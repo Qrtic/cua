@@ -2160,6 +2160,9 @@ pub fn register_all(
     }
     registry.register(Box::new(foreground_segment::BeginForegroundSegmentTool));
     registry.register(Box::new(foreground_segment::EndForegroundSegmentTool));
+    registry.register(crate::foreground_activity::guard_tool(Box::new(
+        foreground_segment::PrepareDialogTool,
+    )));
     let cursor_outcome_reader = {
         let cursor_registry = state.cursor_registry.clone();
         cua_driver_core::session::register_scoped_cursor_outcome_reader(std::sync::Arc::new(

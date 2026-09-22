@@ -21,6 +21,7 @@ struct Inner {
     ending: bool,
     restoring: bool,
     activated: bool,
+    dialog_closed: bool,
     cleanup_unknown: bool,
     summary: Option<Value>,
 }
@@ -29,6 +30,7 @@ struct NativeSegment {
     binding: Binding,
     owner: Arc<cua_driver_core::session::TransportOwner>,
     original: ExactWindowTarget,
+    dialog_host: Option<ExactWindowTarget>,
     inner: Mutex<Inner>,
 }
 
@@ -186,6 +188,56 @@ impl NativeSegment {
             && inner.resources.is_none()
     }
 
+    fn accept_dialog_return(&self) -> bool {
+        let Some(host) = self.dialog_host else {
+            return false;
+        };
+        if !self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .activated
+            || !exact_front(host)
+            || !crate::ax::attached_sheet::dialog_returned_to_host(
+                self.binding.target.pid,
+                self.binding.target.window_id,
+                host.window_id,
+            )
+        {
+            return false;
+        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dialog_closed = true;
+        true
+    }
+
+    fn dialog_closed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dialog_closed
+    }
+
+    fn validate_dialog_call(&self, tool: &str) -> Result<(), ToolResult> {
+        if tool == "prepare_dialog" && self.dialog_host.is_none() {
+            return Err(failure(
+                "foreground_dialog_required",
+                "Preparing a dialog requires a proven Open/Save dialog segment",
+                true,
+            ));
+        }
+        if self.dialog_closed() {
+            return Err(failure(
+                "foreground_dialog_closed",
+                "The dialog closed onto its exact host; finish this segment before observing or acting again",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
     fn owner_live(&self) -> bool {
         self.owner.is_live()
             && !cua_driver_core::session::is_session_ending_or_ended(&self.binding.owner.session_id)
@@ -203,7 +255,9 @@ impl NativeSegment {
         // captured original may be front; afterwards only the immutable target.
         // A programmatic focus change must not silently grant a new episode.
         let expected_front = self.expected_front();
-        let focus_live = LEASE.with(Cell::get).is_some() || exact_front(expected_front);
+        let focus_live = LEASE.with(Cell::get).is_some()
+            || exact_front(expected_front)
+            || self.accept_dialog_return();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.cleanup_unknown {
             anyhow::bail!("native_cleanup_unconfirmed");
@@ -372,6 +426,17 @@ impl Call {
             .summary
             .clone()
     }
+    pub(super) fn accept_dialog_return(&self) -> bool {
+        self.segment.accept_dialog_return()
+    }
+    pub(super) fn dialog_closed_summary(&self) -> Option<Value> {
+        self.segment.dialog_closed().then(|| {
+            json!({
+                "phase": "closed", "foreground_segment_id": self.segment.binding.id,
+                "pid": self.target().pid, "window_id": self.target().window_id,
+            })
+        })
+    }
 }
 
 impl Drop for Call {
@@ -403,6 +468,7 @@ fn supported_tool(name: &str) -> bool {
             | "set_value"
             | "perform_secondary_action"
             | "get_window_state"
+            | "prepare_dialog"
     )
 }
 
@@ -505,6 +571,7 @@ pub(super) fn admit_call(args: &Value, tool: &str) -> Result<Option<Arc<Call>>, 
             true,
         )
     })?;
+    segment.validate_dialog_call(tool)?;
     let reservation = segment
         .inner
         .lock()
@@ -514,7 +581,9 @@ pub(super) fn admit_call(args: &Value, tool: &str) -> Result<Option<Arc<Call>>, 
             &segment.binding,
             clock_ms(),
             snapshot(),
-            if tool == "get_window_state" {
+            if tool == "prepare_dialog" {
+                CallKind::Activation
+            } else if tool == "get_window_state" {
                 CallKind::Observation
             } else {
                 CallKind::Mutation
@@ -572,6 +641,17 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
         Ok(target) => target,
         Err(result) => return result,
     };
+    let dialog = match args.get("scope").and_then(Value::as_str) {
+        None | Some("batch") => false,
+        Some("dialog") => true,
+        _ => {
+            return failure(
+                "foreground_segment_scope_invalid",
+                "Segment scope must be batch or dialog",
+                true,
+            )
+        }
+    };
     if cleanup_latch().load(Ordering::Acquire) {
         return failure(
             "native_cleanup_unconfirmed",
@@ -621,13 +701,19 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
             }
         };
     // No activation or other write in begin. A cancelled capture cannot leave input.
-    let original = match tokio::task::spawn_blocking(move || {
+    let (original, dialog_host) = match tokio::task::spawn_blocking(move || {
         if !matches!(
             crate::windows::resolve_window_owner(target.pid, target.window_id),
             crate::windows::WindowOwner::SamePid
         ) {
             return None;
         }
+        let dialog_host = if dialog {
+            Some(ExactWindowTarget {
+                pid: target.pid,
+                window_id: crate::ax::attached_sheet::focused_dialog_host(target.pid, target.window_id)?,
+            })
+        } else { None };
         let pid = crate::apps::frontmost_pid()?;
         let original = ExactWindowTarget {
             pid,
@@ -638,15 +724,15 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
                 crate::windows::resolve_window_owner(original.pid, original.window_id),
                 crate::windows::WindowOwner::SamePid
             ))
-        .then_some(original)
+        .then_some((original, dialog_host))
     })
     .await
     {
-        Ok(Some(original)) => original,
+        Ok(Some(proof)) => proof,
         _ => {
             return failure(
                 "foreground_activity_unavailable",
-                "Exact original window or target ownership is unavailable",
+                "Exact original window, target ownership, or requested Open/Save attachment is unavailable",
                 true,
             )
         }
@@ -666,6 +752,7 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
         binding,
         owner: transport,
         original,
+        dialog_host,
         inner: Mutex::new(Inner {
             policy,
             resources: Some(Resources {
@@ -675,6 +762,7 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
             ending: false,
             restoring: false,
             activated: false,
+            dialog_closed: false,
             cleanup_unknown: false,
             summary: None,
         }),
@@ -730,7 +818,51 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
     });
     ToolResult::text("Native foreground segment opened; no window activation or input dispatched.").with_structured(json!({
         "foreground_segment_id": segment.binding.id, "phase": "open", "pid": target.pid, "window_id": target.window_id,
+        "scope": if dialog { "dialog" } else { "batch" },
     }))
+}
+
+/// Activation is a separately admitted native call. It emits no click/key and
+/// does not mint AX tokens; the wrapper observes once after exact readiness.
+pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
+    let target = match target_from_args(&args) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    let Some(call) = current_invocation().and_then(|context| context.segment_call.clone()) else {
+        return failure(
+            "foreground_dialog_required",
+            "A live native dialog segment is required",
+            true,
+        );
+    };
+    if call.segment.dialog_host.is_none() || call.target() != target {
+        return failure(
+            "foreground_dialog_required",
+            "Dialog segment target does not match",
+            true,
+        );
+    }
+    let expected_host = call.segment.dialog_host.unwrap();
+    let prepared = spawn_blocking(move || {
+        check_request()?;
+        if crate::ax::attached_sheet::focused_dialog_host(target.pid, target.window_id)
+            != Some(expected_host.window_id)
+        {
+            anyhow::bail!("dialog attachment changed before activation");
+        }
+        crate::input::skylight::with_foreground_hid_activation(target.pid, target.window_id, || {
+            Ok(())
+        })
+    })
+    .await;
+    match prepared {
+        Ok(Ok(())) => ToolResult::text("Exact Open/Save dialog is ready for a fresh observation; no click or key was sent.")
+            .with_structured(json!({"phase":"prepared", "pid":target.pid, "window_id":target.window_id,
+                "foreground_segment_id":call.segment.binding.id})),
+        _ => ToolResult::error("Dialog preparation did not establish exact foreground readiness; finish or abort the segment without replaying input.")
+            .with_structured(json!({"code":"foreground_dialog_preparation_failed", "effect":"unverifiable", "retryable":false})),
+    }
 }
 
 fn claim_end(inner: &mut Inner, binding: &Binding, finish: bool) -> Result<(), ToolResult> {
@@ -896,7 +1028,15 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
                     "skipped_interrupted"
                 } else if exact_front(worker_segment.original) {
                     "unchanged"
-                } else if !exact_front(worker_segment.binding.target) {
+                } else if worker_segment.original == worker_segment.binding.target
+                    && worker_segment.accept_dialog_return()
+                {
+                    // The original WAS the sheet. It closed normally; leave
+                    // its host in front instead of restoring a vanished window.
+                    "unchanged"
+                } else if !exact_front(worker_segment.binding.target)
+                    && !worker_segment.accept_dialog_return()
+                {
                     worker_segment.revoke();
                     "skipped_interrupted"
                 } else if crate::input::skylight::restore_exact_window_guarded(
@@ -1016,6 +1156,7 @@ mod tests {
                 pid: 43,
                 window_id: 72,
             },
+            dialog_host: None,
             inner: Mutex::new(Inner {
                 policy: Segment::begin(binding.clone(), 5_000, idle(), Limits::default()).unwrap(),
                 resources: Some(Resources {
@@ -1025,6 +1166,7 @@ mod tests {
                 ending: false,
                 restoring: false,
                 activated: false,
+                dialog_closed: false,
                 cleanup_unknown: false,
                 summary: None,
             }),
@@ -1072,6 +1214,7 @@ mod tests {
             "get_window_state",
             "click",
             "hotkey",
+            "prepare_dialog",
         ] {
             assert!(supported_tool(tool), "{tool}");
         }
@@ -1085,6 +1228,40 @@ mod tests {
         ] {
             assert!(!supported_tool(tool), "{tool}");
         }
+    }
+
+    #[tokio::test]
+    async fn foreground_dialog_close_is_not_cleanup_or_authority_to_act_on_host() {
+        let (mut segment, _, _) = fixture().await;
+        assert!(segment.validate_dialog_call("prepare_dialog").is_err());
+        Arc::get_mut(&mut segment).unwrap().dialog_host = Some(ExactWindowTarget {
+            pid: 42,
+            window_id: 99,
+        });
+        assert!(segment.validate_dialog_call("prepare_dialog").is_ok());
+        let ticket = call(&segment);
+        segment.inner.lock().unwrap().dialog_closed = true;
+        for tool in [
+            "prepare_dialog",
+            "get_window_state",
+            "click",
+            "type_text",
+            "set_value",
+        ] {
+            let refusal = segment.validate_dialog_call(tool).unwrap_err();
+            assert_eq!(
+                refusal.structured_content.unwrap()["code"],
+                "foreground_dialog_closed"
+            );
+        }
+        let proof = ticket.dialog_closed_summary().unwrap();
+        assert_eq!(proof["window_id"], 71);
+        assert_eq!(ticket.target().window_id, 71);
+        assert!(ticket.closed_summary().is_none());
+        ticket.settle();
+        assert!(segment.inner.lock().unwrap().resources.is_some());
+        segment.revoke();
+        assert!(segment.cleanup_is_settled());
     }
 
     #[test]

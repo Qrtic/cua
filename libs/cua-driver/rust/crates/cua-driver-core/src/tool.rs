@@ -1923,7 +1923,10 @@ impl ToolRegistry {
         }
         let delivery_mode = if matches!(
             tool_name,
-            "bring_to_front" | "begin_foreground_segment" | "end_foreground_segment"
+            "bring_to_front"
+                | "begin_foreground_segment"
+                | "end_foreground_segment"
+                | "prepare_dialog"
         ) {
             "foreground"
         } else {
@@ -2634,6 +2637,7 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "bring_to_front"
             | "set_window_frame"
             | "end_foreground_segment"
+            | "prepare_dialog"
     )
 }
 
@@ -3986,6 +3990,48 @@ resources:
         }
         assert_eq!(hits.load(Ordering::SeqCst), 3);
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dialog_preparation_uses_input_authorization_before_platform_dispatch() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ObservationProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "prepare_dialog".into(),
+                description: "test native dialog preparation".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let result = registry
+            .invoke_with_context(
+                "prepare_dialog",
+                serde_json::json!({"pid":42, "window_id":7, "delivery_mode":"foreground",
+                "foreground_segment_id":"fgs_test", "session":"dialog-authorization"}),
+                standard_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let self_target = registry
+            .invoke_with_context(
+                "prepare_dialog",
+                serde_json::json!({"pid":std::process::id(), "window_id":7,
+                "foreground_segment_id":"fgs_test", "session":"dialog-authorization"}),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(self_target.is_error, Some(true));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "self-target refusal must precede platform dispatch"
+        );
     }
 
     #[tokio::test]

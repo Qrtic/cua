@@ -1,5 +1,5 @@
 //! Native-only lifecycle endpoints. The public marketplace tool surface does
-//! not expose these controls; its checked executor binds them to one batch.
+//! not expose native tokens; its checked executor owns batch/dialog lifetimes.
 
 use async_trait::async_trait;
 use cua_driver_core::{
@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 pub struct BeginForegroundSegmentTool;
 pub struct EndForegroundSegmentTool;
+pub struct PrepareDialogTool;
 
 fn definition(end: bool) -> &'static ToolDef {
     static BEGIN: OnceLock<ToolDef> = OnceLock::new();
@@ -34,13 +35,15 @@ fn definition(end: bool) -> &'static ToolDef {
                 "type": "string", "enum": ["finish", "abort"]
             });
             schema["required"] = json!(["pid", "window_id", "foreground_segment_id", "mode"]);
+        } else {
+            schema["properties"]["scope"] = json!({"type":"string", "enum":["batch", "dialog"], "default":"batch"});
         }
         ToolDef {
             name: if end { "end_foreground_segment" } else { "begin_foreground_segment" }.into(),
             description: if end {
                 "Settle this transport's exact native foreground segment. Finish may restore the original window only without intervention; abort never reclaims focus. Never replay an uncertain end."
             } else {
-                "Reserve one exact native foreground batch segment for the current trusted transport. Captures original focus without activation or input. Only the same owner may use the returned token; end explicitly after settlement."
+                "Reserve one exact native foreground segment for the current trusted transport. Dialog scope requires a live attached standard Open/Save sheet and retains its host only for restoration. Captures original focus without activation or input; end explicitly after settlement."
             }.into(),
             input_schema: schema,
             read_only: false,
@@ -73,6 +76,30 @@ impl Tool for EndForegroundSegmentTool {
     }
 }
 
+#[async_trait]
+impl Tool for PrepareDialogTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: OnceLock<ToolDef> = OnceLock::new();
+        DEF.get_or_init(|| ToolDef {
+            name: "prepare_dialog".into(),
+            description: "Activate this segment's exact attached Open/Save dialog and necessary host once, without clicking or typing. Requires native dialog scope, current owner, idle/activity lease and exact readiness. Observe the dialog after preparation.".into(),
+            input_schema: json!({
+                "type":"object", "properties": {
+                    "pid":{"type":"integer", "minimum":1, "maximum":i32::MAX},
+                    "window_id":{"type":"integer", "minimum":1, "maximum":u32::MAX},
+                    "foreground_segment_id":{"type":"string", "minLength":1, "maxLength":128},
+                    "delivery_mode":{"type":"string", "enum":["foreground"]}
+                }, "required":["pid", "window_id", "foreground_segment_id"], "additionalProperties":false
+            }),
+            read_only:false, destructive:false, idempotent:false, open_world:false,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        crate::foreground_activity::prepare_dialog(args).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +125,31 @@ mod tests {
             definition(true).input_schema["properties"]["foreground_segment_id"]["maxLength"],
             128
         );
+    }
+
+    #[test]
+    fn dialog_preparation_is_native_exact_and_has_no_input_or_host_override() {
+        let tool = PrepareDialogTool;
+        let def = tool.def();
+        assert!(!def.read_only && !def.idempotent && !def.open_world);
+        assert_eq!(
+            def.input_schema["required"],
+            json!(["pid", "window_id", "foreground_segment_id"])
+        );
+        assert_eq!(
+            definition(false).input_schema["properties"]["scope"]["enum"],
+            json!(["batch", "dialog"])
+        );
+        for forbidden in [
+            "host_pid",
+            "host_window_id",
+            "text",
+            "key",
+            "x",
+            "y",
+            "session_id",
+        ] {
+            assert!(def.input_schema["properties"].get(forbidden).is_none());
+        }
     }
 }

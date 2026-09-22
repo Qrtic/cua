@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 
 mod segment;
 pub(crate) use segment::{
-    begin_segment, end_segment, stop_runtime_segments, stop_session_segments,
+    begin_segment, end_segment, prepare_dialog, stop_runtime_segments, stop_session_segments,
 };
 
 fn foreground_writer() -> Arc<tokio::sync::Mutex<()>> {
@@ -49,6 +49,7 @@ pub(crate) fn guard_tool(inner: Box<dyn Tool>) -> Box<dyn Tool> {
             | "bring_to_front"
             | "set_window_frame"
             | "get_window_state"
+            | "prepare_dialog"
     ) {
         let mut def = inner.def().clone();
         def.input_schema["properties"]["foreground_segment_id"] = serde_json::json!({
@@ -146,6 +147,19 @@ impl InvocationContext {
     }
 
     fn project_native_result(&self, result: &mut cua_driver_core::protocol::ToolResult) {
+        if let Some(summary) = self
+            .segment_call
+            .as_ref()
+            .and_then(|call| call.dialog_closed_summary())
+        {
+            let structured = result
+                .structured_content
+                .get_or_insert_with(|| serde_json::json!({}));
+            if !structured.is_object() {
+                *structured = serde_json::json!({});
+            }
+            structured["foreground_dialog"] = summary;
+        }
         if let Some(summary) = self
             .segment_call
             .as_ref()
@@ -649,7 +663,7 @@ impl Episode {
         if let Some(call) = &self.segment {
             if exact_target_is_frontmost(self.lease) {
                 call.mark_activated();
-            } else {
+            } else if !call.accept_dialog_return() {
                 record_interruption();
                 anyhow::bail!("foreground segment target changed after input; stop further calls");
             }
@@ -1285,6 +1299,7 @@ fn diagnostic_state_from_snapshot(current: Snapshot) -> serde_json::Value {
         "native_cleanup": true,
         "exact_window_restore": true,
         "batch_foreground_segments": true,
+        "dialog_foreground_segments": true,
     })
 }
 
@@ -1327,6 +1342,7 @@ mod episode_lifecycle_tests {
                 "native_cleanup",
                 "exact_window_restore",
                 "batch_foreground_segments",
+                "dialog_foreground_segments",
             ] {
                 assert_eq!(value[capability], true);
             }

@@ -1150,6 +1150,52 @@ fn complete_exact_ax_window_activation(
     };
 
     check_exact_activation_owner(pid, window_id, &mut check_activity)?;
+    if let Some(host_id) = crate::ax::attached_sheet::focused_dialog_host(pid, window_id) {
+        use crate::ax::bindings::copy_element_attr;
+        let sheet = OwnedActivationAx(
+            crate::ax::attached_sheet::copy_focused_attached_sheet(pid, window_id)
+                .ok_or_else(|| anyhow::anyhow!("dialog attachment changed before activation"))?,
+        );
+        let host = OwnedActivationAx(unsafe {
+            copy_element_attr(sheet.0, "AXParent")
+                .ok_or_else(|| anyhow::anyhow!("dialog host is unavailable"))?
+        });
+        bound_activation_ax(&sheet)?;
+        bound_activation_ax(&host)?;
+        return exact_ax_activation_steps(
+            || {
+                check_exact_activation_owner(pid, window_id, &mut check_activity)?;
+                check_exact_activation_owner(pid, host_id, &mut check_activity)?;
+                for (element, expected_id) in [(&sheet, window_id), (&host, host_id)] {
+                    let mut owner = 0;
+                    if unsafe { AXUIElementGetPid(element.0, &mut owner) } != kAXErrorSuccess
+                        || owner != pid
+                        || unsafe { ax_get_window_id(element.0) } != Some(expected_id)
+                    {
+                        anyhow::bail!("dialog activation target identity changed");
+                    }
+                }
+                for relation in ["AXParent", "AXWindow"] {
+                    let current = OwnedActivationAx(unsafe {
+                        copy_element_attr(sheet.0, relation)
+                            .ok_or_else(|| anyhow::anyhow!("dialog detached during activation"))?
+                    });
+                    if unsafe { core_foundation::base::CFEqual(current.0 as _, host.0 as _) } == 0 {
+                        anyhow::bail!("dialog host changed during activation");
+                    }
+                }
+                check_activity()
+            },
+            |operation| unsafe {
+                match operation {
+                    "AXMain" => set_bool_attr_true(host.0, operation),
+                    "AXRaise" => perform_action(sheet.0, operation),
+                    _ => set_bool_attr_true(sheet.0, operation),
+                }
+            },
+            crate::foreground_activity::mark_native_cleanup_unconfirmed,
+        );
+    }
     let app = OwnedActivationAx(unsafe { AXUIElementCreateApplication(pid) });
     bound_activation_ax(&app)?;
     let snapshot = unsafe { try_copy_ax_windows(app.0) }

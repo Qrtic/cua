@@ -21,6 +21,7 @@ trait SheetTree {
     fn focused(&self) -> Option<Self::Node>;
     fn windows(&self) -> Option<Vec<Self::Node>>;
     fn role(&self, node: &Self::Node) -> Option<String>;
+    fn identifier(&self, node: &Self::Node) -> Option<String>;
     fn owner(&self, node: &Self::Node) -> Option<i32>;
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn relation(&self, node: &Self::Node, name: &str) -> Option<Self::Node>;
@@ -34,6 +35,41 @@ trait SheetTree {
 
 fn prove<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::Node> {
     prove_with_visibility(tree, pid, requested, false)
+}
+
+// Only the standard attached Open/Save panels may establish a dialog
+// interaction. A role, title, caller-supplied host, or an arbitrary child is
+// insufficient. The host is for activation/restoration, never an input alias.
+fn dialog_host<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::Node> {
+    let sheet = prove(tree, pid, requested)?;
+    if !matches!(
+        tree.identifier(&sheet).as_deref(),
+        Some("save-panel" | "open-panel")
+    ) {
+        return None;
+    }
+    let host = tree.relation(&sheet, "AXParent")?;
+    let minimized = tree.minimized(&sheet);
+    if (minimized != Ok(false) && minimized != Err(kAXErrorAttributeUnsupported))
+        || tree.minimized(&host) != Ok(false)
+        || !tree.on_screen(pid, requested)
+        || !tree.on_screen(pid, tree.window_id(&host)?)
+        || !tree.within_budget()
+    {
+        return None;
+    }
+    // Visibility queries must not make a newly attached/reparented host inherit
+    // the earlier attachment proof.
+    let current = prove(tree, pid, requested)?;
+    if !tree.same(&current, &sheet)
+        || !tree
+            .relation(&current, "AXParent")
+            .is_some_and(|parent| tree.same(&parent, &host))
+        || !tree.within_budget()
+    {
+        return None;
+    }
+    Some(host)
 }
 
 fn prove_with_visibility<T: SheetTree>(
@@ -153,6 +189,9 @@ impl SheetTree for NativeTree {
     fn role(&self, node: &Node) -> Option<String> {
         unsafe { copy_string_attr(node.0, "AXRole") }
     }
+    fn identifier(&self, node: &Node) -> Option<String> {
+        unsafe { copy_string_attr(node.0, "AXIdentifier") }
+    }
     fn owner(&self, node: &Node) -> Option<i32> {
         let mut pid = 0;
         (unsafe { AXUIElementGetPid(node.0, &mut pid) } == kAXErrorSuccess).then_some(pid)
@@ -225,6 +264,65 @@ pub(crate) fn copy_focused_attached_sheet(pid: i32, window_id: u32) -> Option<AX
     }
 }
 
+/// The live, same-process host of an exact focused standard Open/Save sheet.
+pub(crate) fn focused_dialog_host(pid: i32, window_id: u32) -> Option<u32> {
+    unsafe {
+        let tree = NativeTree {
+            app: Node::owned(AXUIElementCreateApplication(pid))?,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        let host = dialog_host(&tree, pid, window_id)?;
+        tree.window_id(&host)
+    }
+}
+
+/// Closing a sheet may return focus to its previously proven host. Check one
+/// WindowServer snapshot and the host's exact AX focus; unreadable AX or a
+/// still-visible sheet cannot authorize this transition. No AX tree is built.
+fn dialog_windows_allow_host_return(
+    snapshot: &crate::windows::WindowEnumeration,
+    pid: i32,
+    sheet_id: u32,
+    host_id: u32,
+) -> bool {
+    snapshot.succeeded
+        && sheet_id != host_id
+        && snapshot
+            .windows
+            .iter()
+            .any(|window| window.pid == pid && window.window_id == host_id && window.is_on_screen)
+        && !snapshot.windows.iter().any(|window| {
+            window.window_id == sheet_id && (window.is_on_screen || window.pid != pid)
+        })
+}
+
+pub(crate) fn dialog_returned_to_host(pid: i32, sheet_id: u32, host_id: u32) -> bool {
+    let windows = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+    if !dialog_windows_allow_host_return(&windows, pid, sheet_id, host_id) {
+        return false;
+    }
+    unsafe {
+        let Some(app) = Node::owned(AXUIElementCreateApplication(pid)) else {
+            return false;
+        };
+        let tree = NativeTree {
+            app,
+            deadline: Instant::now() + Duration::from_millis(500),
+        };
+        let Some(host) = tree.focused() else {
+            return false;
+        };
+        tree.window_id(&host) == Some(host_id)
+            && tree.owner(&host) == Some(pid)
+            && tree.role(&host).as_deref() == Some("AXWindow")
+            && tree.minimized(&host) == Ok(false)
+            && tree
+                .windows()
+                .is_some_and(|windows| windows.iter().any(|w| tree.same(w, &host)))
+            && tree.within_budget()
+    }
+}
+
 /// Prove the unsupported AXMinimized case for one already retained sheet.
 /// The host supplies visibility evidence only; input remains bound to the
 /// sheet's own CGWindowID. Discovery alone never supplies this extra proof.
@@ -260,6 +358,7 @@ mod tests {
     struct FakeNode {
         identity: u32,
         role: &'static str,
+        identifier: &'static str,
         owner: i32,
         window: u32,
     }
@@ -294,6 +393,9 @@ mod tests {
         }
         fn role(&self, node: &FakeNode) -> Option<String> {
             Some(node.role.into())
+        }
+        fn identifier(&self, node: &FakeNode) -> Option<String> {
+            Some(node.identifier.into())
         }
         fn owner(&self, node: &FakeNode) -> Option<i32> {
             Some(node.owner)
@@ -340,12 +442,14 @@ mod tests {
             sheet: FakeNode {
                 identity: 1,
                 role: "AXSheet",
+                identifier: "save-panel",
                 owner: 42,
                 window: 900,
             },
             host: FakeNode {
                 identity: 2,
                 role: "AXWindow",
+                identifier: "document",
                 owner: 42,
                 window: 700,
             },
@@ -366,6 +470,76 @@ mod tests {
     fn discovers_focused_sheet_missing_from_top_level_windows() {
         let sheet = prove(&pages(), 42, 900).unwrap();
         assert_eq!(sheet.window, 900);
+    }
+
+    #[test]
+    fn dialog_activation_requires_a_live_standard_panel_and_exact_host() {
+        for identifier in ["save-panel", "open-panel"] {
+            let mut tree = pages();
+            tree.sheet.identifier = identifier;
+            assert_eq!(dialog_host(&tree, 42, 900).unwrap().window, 700);
+        }
+        for alter in [
+            |t: &mut Tree| t.sheet.identifier = "confirmation",
+            |t: &mut Tree| t.attached = false,
+            |t: &mut Tree| t.matching_window_relation = false,
+            |t: &mut Tree| t.host_listed = false,
+            |t: &mut Tree| t.host.owner = 99,
+            |t: &mut Tree| t.host_minimized = Ok(true),
+            |t: &mut Tree| t.sheet_minimized = Err(super::super::bindings::kAXErrorCannotComplete),
+            |t: &mut Tree| t.sheet_on_screen = false,
+            |t: &mut Tree| t.host_on_screen = false,
+            |t: &mut Tree| t.focus_changed = true,
+        ] {
+            let mut tree = pages();
+            alter(&mut tree);
+            assert!(dialog_host(&tree, 42, 900).is_none());
+        }
+        assert!(dialog_host(&pages(), 42, 700).is_none());
+        assert!(dialog_host(&pages(), 42, 901).is_none());
+    }
+
+    #[test]
+    fn dialog_close_requires_a_successful_snapshot_and_never_accepts_a_reused_sheet_id() {
+        use crate::windows::{WindowBounds, WindowEnumeration, WindowInfo};
+        let window = |id, pid, visible| WindowInfo {
+            window_id: id,
+            pid,
+            app_name: String::new(),
+            title: String::new(),
+            bounds: WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            layer: 0,
+            z_index: 0,
+            is_on_screen: visible,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        };
+        let mut snapshot = WindowEnumeration {
+            windows: vec![window(700, 42, true)],
+            current_space_id: None,
+            succeeded: true,
+        };
+        assert!(dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
+        snapshot.windows.push(window(900, 42, false));
+        assert!(dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
+        snapshot.windows[1].is_on_screen = true;
+        assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
+        snapshot.windows[1].is_on_screen = false;
+        snapshot.windows[1].pid = 99;
+        assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
+        snapshot.windows.pop();
+        snapshot.succeeded = false;
+        assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
+        snapshot.succeeded = true;
+        snapshot.windows[0].is_on_screen = false;
+        assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
+        assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 900));
     }
 
     #[test]
