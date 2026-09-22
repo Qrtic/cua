@@ -28,8 +28,9 @@
 //! (`RenderStateCore`, `tick_swift_constants`, `apply_command_base`,
 //! `render_frame`).  macOS uses the hardcoded Swift reference constants
 //! (peakSpeed=900, springK=400, overshoot=0.8) and the sentinel-snap
-//! variants of MoveTo / ClickPulse — see the wrapper around
-//! `apply_command_base` below.
+//! variants of explicit MoveTo / ClickPulse commands. Asynchronous input
+//! feedback instead snaps to the current target; its decoration never delays
+//! input or continues a glide after the click has already happened.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -45,7 +46,9 @@ use indexmap::IndexMap;
 
 mod displays;
 mod surfaces;
+mod visibility;
 use displays::{DisplayGeometry, DisplayLayout};
+use visibility::{Rect, WindowClips};
 
 // ── Arrival-signal channels (one waiter slot per cursor key) ──────────────
 //
@@ -96,6 +99,7 @@ enum RenderEvent {
         click_pulse: bool,
     },
     DisplaysChanged,
+    VisibilityChanged,
 }
 
 static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<RenderEvent>> = OnceLock::new();
@@ -150,27 +154,34 @@ fn apply_render_event(map: &mut RenderMap, event: RenderEvent) -> Option<CursorK
             if key.is_empty() || !x.is_finite() || !y.is_finite() {
                 return None;
             }
-            // First placement and display recovery belong to the renderer too.
-            // Otherwise even an asynchronous action can wait for full-display
-            // painting (or theme loading) before it gets to enqueue its move.
-            seed_start_in_map(map, &key, x, y);
-            if map.ended.contains(&key)
-                || !map
-                    .cursors
-                    .get(&key)
-                    .is_some_and(|state| state.core.cfg.enabled && state.core.has_position())
-            {
+            if map.ended.contains(&key) {
                 return None;
             }
-            apply_msg(
-                map,
-                OverlayMsg::Cmd(KeyedOverlayCommand {
-                    key,
-                    cmd: cursor_feedback_move(x, y, click_pulse),
-                }),
-            )
+            // Input has already progressed independently of this renderer.
+            // Show its latest target on the next frame, rather than gliding
+            // through old clicks (and pulsing only after a late arrival).
+            // Placement and theme loading stay off the input dispatch path.
+            let template = map.template.clone();
+            let state = map
+                .cursors
+                .entry(key.clone())
+                .or_insert_with(|| render_state_for_key(&template, &key));
+            if !state.core.cfg.enabled {
+                return None;
+            }
+            state.apply_command(cursor_feedback_position(x, y));
+            if click_pulse {
+                state.apply_command(OverlayCommand::ClickPulse { x, y });
+            }
+            Some(key)
         }
-        RenderEvent::DisplaysChanged => None,
+        RenderEvent::DisplaysChanged | RenderEvent::VisibilityChanged => None,
+    }
+}
+
+fn request_visibility_refresh() {
+    if let Some(sender) = CMD_TX.get() {
+        let _ = sender.try_send(RenderEvent::VisibilityChanged);
     }
 }
 
@@ -529,27 +540,22 @@ pub fn async_click_feedback_enabled(_key: &str) -> bool {
     ASYNC_CLICK_FEEDBACK.load(Ordering::Acquire)
 }
 
-/// Queue a renderer-owned glide followed by a click pulse. Returns `true`
+/// Queue the current input target and an immediate click pulse. Returns `true`
 /// only when the command was accepted, so callers can retain an immediate
 /// pulse fallback if the bounded queue is unavailable.
 pub fn queue_async_click_feedback(key: CursorKey, x: f64, y: f64) -> bool {
     queue_async_cursor_feedback(key, x, y, true)
 }
 
-fn cursor_feedback_move(x: f64, y: f64, click_pulse: bool) -> OverlayCommand {
-    let end_heading_radians = std::f64::consts::FRAC_PI_4;
-    if click_pulse {
-        OverlayCommand::MoveToThenClickPulse {
-            x,
-            y,
-            end_heading_radians,
-        }
-    } else {
-        OverlayCommand::MoveTo {
-            x,
-            y,
-            end_heading_radians,
-        }
+fn cursor_feedback_position(x: f64, y: f64) -> OverlayCommand {
+    // Match the 16 point tip offset used by the explicit glide. SnapTo takes
+    // the artwork anchor rather than the input point.
+    let heading = std::f64::consts::FRAC_PI_4;
+    const CLICK_OFFSET: f64 = 16.0;
+    OverlayCommand::SnapTo {
+        x: x + heading.cos() * CLICK_OFFSET,
+        y: y + heading.sin() * CLICK_OFFSET,
+        heading_radians: Some(heading),
     }
 }
 
@@ -599,7 +605,7 @@ fn enqueue_cursor_feedback(
     true
 }
 
-/// Return whether a renderer-owned arrival pulse was queued. Callers skip
+/// Return whether a renderer-owned click pulse was queued. Callers skip
 /// their immediate pulse in that case, without delaying the actual input.
 pub async fn animate_click_feedback(key: CursorKey, x: f64, y: f64) -> bool {
     let wait_key = key.clone();
@@ -815,6 +821,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<RenderEvent>) {
     let mut last_pinned: Option<u64> = None;
     let mut repin_frames: u32 = 0;
     let mut last_layout_generation = 0;
+    let mut last_clips = WindowClips::new();
 
     loop {
         // When no cursor animation/fade is active, block until the MCP side
@@ -976,11 +983,37 @@ fn render_loop(rx: std::sync::mpsc::Receiver<RenderEvent>) {
             }
         }
 
+        // Clip each session to its own target, regardless of where the shared
+        // display surface was ordered. Query WindowServer outside the render
+        // lock and never from the input dispatch path. Recheck on hover polls
+        // too, so stationary feedback follows window activation/occlusion.
+        let targets = {
+            let guard = RENDER.lock().unwrap();
+            guard
+                .as_ref()
+                .into_iter()
+                .flat_map(|map| {
+                    map.cursors.values().filter_map(|state| {
+                        cursor_is_externally_visible(&map.layout, state)
+                            .then_some(state.core.pinned_wid)
+                            .flatten()
+                    })
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let clips = visibility::capture_clips(targets);
+        let clips_changed = clips != last_clips;
+
         // ── Phase 2: paint the same animation state on each display ───────
         // Render only when a command arrived or the previous/next tick can
         // change pixels. A final frame is emitted as animations/fades finish so
         // the layer is left in the completed/cleared state before blocking.
-        if had_msg || hover_changed || frame_tick_needed || next_frame_tick_needed || layout_changed
+        if had_msg
+            || hover_changed
+            || frame_tick_needed
+            || next_frame_tick_needed
+            || layout_changed
+            || clips_changed
         {
             let pixmaps = {
                 let guard = RENDER.lock().unwrap();
@@ -989,16 +1022,17 @@ fn render_loop(rx: std::sync::mpsc::Receiver<RenderEvent>) {
                         .displays
                         .iter()
                         .filter_map(|display| {
-                            render_display(map, display).map(|pixmap| (display.id, pixmap))
+                            render_display(map, display, &clips).map(|pixmap| (display.id, pixmap))
                         })
                         .collect()
                 } else {
                     break;
                 }
             };
-            surfaces::submit_frames(layout.generation, pixmaps);
+            surfaces::submit_frames(layout.generation, pixmaps, clips.clone());
         }
 
+        last_clips = clips;
         last_layout_generation = layout.generation;
         frame_tick_needed = next_frame_tick_needed;
         hover_poll_needed = next_hover_poll_needed;
@@ -1012,24 +1046,116 @@ fn render_loop(rx: std::sync::mpsc::Receiver<RenderEvent>) {
     }
 }
 
-fn render_display(map: &RenderMap, display: &DisplayGeometry) -> Option<tiny_skia::Pixmap> {
+fn render_display(
+    map: &RenderMap,
+    display: &DisplayGeometry,
+    clips: &WindowClips,
+) -> Option<tiny_skia::Pixmap> {
     let (width, height) = display.pixel_size()?;
     let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
     for state in map.cursors.values() {
+        if !state.core.cfg.enabled || !state.core.visible || !state.core.has_position() {
+            continue;
+        }
         let focus = state.focus_rect.map(|rect| FocusRect {
             rect,
             t: state.focus_rect_t,
         });
-        cursor_overlay::paint_cursor(
-            &mut pixmap,
-            &state.core,
-            display.bounds[0],
-            display.bounds[1],
-            focus,
-            display.scale as f32,
-        );
+        if let Some(target) = state.core.pinned_wid {
+            if let Some(clip) = clips.get(&target) {
+                paint_target_cursor(&mut pixmap, state, focus, display, clip);
+            }
+        } else {
+            // Explicit standalone cursor moves retain their desktop viewport.
+            cursor_overlay::paint_cursor(
+                &mut pixmap,
+                &state.core,
+                display.bounds[0],
+                display.bounds[1],
+                focus,
+                display.scale as f32,
+            );
+        }
     }
     Some(pixmap)
+}
+
+fn paint_target_cursor(
+    pixmap: &mut tiny_skia::Pixmap,
+    state: &RenderState,
+    focus: Option<FocusRect>,
+    display: &DisplayGeometry,
+    clip: &visibility::WindowClip,
+) {
+    if clip.visible.is_empty() || state.core.idle_alpha < 0.004 {
+        return;
+    }
+    let [origin_x, origin_y, width, height] = display.bounds;
+    let Some(bounds) = clip
+        .bounds
+        .and_then(|bounds| bounds.intersect(Rect::from_xywh(origin_x, origin_y, width, height)?))
+    else {
+        return;
+    };
+    let scale = display.scale;
+    // Round inward: no partially covered pixel may escape onto an occluder.
+    let left = ((bounds.left - origin_x) * scale).ceil() as u32;
+    let top = ((bounds.top - origin_y) * scale).ceil() as u32;
+    let right = ((bounds.right - origin_x) * scale).floor() as u32;
+    let bottom = ((bounds.bottom - origin_y) * scale).floor() as u32;
+    if right <= left || bottom <= top {
+        return;
+    }
+    let Some(mut target) = tiny_skia::Pixmap::new(right - left, bottom - top) else {
+        return;
+    };
+    let target_x = origin_x + f64::from(left) / scale;
+    let target_y = origin_y + f64::from(top) / scale;
+    cursor_overlay::paint_cursor(
+        &mut target,
+        &state.core,
+        target_x,
+        target_y,
+        focus,
+        scale as f32,
+    );
+
+    if clip.visible.len() != 1 || clip.visible[0].intersect(bounds) != Some(bounds) {
+        let Some(mut mask) = tiny_skia::Mask::new(target.width(), target.height()) else {
+            return;
+        };
+        let mut path = tiny_skia::PathBuilder::new();
+        for visible in &clip.visible {
+            if let Some(rect) = visible.intersect(bounds).and_then(|rect| {
+                tiny_skia::Rect::from_ltrb(
+                    ((rect.left - target_x) * scale).ceil() as f32,
+                    ((rect.top - target_y) * scale).ceil() as f32,
+                    ((rect.right - target_x) * scale).floor() as f32,
+                    ((rect.bottom - target_y) * scale).floor() as f32,
+                )
+            }) {
+                path.push_rect(rect);
+            }
+        }
+        let Some(path) = path.finish() else {
+            return;
+        };
+        mask.fill_path(
+            &path,
+            tiny_skia::FillRule::Winding,
+            false,
+            tiny_skia::Transform::identity(),
+        );
+        target.apply_mask(&mask);
+    }
+    pixmap.draw_pixmap(
+        left as i32,
+        top as i32,
+        target.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        tiny_skia::Transform::identity(),
+        None,
+    );
 }
 
 fn hardware_cursor_position() -> Option<(f64, f64)> {
@@ -1225,23 +1351,56 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn asynchronous_typing_feedback_uses_a_move_without_a_click_pulse() {
-        assert!(matches!(
-            cursor_feedback_move(12.0, 34.0, false),
-            OverlayCommand::MoveTo {
-                x: 12.0,
-                y: 34.0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            cursor_feedback_move(12.0, 34.0, true),
-            OverlayCommand::MoveToThenClickPulse {
-                x: 12.0,
-                y: 34.0,
-                ..
-            }
-        ));
+    fn asynchronous_feedback_keeps_the_pointer_tip_at_the_input_target() {
+        let mut map = empty_map();
+        for click_pulse in [false, true] {
+            apply_render_event(
+                &mut map,
+                RenderEvent::Feedback {
+                    key: "session".to_owned(),
+                    x: 12.0,
+                    y: 34.0,
+                    click_pulse,
+                },
+            );
+            let core = &map.cursors["session"].core;
+            assert!((core.pos.0 - core.heading.cos() * 16.0 - 12.0).abs() < 0.001);
+            assert!((core.pos.1 - core.heading.sin() * 16.0 - 34.0).abs() < 0.001);
+            assert!(core.path.is_none());
+            assert!(core.spring.is_none());
+            assert!(!core.click_pulse_on_arrival);
+            assert_eq!(core.click_t.is_some(), click_pulse);
+        }
+    }
+
+    #[test]
+    fn burst_feedback_supersedes_a_glide_without_replaying_old_clicks() {
+        let mut map = empty_map();
+        seed_start_in_map(&mut map, &"session".to_owned(), 60.0, 60.0);
+        apply_msg(&mut map, move_msg("session", 90.0, 90.0));
+        assert!(map.cursors["session"].core.path.is_some());
+        // A stalled renderer may drain an entire fast batch on one frame.
+        for step in 0..100 {
+            apply_render_event(
+                &mut map,
+                RenderEvent::Feedback {
+                    key: "session".to_owned(),
+                    x: f64::from(step % 10) * 8.0,
+                    y: f64::from(step / 10) * 8.0,
+                    click_pulse: true,
+                },
+            );
+        }
+        let state = map.cursors.get_mut("session").unwrap();
+        let final_position = state.core.pos;
+        assert!((final_position.0 - state.core.heading.cos() * 16.0 - 72.0).abs() < 0.001);
+        assert!((final_position.1 - state.core.heading.sin() * 16.0 - 72.0).abs() < 0.001);
+        for _ in 0..120 {
+            assert!(!state.tick(1.0 / 60.0));
+            assert_eq!(state.core.pos, final_position);
+        }
+        assert!(state.core.click_t.is_none());
+        assert!(!state.core.click_pulse_on_arrival);
     }
 
     #[test]
@@ -1368,8 +1527,12 @@ mod tests {
         );
         let state = &map.cursors["session"].core;
         assert!(state.has_position());
-        assert!(state.path.is_some(), "first feedback must still glide");
-        assert!(state.click_pulse_on_arrival);
+        assert!(
+            state.path.is_none(),
+            "feedback must follow the dispatched target"
+        );
+        assert_eq!(state.click_t, Some(0.0));
+        assert!(!state.click_pulse_on_arrival);
     }
 
     #[test]
@@ -1437,7 +1600,8 @@ mod tests {
                 click_pulse: false,
             },
         );
-        assert!(map.cursors["typing"].core.path.is_some());
+        assert!(map.cursors["typing"].core.path.is_none());
+        assert!(map.cursors["typing"].core.click_t.is_none());
         assert!(!map.cursors["typing"].core.click_pulse_on_arrival);
     }
 
@@ -1464,6 +1628,82 @@ mod tests {
             Some(target_pid),
             &windows,
         ));
+    }
+
+    #[test]
+    fn covered_background_cursor_paints_no_pixels_on_a_shared_front_surface() {
+        let mut map = empty_map();
+        apply_render_event(
+            &mut map,
+            RenderEvent::Feedback {
+                key: "background".to_owned(),
+                x: 40.0,
+                y: 40.0,
+                click_pulse: true,
+            },
+        );
+        let state = map.cursors.get_mut("background").unwrap();
+        state.core.pinned_wid = Some(10);
+        state.focus_rect = Some([0.0, 0.0, 100.0, 100.0]);
+        state.focus_rect_t = 0.0;
+        for clips in [
+            WindowClips::new(), // Snapshot unavailable / no verified target.
+            WindowClips::from([(10, visibility::WindowClip::default())]),
+        ] {
+            let painted = render_display(&map, &map.layout.displays[0], &clips).unwrap();
+            assert!(painted.pixels().iter().all(|pixel| pixel.alpha() == 0));
+        }
+        // A different session has a standalone foreground cursor on this same
+        // display surface. It must not bring the background artwork with it.
+        apply_render_event(
+            &mut map,
+            RenderEvent::Feedback {
+                key: "foreground".to_owned(),
+                x: 70.0,
+                y: 70.0,
+                click_pulse: false,
+            },
+        );
+        let together = render_display(&map, &map.layout.displays[0], &WindowClips::new()).unwrap();
+        map.cursors.shift_remove("background");
+        let alone = render_display(&map, &map.layout.displays[0], &WindowClips::new()).unwrap();
+        assert_eq!(together.data(), alone.data());
+        assert!(alone.pixels().iter().any(|pixel| pixel.alpha() > 0));
+    }
+
+    #[test]
+    fn target_clip_masks_artwork_badge_and_focus_on_a_negative_retina_display() {
+        let mut map = empty_map();
+        let display = DisplayGeometry::new(
+            2,
+            [-100.0, 100.0, 100.0, 100.0],
+            [-100.0, -100.0, 100.0, 100.0],
+            2.0,
+        )
+        .unwrap();
+        let state = map.cursors.get_mut("default").unwrap();
+        state.core.set_position((-51.0, -50.0));
+        state.core.pinned_wid = Some(10);
+        state.core.session_label = Some("background".to_owned());
+        state.core.session_badge_secs = 0.0;
+        state.focus_rect = Some([-90.0, -90.0, 80.0, 80.0]);
+        state.focus_rect_t = 0.0;
+        let clips = WindowClips::from([(
+            10,
+            visibility::WindowClip {
+                bounds: Rect::from_xywh(-90.0, -90.0, 80.0, 80.0),
+                visible: vec![Rect::from_xywh(-90.0, -90.0, 40.0, 80.0).unwrap()],
+            },
+        )]);
+        let painted = render_display(&map, &display, &clips).unwrap();
+        assert!(painted.pixel(40, 40).unwrap().alpha() > 0);
+        for y in 0..painted.height() {
+            for x in 0..painted.width() {
+                if !(20..100).contains(&x) || !(20..180).contains(&y) {
+                    assert_eq!(painted.pixel(x, y).unwrap().alpha(), 0, "pixel {x},{y}");
+                }
+            }
+        }
     }
 
     fn move_msg(key: &str, x: f64, y: f64) -> OverlayMsg {
@@ -1732,8 +1972,8 @@ mod tests {
             !seed_start_in_map(&mut map, &key, 900.0, -500.0),
             "negative initialized positions must not be reseeded every action"
         );
-        let primary = render_display(&map, &map.layout.displays[0]).unwrap();
-        let external = render_display(&map, &map.layout.displays[1]).unwrap();
+        let primary = render_display(&map, &map.layout.displays[0], &WindowClips::new()).unwrap();
+        let external = render_display(&map, &map.layout.displays[1], &WindowClips::new()).unwrap();
         assert!(primary.data().iter().all(|value| *value == 0));
         assert!(external.data().chunks_exact(4).any(|pixel| pixel[3] > 96));
     }
@@ -1787,7 +2027,7 @@ mod tests {
         map.cursors.get_mut(&key).unwrap().tick(0.016);
         let before = (map.cursors[&key].core.pos, map.cursors[&key].core.dist);
         for display in &map.layout.displays {
-            render_display(&map, display).unwrap();
+            render_display(&map, display, &WindowClips::new()).unwrap();
         }
         assert_eq!(
             (map.cursors[&key].core.pos, map.cursors[&key].core.dist),

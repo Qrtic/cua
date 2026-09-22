@@ -2,6 +2,7 @@
 //! and layout generations, never NSWindow/CALayer pointers that hotplug retires.
 
 use super::displays::{DisplayGeometry, DisplayLayout};
+use super::visibility::{self, WindowClips};
 use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 use std::{
@@ -225,6 +226,7 @@ impl Drop for Frame {
 struct FrameBatch {
     generation: u64,
     frames: Vec<Frame>,
+    clips: WindowClips,
 }
 
 /// One queued batch, not an unbounded queue of full-resolution screen images.
@@ -251,17 +253,22 @@ static FRAMES: Mutex<LatestFrame<FrameBatch>> = Mutex::new(LatestFrame {
     scheduled: false,
 });
 
-pub(super) fn submit_frames(generation: u64, pixmaps: Vec<(u32, tiny_skia::Pixmap)>) {
+pub(super) fn submit_frames(
+    generation: u64,
+    pixmaps: Vec<(u32, tiny_skia::Pixmap)>,
+    clips: WindowClips,
+) {
     let frames = pixmaps
         .into_iter()
         .filter_map(|(display_id, pixmap)| {
             super::pixmap_to_cgimage(&pixmap).map(|image| Frame { display_id, image })
         })
         .collect();
-    let schedule = FRAMES
-        .lock()
-        .unwrap()
-        .replace(FrameBatch { generation, frames });
+    let schedule = FRAMES.lock().unwrap().replace(FrameBatch {
+        generation,
+        frames,
+        clips,
+    });
     if schedule {
         dispatch_main(std::ptr::null_mut(), present_frames);
     }
@@ -273,6 +280,20 @@ unsafe extern "C" fn present_frames(_ctx: *mut c_void) {
     };
     SURFACES.with(|cell| {
         let state = cell.borrow();
+        if batch.generation != state.layout.generation {
+            return;
+        }
+        if !visibility::clips_are_current(&batch.clips) {
+            // Window activation, movement or a closed save panel can race a
+            // queued frame. Clear stale pixels instead of briefly presenting
+            // them above the new foreground window, and request a fresh frame.
+            for surface in state.surfaces.values() {
+                let _: () = msg_send![&*surface.layer,
+                    setContents: std::ptr::null_mut::<AnyObject>()];
+            }
+            super::request_visibility_refresh();
+            return;
+        }
         for frame in &batch.frames {
             if !state
                 .layout

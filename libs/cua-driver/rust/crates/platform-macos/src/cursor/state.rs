@@ -30,9 +30,9 @@ impl Default for CursorConfig {
 
 /// Last logical target of the agent cursor.
 ///
-/// In asynchronous-feedback mode the renderer may still be gliding toward
-/// this point. Keyboard tools intentionally use this logical target so their
-/// follow-up action does not inherit decorative animation latency.
+/// In asynchronous-feedback mode the renderer updates this point on its next
+/// frame. Keyboard tools use the logical target immediately so their follow-up
+/// action does not inherit decorative rendering latency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorPosition {
     pub x: f64,
