@@ -958,6 +958,48 @@ fn activity() -> &'static Mutex<Activity> {
     ACTIVITY.get_or_init(|| Mutex::new(Activity::default()))
 }
 
+/// Last-event metadata only: no key, text, pointer position, or raw marker.
+/// This is diagnostic evidence and must never be used to admit an action or
+/// identify an untagged event as human input.
+#[derive(Clone, Copy)]
+struct ExternalEventEvidence {
+    at_ms: u64,
+    event_type: u32,
+    source_pid: i64,
+    driver_marker_matches: bool,
+}
+
+impl ExternalEventEvidence {
+    fn from_event(
+        at_ms: u64,
+        event_type: u32,
+        source_pid: i64,
+        driver_pid: i64,
+        driver_marker_matches: bool,
+    ) -> Option<Self> {
+        (!(source_pid == driver_pid && driver_marker_matches)).then_some(Self {
+            at_ms,
+            event_type,
+            source_pid,
+            driver_marker_matches,
+        })
+    }
+
+    fn diagnostic(self, now_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "age_ms": now_ms.saturating_sub(self.at_ms),
+            "event_type": self.event_type,
+            "source_pid": self.source_pid,
+            "driver_marker_matches": self.driver_marker_matches,
+        })
+    }
+}
+
+fn external_event_evidence() -> &'static Mutex<Option<ExternalEventEvidence>> {
+    static LAST: OnceLock<Mutex<Option<ExternalEventEvidence>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
 fn cookie() -> i64 {
     static COOKIE: OnceLock<i64> = OnceLock::new();
     *COOKIE.get_or_init(|| uuid::Uuid::new_v4().as_u128() as i64)
@@ -1130,19 +1172,33 @@ unsafe extern "C" fn observe_event(
     if event.is_null() || kind == u32::MAX || kind == u32::MAX - 1 {
         state.invalidate();
     } else {
-        let own =
-            CGEventGetIntegerValueField(event.cast(), EventField::EVENT_SOURCE_UNIX_PROCESS_ID)
-                == std::process::id() as i64
-                && CGEventGetIntegerValueField(event.cast(), EventField::EVENT_SOURCE_USER_DATA)
-                    == cookie();
+        let source_pid =
+            CGEventGetIntegerValueField(event.cast(), EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
+        let marker_matches =
+            CGEventGetIntegerValueField(event.cast(), EventField::EVENT_SOURCE_USER_DATA)
+                == cookie();
+        let now_ms = clock_ms();
+        let external = ExternalEventEvidence::from_event(
+            now_ms,
+            kind,
+            source_pid,
+            std::process::id() as i64,
+            marker_matches,
+        );
+        let own = external.is_none();
         state.event(
-            clock_ms(),
+            now_ms,
             if own {
                 Source::OwnGenerated
             } else {
                 Source::Unknown
             },
         );
+        if let Some(external) = external {
+            *external_event_evidence()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(external);
+        }
     }
     event
 }
@@ -1282,7 +1338,47 @@ pub(crate) fn generation_is_current(generation: u64) -> bool {
 }
 
 pub(crate) fn diagnostic_state() -> serde_json::Value {
-    diagnostic_state_from_snapshot(snapshot())
+    let current = snapshot();
+    let mut result = diagnostic_state_from_snapshot(current);
+    result["generation"] = serde_json::json!(current.generation);
+    if let Some(last) = *external_event_evidence()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+    {
+        result["last_external_event"] = last.diagnostic(clock_ms());
+    }
+    result
+}
+
+#[cfg(test)]
+mod external_event_diagnostic_tests {
+    use super::ExternalEventEvidence;
+
+    #[test]
+    fn own_tagged_input_does_not_replace_external_evidence() {
+        assert!(ExternalEventEvidence::from_event(100, 10, 42, 42, true).is_none());
+    }
+
+    #[test]
+    fn marker_or_pid_alone_stays_external() {
+        for (pid, marker) in [(42, false), (0, true), (81, false)] {
+            assert!(ExternalEventEvidence::from_event(100, 5, pid, 42, marker).is_some());
+        }
+    }
+
+    #[test]
+    fn diagnostic_exposes_only_bounded_metadata() {
+        let value = ExternalEventEvidence::from_event(100, 5, 0, 42, false)
+            .unwrap()
+            .diagnostic(110);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "age_ms": 10, "event_type": 5, "source_pid": 0,
+                "driver_marker_matches": false,
+            })
+        );
+    }
 }
 
 fn diagnostic_state_from_snapshot(current: Snapshot) -> serde_json::Value {
