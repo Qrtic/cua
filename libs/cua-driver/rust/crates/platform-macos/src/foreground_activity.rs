@@ -70,6 +70,7 @@ struct ActivityGuardedTool {
 struct InvocationContext {
     cancelled: AtomicBool,
     interrupted: AtomicBool,
+    interruption_cause: Mutex<Option<&'static str>>,
     cleanup_unconfirmed: AtomicBool,
     session_id: Option<String>,
     runtime_scope: Option<String>,
@@ -82,6 +83,26 @@ struct InvocationContext {
 }
 
 impl InvocationContext {
+    fn mark_interrupted(&self, cause: &'static str) {
+        let mut first_cause = self
+            .interruption_cause
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if first_cause.is_none() {
+            *first_cause = Some(cause);
+            let evidence = snapshot();
+            tracing::warn!(
+                target: "foreground_activity",
+                cause,
+                monitor_reliable = evidence.reliable,
+                activity_generation = evidence.generation,
+                idle_ms = evidence.idle_ms,
+                "Native foreground invocation interrupted"
+            );
+        }
+        self.interrupted.store(true, Ordering::Release);
+    }
+
     fn check(&self) -> anyhow::Result<()> {
         if self.cleanup_unconfirmed.load(Ordering::Acquire) {
             anyhow::bail!("native_cleanup_unconfirmed: stop task input until cleanup is confirmed");
@@ -101,7 +122,7 @@ impl InvocationContext {
                 .as_deref()
                 .is_some_and(cua_driver_core::session::is_runtime_scope_suspended)
         {
-            self.interrupted.store(true, Ordering::Release);
+            self.mark_interrupted("request_ended");
             if let Some(call) = &self.segment_call {
                 call.revoke();
             }
@@ -113,7 +134,7 @@ impl InvocationContext {
             .foreground_admission
             .is_some_and(|lease| !lease.permits(clock_ms(), snapshot()))
         {
-            self.interrupted.store(true, Ordering::Release);
+            self.mark_interrupted("activity_changed");
             if let Some(call) = &self.segment_call {
                 call.revoke();
             }
@@ -124,7 +145,7 @@ impl InvocationContext {
                 if call.cleanup_is_unknown() {
                     self.cleanup_unconfirmed.store(true, Ordering::Release);
                 }
-                self.interrupted.store(true, Ordering::Release);
+                self.mark_interrupted("segment_invalidated");
                 call.revoke();
                 return Err(error);
             }
@@ -203,6 +224,17 @@ impl InvocationContext {
         structured["verified"] = serde_json::json!(false);
         structured["retryable"] = serde_json::json!(false);
         structured["foreground_failure"] = serde_json::json!({"reason": reason});
+        if !cleanup_unconfirmed {
+            if let Some(cause) = *self
+                .interruption_cause
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+            {
+                // Additive, content-free detail. Keep foreground_failure's
+                // original shape compatible with existing public wrappers.
+                structured["foreground_interruption"] = serde_json::json!(cause);
+            }
+        }
         result.structured_content = Some(structured);
         result.content = vec![cua_driver_core::protocol::Content::text(message)];
         if let Some(record) = result.action_record.as_mut() {
@@ -305,9 +337,9 @@ fn check_invocation(required: bool) -> anyhow::Result<()> {
     }
 }
 
-fn record_interruption() {
+fn record_interruption(cause: &'static str) {
     if let Some(context) = current_invocation() {
-        context.interrupted.store(true, Ordering::Release);
+        context.mark_interrupted(cause);
         if let Some(call) = &context.segment_call {
             call.revoke();
         }
@@ -510,6 +542,7 @@ impl Tool for ActivityGuardedTool {
         let context = Arc::new(InvocationContext {
             cancelled: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
             // _session_id is injected by the canonical registry, unlike the
             // caller's optional public `session` display label.
@@ -664,7 +697,7 @@ impl Episode {
             if exact_target_is_frontmost(self.lease) {
                 call.mark_activated();
             } else if !call.accept_dialog_return() {
-                record_interruption();
+                record_interruption("dialog_return_unproven");
                 anyhow::bail!("foreground segment target changed after input; stop further calls");
             }
             if had_pressed_controls && result.is_ok() {
@@ -712,7 +745,7 @@ impl Drop for Episode {
 fn check_activity(lease: Lease) -> anyhow::Result<()> {
     check_invocation(true)?;
     if !lease.evidence.permits(clock_ms(), snapshot()) {
-        record_interruption();
+        record_interruption("activity_changed");
         anyhow::bail!(
             "foreground_activity_interrupted: stop task input; observe before continuing"
         );
@@ -725,13 +758,31 @@ fn exact_target_is_frontmost(lease: Lease) -> bool {
         && crate::ax::bindings::focused_window_id_of_pid(lease.pid) == Some(lease.window)
 }
 
+/// Cursor restoration is optional after completed input. A shortcut can open a
+/// new window or sheet, so a changed target skips this write without revoking
+/// the completed action. Activity/owner checks still run, and an actual restore
+/// must pass the strict input guard immediately before the native write.
+pub(crate) fn restore_cursor_if_target_unchanged(
+    restore: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let lease = LEASE
+        .with(Cell::get)
+        .ok_or_else(|| anyhow::anyhow!("bounded foreground episode is required"))?;
+    check_activity(lease)?;
+    if exact_target_is_frontmost(lease) {
+        check_input()?;
+        restore()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn check_input() -> anyhow::Result<()> {
     let lease = LEASE
         .with(Cell::get)
         .ok_or_else(|| anyhow::anyhow!("bounded foreground episode is required"))?;
     check_activity(lease)?;
     if !exact_target_is_frontmost(lease) {
-        record_interruption();
+        record_interruption("input_target_changed");
         anyhow::bail!("foreground target changed; stop input and observe again");
     }
     Ok(())
@@ -1450,6 +1501,7 @@ mod episode_lifecycle_tests {
         Arc::new(InvocationContext {
             cancelled: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
             session_id: Some("foreground-lifecycle-unit-session".into()),
             runtime_scope: Some("foreground-lifecycle-unit-runtime".into()),
@@ -1644,6 +1696,42 @@ mod episode_lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn optional_cursor_restore_cannot_create_a_foreground_episode() {
+        INVOCATION
+            .scope(context(), async {
+                assert!(spawn_blocking(|| {
+                    restore_cursor_if_target_unchanged(|| {
+                        panic!("restoration must not run outside an existing episode")
+                    })
+                    .is_err()
+                })
+                .await
+                .unwrap());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn first_interruption_cause_survives_later_owner_checks() {
+        let context = context();
+        context.mark_interrupted("dialog_return_unproven");
+        context.mark_interrupted("request_ended");
+        let mut result = cua_driver_core::protocol::ToolResult::text("action dispatched");
+        context.project_native_result(&mut result);
+        let structured = result.structured_content.unwrap();
+        assert_eq!(
+            structured["foreground_interruption"],
+            "dialog_return_unproven"
+        );
+        assert_eq!(
+            structured["foreground_failure"],
+            serde_json::json!({"reason":"native_interruption"})
+        );
+        assert_eq!(structured["effect"], "unverifiable");
+        assert_eq!(structured["retryable"], false);
+    }
+
+    #[tokio::test]
     async fn cleanup_unconfirmed_is_sticky_and_takes_precedence_over_interruption() {
         let context = context();
         INVOCATION
@@ -1699,6 +1787,7 @@ mod episode_lifecycle_tests {
         let mut unowned = InvocationContext {
             cancelled: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
             session_id: None,
             runtime_scope: Some("unit-runtime".into()),
@@ -1717,6 +1806,7 @@ mod episode_lifecycle_tests {
         unowned = InvocationContext {
             cancelled: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
             session_id: Some("unit-session".into()),
             runtime_scope: None,

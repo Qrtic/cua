@@ -989,6 +989,7 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
     let context = Arc::new(InvocationContext {
         cancelled: AtomicBool::new(false),
         interrupted: AtomicBool::new(false),
+        interruption_cause: Mutex::new(None),
         cleanup_unconfirmed: AtomicBool::new(false),
         session_id: Some(segment.binding.owner.session_id.clone()),
         runtime_scope: Some(segment.binding.owner.runtime_scope.clone()),
@@ -1193,6 +1194,7 @@ mod tests {
         Arc::new(InvocationContext {
             cancelled: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
+            interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
             session_id: None,
             runtime_scope: None,

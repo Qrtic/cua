@@ -228,11 +228,14 @@ fn click_at_xy_desktop_inner(
     // Let AppKit consume the up event before the pointer is restored. The
     // exact foreground guard remains active around this entire helper.
     std::thread::sleep(std::time::Duration::from_millis(40));
-    if let Some(prior) =
-        prior.filter(|_| result.is_ok() && crate::foreground_activity::check_input().is_ok())
-    {
-        let _ = CGDisplay::warp_mouse_cursor_position(prior);
-        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+    if let Some(prior) = prior.filter(|_| result.is_ok()) {
+        crate::foreground_activity::restore_cursor_if_target_unchanged(|| {
+            CGDisplay::warp_mouse_cursor_position(prior).map_err(|error| {
+                anyhow::anyhow!("CGWarpMouseCursorPosition restore failed: {error:?}")
+            })?;
+            unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+            Ok(())
+        })?;
     }
     result
 }
@@ -265,6 +268,10 @@ fn post_desktop_mouse_moved(source: &CGEventSource, point: CGPoint) -> anyhow::R
 trait ForegroundKeyboardPointerBackend {
     fn current_position(&mut self) -> anyhow::Result<ForegroundKeyboardAnchor>;
     fn warp(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()>;
+    fn restore_if_target_unchanged(
+        &mut self,
+        point: ForegroundKeyboardAnchor,
+    ) -> anyhow::Result<()>;
     fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()>;
     fn focus_click(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()>;
     fn wait(&mut self, duration: std::time::Duration);
@@ -300,6 +307,13 @@ impl ForegroundKeyboardPointerBackend for QuartzForegroundKeyboardPointer {
             .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
         unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
         Ok(())
+    }
+
+    fn restore_if_target_unchanged(
+        &mut self,
+        point: ForegroundKeyboardAnchor,
+    ) -> anyhow::Result<()> {
+        crate::foreground_activity::restore_cursor_if_target_unchanged(|| self.warp(point))
     }
 
     fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
@@ -412,7 +426,7 @@ fn with_foreground_keyboard_pointer_context_using<B: ForegroundKeyboardPointerBa
     let action_result = action();
     backend.wait(post_action_drain);
     action_result?;
-    backend.warp(prior)
+    backend.restore_if_target_unchanged(prior)
 }
 
 /// Scroll the foreground desktop surface at a logical screen point through the
@@ -1661,6 +1675,7 @@ mod tests {
     struct RecordingPointerBackend {
         prior: ForegroundKeyboardAnchor,
         events: Rc<RefCell<Vec<String>>>,
+        target_unchanged: Rc<std::cell::Cell<bool>>,
     }
 
     impl ForegroundKeyboardPointerBackend for RecordingPointerBackend {
@@ -1673,6 +1688,16 @@ mod tests {
             self.events
                 .borrow_mut()
                 .push(format!("warp:{:.0},{:.0}", point.x, point.y));
+            Ok(())
+        }
+
+        fn restore_if_target_unchanged(
+            &mut self,
+            point: ForegroundKeyboardAnchor,
+        ) -> anyhow::Result<()> {
+            if self.target_unchanged.get() {
+                self.warp(point)?;
+            }
             Ok(())
         }
 
@@ -1716,6 +1741,13 @@ mod tests {
             Ok(())
         }
 
+        fn restore_if_target_unchanged(
+            &mut self,
+            point: ForegroundKeyboardAnchor,
+        ) -> anyhow::Result<()> {
+            self.warp(point)
+        }
+
         fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
             self.move_count += 1;
             self.events
@@ -1747,6 +1779,7 @@ mod tests {
         let mut backend = RecordingPointerBackend {
             prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
             events: events.clone(),
+            target_unchanged: Rc::new(std::cell::Cell::new(true)),
         };
         let anchor = ForegroundKeyboardAnchor { x: 500.0, y: 350.0 };
 
@@ -1782,6 +1815,7 @@ mod tests {
         let mut backend = RecordingPointerBackend {
             prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
             events: events.clone(),
+            target_unchanged: Rc::new(std::cell::Cell::new(true)),
         };
         let anchor = ForegroundKeyboardAnchor { x: 500.0, y: 350.0 };
 
@@ -1821,6 +1855,7 @@ mod tests {
         let mut backend = RecordingPointerBackend {
             prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
             events: events.clone(),
+            target_unchanged: Rc::new(std::cell::Cell::new(true)),
         };
 
         let error = with_foreground_keyboard_pointer_context_using(
@@ -1842,6 +1877,42 @@ mod tests {
                 .count(),
             1,
             "restoration must not post a second MouseMoved"
+        );
+    }
+
+    #[test]
+    fn foreground_keyboard_opening_a_sheet_preserves_input_and_skips_cursor_restore() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let target_unchanged = Rc::new(std::cell::Cell::new(true));
+        let mut backend = RecordingPointerBackend {
+            prior: ForegroundKeyboardAnchor { x: 12.0, y: 34.0 },
+            events: events.clone(),
+            target_unchanged: target_unchanged.clone(),
+        };
+
+        with_foreground_keyboard_pointer_context_using(
+            &mut backend,
+            ForegroundKeyboardAnchor { x: 500.0, y: 350.0 },
+            false,
+            std::time::Duration::from_millis(40),
+            || {
+                events.borrow_mut().push("keyboard:opened-sheet".into());
+                target_unchanged.set(false);
+                Ok(())
+            },
+        )
+        .expect("opening a new sheet must not turn completed keyboard input into an error");
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                "capture",
+                "warp:500,350",
+                "move:500,350",
+                "wait:40",
+                "keyboard:opened-sheet",
+                "wait:40",
+            ]
         );
     }
 
