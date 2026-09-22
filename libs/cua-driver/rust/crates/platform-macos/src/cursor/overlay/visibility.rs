@@ -126,10 +126,13 @@ fn clip_for_window(target: u64, windows: &[WindowInfo], overlay_pid: i32) -> Win
     let mut visible = vec![bounds];
     for cover in windows.iter().filter(|cover| {
         cover.is_on_screen
+            // Our surfaces stay at normal window level. Higher-level panels
+            // already composite above them. Their bounding boxes are not an
+            // opacity mask: Dock, for example, owns a transparent screen-sized
+            // layer-20 window that would otherwise hide every cursor.
+            && cover.layer == 0
             && cover.z_index > window.z_index
-            // Ignore our transparent display surfaces, not the floating PiP
-            // panel (layer 3), which must still cover background feedback.
-            && !(cover.pid == overlay_pid && cover.layer == 0)
+            && cover.pid != overlay_pid
     }) {
         let Some(cover) = Rect::from_bounds(&cover.bounds) else {
             continue;
@@ -240,15 +243,21 @@ mod tests {
     }
 
     #[test]
-    fn floating_pip_and_same_app_windows_still_occlude() {
+    fn higher_level_compositor_bounds_do_not_hide_normal_window_feedback() {
         let target = window(1, 10, 10, [0.0, 0.0, 100.0, 100.0]);
-        let mut cover = window(2, 99, 20, [0.0, 0.0, 100.0, 100.0]);
-        cover.layer = 3;
-        assert!(clip_for_window(1, &[target.clone(), cover.clone()], 99)
-            .visible
-            .is_empty());
+        let mut cover = window(2, 20, 20, [0.0, 0.0, 1728.0, 1117.0]);
+        for layer in [3, 20, 25, 101] {
+            cover.layer = layer;
+            let clip = clip_for_window(1, &[target.clone(), cover.clone()], 99);
+            assert_eq!(clip.visible, vec![clip.bounds.unwrap()]);
+        }
+    }
+
+    #[test]
+    fn same_app_normal_windows_still_occlude_the_target() {
+        let target = window(1, 10, 10, [0.0, 0.0, 100.0, 100.0]);
+        let mut cover = window(2, 10, 20, [0.0, 0.0, 100.0, 100.0]);
         cover.layer = 0;
-        cover.pid = target.pid;
         assert!(clip_for_window(1, &[target, cover], 99).visible.is_empty());
     }
 }
