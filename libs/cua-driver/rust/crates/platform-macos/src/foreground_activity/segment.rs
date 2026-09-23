@@ -426,8 +426,19 @@ impl Call {
             .summary
             .clone()
     }
-    pub(super) fn accept_dialog_return(&self) -> bool {
-        self.segment.accept_dialog_return()
+    pub(super) fn settle_dialog_return(
+        &self,
+        check_live: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if self.segment.dialog_host.is_none() {
+            return Ok(false);
+        }
+        // AppKit may switch its focused window before WindowServer finishes
+        // hiding the sheet. Wait only for the original exact-host proof;
+        // this sends no input, changes no focus and grants no new target.
+        settle_dialog_condition(Duration::from_millis(350), check_live, || {
+            self.segment.accept_dialog_return()
+        })
     }
     pub(super) fn dialog_closed_summary(&self) -> Option<Value> {
         self.segment.dialog_closed().then(|| {
@@ -436,6 +447,29 @@ impl Call {
                 "pid": self.target().pid, "window_id": self.target().window_id,
             })
         })
+    }
+}
+
+fn settle_dialog_condition(
+    budget: Duration,
+    mut check_live: impl FnMut() -> anyhow::Result<()>,
+    mut probe: impl FnMut() -> bool,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + budget;
+    loop {
+        check_live()?;
+        let returned = probe();
+        // A successful AX/WindowServer read cannot override intervening input,
+        // cancellation, ended ownership or an exhausted native segment.
+        check_live()?;
+        if returned {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
@@ -1120,6 +1154,57 @@ pub(crate) fn stop_runtime_segments(runtime_scope: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_return_waits_for_appkit_and_windowserver_to_agree() {
+        let reads = Cell::new(0);
+        assert!(settle_dialog_condition(
+            Duration::from_millis(100),
+            || Ok(()),
+            || {
+                reads.set(reads.get() + 1);
+                reads.get() >= 3
+            },
+        )
+        .unwrap());
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn dialog_return_settlement_stops_before_reading_after_cancellation() {
+        let error = settle_dialog_condition(
+            Duration::from_millis(100),
+            || anyhow::bail!("request cancelled"),
+            || panic!("cancelled ownership must not perform another AX query"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("request cancelled"));
+    }
+
+    #[test]
+    fn dialog_return_proof_does_not_override_activity_during_the_read() {
+        let changed = Cell::new(false);
+        let error = settle_dialog_condition(
+            Duration::from_millis(100),
+            || {
+                if changed.get() {
+                    anyhow::bail!("activity changed");
+                }
+                Ok(())
+            },
+            || {
+                changed.set(true);
+                true
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("activity changed"));
+    }
+
+    #[test]
+    fn dialog_return_without_exact_host_proof_expires_without_acceptance() {
+        assert!(!settle_dialog_condition(Duration::from_millis(15), || Ok(()), || false).unwrap());
+    }
 
     fn idle() -> Snapshot {
         Snapshot {

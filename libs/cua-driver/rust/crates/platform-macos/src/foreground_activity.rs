@@ -696,7 +696,7 @@ impl Episode {
         if let Some(call) = &self.segment {
             if exact_target_is_frontmost(self.lease) {
                 call.mark_activated();
-            } else if !call.accept_dialog_return() {
+            } else if !call.settle_dialog_return(|| self.check())? {
                 record_interruption("dialog_return_unproven");
                 anyhow::bail!("foreground segment target changed after input; stop further calls");
             }
