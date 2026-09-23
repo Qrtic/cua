@@ -1601,6 +1601,18 @@ impl Tool for GetWindowStateTool {
         if let Some((_, context, _)) = app_context_observation.as_ref() {
             structured["selection"] = context.selection_json(true);
         }
+        // A desktop-independent app capture cannot show another process's
+        // permission alert. Advertise that separate observable surface without
+        // guessing a host association or transferring this window's authority.
+        if let Ok(dialogs) = crate::foreground_activity::spawn_blocking(move || {
+            crate::apps::system_dialogs::observation_advisories(requested_pid)
+        })
+        .await
+        {
+            if !dialogs.is_empty() {
+                structured["system_dialogs"] = serde_json::json!(dialogs);
+            }
+        }
         if let Some(target) = transient_target {
             apply_transient_observation_contract(&mut structured, source_target, target);
         }

@@ -12,7 +12,7 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_windows".into(),
-        description: "List public layer-0 top-level windows currently known to WindowServer. \
+        description: "List public layer-0 top-level windows and verified visible macOS system dialogs currently known to WindowServer. \
             Includes off-screen windows (minimized, on another Space, hidden-launched). \
             Private trusted system helpers such as the AppKit Open/Save panel service are omitted; \
             observe those only through the original host application's app_context. \
@@ -84,6 +84,19 @@ impl Tool for ListWindowsTool {
         };
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;
+        let mut added_system_dialog_ids = std::collections::HashSet::new();
+        // UserNotificationCenter permission alerts use an accessory layer.
+        // Add only its signed, visible AXSystemDialog windows, not every menu,
+        // tooltip or system helper on a nonzero layer.
+        for dialog in crate::apps::system_dialogs::visible_windows() {
+            if !windows
+                .iter()
+                .any(|window| window.window_id == dialog.window_id)
+            {
+                added_system_dialog_ids.insert(dialog.window_id);
+                windows.push(dialog);
+            }
+        }
 
         // The AppKit Open/Save XPC service is an implementation detail, not a
         // public application/window target. Use the cheap bundle/path/name
@@ -147,7 +160,13 @@ impl Tool for ListWindowsTool {
                     .as_ref()
                     .and_then(|evidence| evidence.get(&window.window_id))
                     .copied();
-                window_record_with_lifecycle_evidence(window, evidence)
+                let mut record = window_record_with_lifecycle_evidence(window, evidence);
+                if added_system_dialog_ids.contains(&window.window_id) {
+                    // This row came from a separate on-screen snapshot; its
+                    // rank is not comparable to the original inventory ranks.
+                    record["z_index"] = Value::Null;
+                }
+                record
             })
             .collect();
 

@@ -1,6 +1,7 @@
 //! macOS app enumeration via NSWorkspace and NSRunningApplication.
 
 pub mod nsworkspace;
+pub(crate) mod system_dialogs;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,9 @@ pub struct AppInfo {
     /// runtime list and whose bundle path could not be resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_path: Option<String>,
-    /// Kind discriminator. macOS reports `"desktop"` for every `.app` bundle.
-    /// Reserved for future use on platforms with packaged-app distinctions
-    /// (e.g. Windows UWP packages).
+    /// Kind discriminator: ordinary `.app` bundles are `"desktop"`; a verified
+    /// visible system permission dialog is `"system_dialog"` and is not a
+    /// launch target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// RFC3339 timestamp of the launcher's filesystem `LastAccessTime` /
@@ -94,6 +95,11 @@ fn list_running_apps_native() -> Vec<AppInfo> {
 ///     without needing a separate `list_running_apps` lookup, so we
 ///     can't race a same-bundle-id helper that happens to be running.
 pub fn launch_app(bundle_id: &str) -> anyhow::Result<i32> {
+    if bundle_id == system_dialogs::BUNDLE_ID {
+        anyhow::bail!(
+            "System dialogs must already exist; observe the system app instead of launching it"
+        );
+    }
     // Pass the bundle id straight through — `nsworkspace::resolve_application_url`
     // calls `URLForApplicationWithBundleIdentifier` and uses the resulting
     // NSURL verbatim. Going via a `path` string and back loses the
@@ -423,9 +429,13 @@ fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
 ///   * `running` (true for currently-live processes, false for installed-only),
 ///   * `pid` (live pid when running, `0` otherwise),
 ///   * `launch_path` (filesystem `.app` path when known, else `None`),
-///   * `kind` (`"desktop"` on macOS).
+///   * `kind` (`"desktop"`, or `"system_dialog"` for a visible verified dialog).
 pub fn list_all_apps() -> Vec<AppInfo> {
     let mut running = list_running_apps();
+    // Permission dialogs live in an accessory system app rather than the
+    // application they mention. Keep regular-app enumeration unchanged for
+    // focus/lifecycle callers; add only verified visible dialogs to discovery.
+    running.extend(system_dialogs::running_apps());
     let installed = scan_installed_apps();
     // Lookup: bundle_id → (launch_path, last_used) from the installed scan.
     let installed_by_bundle: std::collections::HashMap<String, (Option<String>, Option<String>)> =

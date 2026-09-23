@@ -21,8 +21,10 @@ fn def() -> &'static ToolDef {
             - kind: `\"desktop\"` for `.app` bundles on macOS.\n\
             - last_used: RFC3339 timestamp from the bundle's filesystem mtime, \
             when readable; otherwise null.\n\n\
-            Only apps with NSApplicationActivationPolicyRegular are included — \
-            background helpers and system UI agents are filtered out. Installed \
+            Regular apps and the Apple-signed UserNotificationCenter while it has \
+            a visible AXSystemDialog are included. That separate target has kind \
+            system_dialog and is not launchable. Other background helpers and \
+            system UI agents are filtered out. Installed \
             apps come from scanning /Applications, /Applications/Utilities, \
             ~/Applications, /System/Applications, and /System/Applications/Utilities.\n\n\
             Use this for \"is X installed?\" as well as \"is X running?\". For \
