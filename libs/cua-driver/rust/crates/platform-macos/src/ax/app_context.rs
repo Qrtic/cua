@@ -370,14 +370,26 @@ fn signed_open_save_panel_executable_path(pid: i32) -> Option<String> {
         "anchor apple and identifier \"{OPEN_SAVE_PANEL_HELPER_BUNDLE_ID}\""
     ))
     .ok()?;
-    code.check_validity(
-        Flags::CHECK_TRUSTED_ANCHORS | Flags::NO_NETWORK_ACCESS,
-        &requirement,
-    )
-    .ok()?;
+    // SecCodeCheckValidity dynamically validates the running process. Static
+    // validation flags return errSecCSInvalidFlags (-67070) here. The explicit
+    // Apple anchor and identifier requirement remains mandatory.
+    code.check_validity(Flags::NONE, &requirement).ok()?;
     let url = code.path(Flags::NONE).ok()?;
-    let path = url.get_file_system_path(kCFURLPOSIXPathStyle).to_string();
-    trusted_open_save_panel_path(&path).then_some(path)
+    let code_path = url.get_file_system_path(kCFURLPOSIXPathStyle).to_string();
+    let executable_path = crate::apps::executable_path_for_pid(pid)?;
+    signed_panel_path_matches_executable(&code_path, &executable_path).then_some(executable_path)
+}
+
+fn signed_panel_path_matches_executable(code_path: &str, executable_path: &str) -> bool {
+    if !trusted_open_save_panel_path(executable_path) {
+        return false;
+    }
+    // SecCodeCopyPath normally names the .xpc bundle, not Contents/MacOS/...
+    // Require that bundle to be the parent of this exact trusted executable.
+    let bundle_path = executable_path
+        .rsplit_once("/Contents/MacOS/")
+        .map(|pair| pair.0);
+    code_path == executable_path || bundle_path == Some(code_path.trim_end_matches('/'))
 }
 
 pub(crate) fn looks_like_open_save_panel_process(pid: i32) -> bool {
@@ -1609,6 +1621,39 @@ mod tests {
             true,
             Some(OPEN_SAVE_PANEL_HELPER_SYSTEM_PATH),
             false,
+        ));
+    }
+
+    #[test]
+    fn signed_panel_bundle_path_must_match_the_exact_running_executable() {
+        let executable = OPEN_SAVE_PANEL_HELPER_SYSTEM_PATH;
+        let bundle = executable.rsplit_once("/Contents/MacOS/").unwrap().0;
+        assert!(signed_panel_path_matches_executable(bundle, executable));
+        assert!(signed_panel_path_matches_executable(
+            &format!("{bundle}/"),
+            executable
+        ));
+        assert!(signed_panel_path_matches_executable(executable, executable));
+        assert!(!signed_panel_path_matches_executable(
+            "/tmp/lookalike.xpc",
+            executable
+        ));
+        assert!(!signed_panel_path_matches_executable(
+            bundle,
+            "/tmp/lookalike"
+        ));
+        let cryptex_executable = format!("{CRYPTEX_SYSTEM_PREFIX}OS{executable}");
+        let cryptex_bundle = cryptex_executable
+            .rsplit_once("/Contents/MacOS/")
+            .unwrap()
+            .0;
+        assert!(signed_panel_path_matches_executable(
+            cryptex_bundle,
+            &cryptex_executable
+        ));
+        assert!(!signed_panel_path_matches_executable(
+            bundle,
+            &cryptex_executable
         ));
     }
 
