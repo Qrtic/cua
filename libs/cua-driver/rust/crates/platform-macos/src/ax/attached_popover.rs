@@ -32,43 +32,72 @@ trait PopoverTree {
 }
 
 fn prove<T: PopoverTree>(tree: &T, pid: i32, host_id: u32, element: &T::Node) -> bool {
+    match prove_checked(tree, pid, host_id, element) {
+        Ok(()) => true,
+        Err(reason) => {
+            // Bounded diagnostic facts only; never log labels or text values.
+            tracing::debug!(target: "cua_popover_proof", pid, host_id, reason,
+                "attached popover proof refused");
+            false
+        }
+    }
+}
+
+fn prove_checked<T: PopoverTree>(
+    tree: &T,
+    pid: i32,
+    host_id: u32,
+    element: &T::Node,
+) -> Result<(), &'static str> {
     // This route deliberately covers controls, not text/value writes or focus.
     if tree.role(element).as_deref() != Some("AXButton") {
-        return false;
+        return Err("element_not_button");
     }
     let Some(popover) = tree.window(element) else {
-        return false;
+        return Err("element_window_missing");
     };
-    if tree.role(&popover).as_deref() != Some("AXPopover") || tree.owner(&popover) != Some(pid) {
-        return false;
+    let popover_role = tree.role(&popover);
+    if popover_role.as_deref() != Some("AXPopover") {
+        tracing::debug!(target: "cua_popover_proof", role = ?popover_role,
+            "element window is not a popover");
+        return Err("element_window_not_popover");
+    }
+    if tree.owner(&popover) != Some(pid) {
+        return Err("popover_owner_mismatch");
     }
     let Some(popover_id) = tree.window_id(&popover).filter(|id| *id != host_id) else {
-        return false;
+        return Err("popover_window_id_missing_or_host");
     };
     let Some(host) = tree.window(&popover) else {
-        return false;
+        return Err("popover_host_attribute_missing");
     };
-    if !matches!(tree.role(&host).as_deref(), Some("AXWindow" | "AXSheet"))
-        || tree.owner(&host) != Some(pid)
-        || tree.window_id(&host) != Some(host_id)
-    {
-        return false;
+    if !matches!(tree.role(&host).as_deref(), Some("AXWindow" | "AXSheet")) {
+        return Err("host_role_unexpected");
+    }
+    if tree.owner(&host) != Some(pid) {
+        return Err("host_owner_mismatch");
+    }
+    if tree.window_id(&host) != Some(host_id) {
+        return Err("host_window_id_mismatch");
     }
 
     let mut current = element.clone();
     let mut visited = Vec::new();
     let mut crossed_popover = false;
-    for _ in 0..MAX_DEPTH {
-        if !tree.within_budget()
-            || tree.owner(&current) != Some(pid)
-            || visited.iter().any(|node| tree.same(node, &current))
-        {
-            return false;
+    for depth in 0..MAX_DEPTH {
+        if !tree.within_budget() {
+            return Err("ancestry_deadline");
+        }
+        if tree.owner(&current) != Some(pid) {
+            return Err("ancestor_owner_mismatch");
+        }
+        if visited.iter().any(|node| tree.same(node, &current)) {
+            return Err("ancestry_cycle");
         }
         if tree.same(&current, &host) {
             // Re-read the attachment after traversal; an old AXParent alone
             // must not authorize a closed or reattached panel.
-            return crossed_popover
+            let unchanged = crossed_popover
                 && tree.window_id(&current) == Some(host_id)
                 && tree.window_id(&popover) == Some(popover_id)
                 && tree
@@ -78,26 +107,34 @@ fn prove<T: PopoverTree>(tree: &T, pid: i32, host_id: u32, element: &T::Node) ->
                     .window(&popover)
                     .is_some_and(|node| tree.same(&node, &host))
                 && tree.within_budget();
+            return unchanged.then_some(()).ok_or("attachment_changed");
         }
-        match tree.role(&current).as_deref() {
+        let role = tree.role(&current);
+        match role.as_deref() {
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
             }
             Some("AXButton" | "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup") => {}
             // A different top-level window, nested popover, web subtree or
             // application root cannot be treated as an attachment to this host.
-            _ => return false,
+            _ => {
+                tracing::debug!(target: "cua_popover_proof", depth, role = ?role,
+                    "unexpected role in popover ancestry");
+                return Err("ancestor_role_unexpected");
+            }
         }
         let Some(parent) = tree.parent(&current) else {
-            return false;
+            return Err("ancestor_parent_missing");
         };
         if !tree.contains_child(&parent, &current) {
-            return false;
+            tracing::debug!(target: "cua_popover_proof", depth, role = ?role,
+                "popover ancestry lacks reciprocal child relation");
+            return Err("ancestor_child_relation_missing");
         }
         visited.push(current);
         current = parent;
     }
-    false
+    Err("ancestry_depth_limit")
 }
 
 /// No unknown-action mapping, selection writes, ancestor or pixel fallback.
@@ -349,6 +386,25 @@ mod tests {
     #[test]
     fn pages_swatch_crosses_its_attached_popover_to_exact_host() {
         assert!(prove(&pages(), 42, 700, &0));
+    }
+    #[test]
+    fn refusal_diagnostics_distinguish_attachment_and_ancestry_failures() {
+        let mut tree = pages();
+        tree.nodes.get_mut(&2).unwrap().window = None;
+        assert_eq!(
+            prove_checked(&tree, 42, 700, &0),
+            Err("popover_host_attribute_missing")
+        );
+        let mut tree = pages();
+        tree.nodes.get_mut(&3).unwrap().children.clear();
+        assert_eq!(
+            prove_checked(&tree, 42, 700, &0),
+            Err("ancestor_child_relation_missing")
+        );
+        assert_eq!(
+            prove_checked(&pages(), 42, 701, &0),
+            Err("host_window_id_mismatch")
+        );
     }
     #[test]
     fn exact_popover_window_keeps_ordinary_route() {
