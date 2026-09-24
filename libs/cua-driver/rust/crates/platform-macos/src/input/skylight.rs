@@ -522,6 +522,27 @@ pub(super) fn window_tagged_return_event_on_main(
     construct_window_tagged_return_event(window_id, down)
 }
 
+// objc2-app-kit 0.2 does not bind eventWithCGEvent:. Its argument is an
+// opaque __CGEvent pointer, not void*. Keep the native encoding for objc2's
+// message signature validation without changing ownership or copying events.
+#[repr(C)]
+struct EncodedCGEvent {
+    _private: [u8; 0],
+}
+
+unsafe impl objc2::encode::RefEncode for EncodedCGEvent {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CGEvent", &[]));
+}
+
+/// The caller must keep an autorelease pool and the original CGEvent alive.
+unsafe fn nsevent_readback(event: &core_graphics::event::CGEvent) -> *mut objc2_app_kit::NSEvent {
+    use foreign_types::ForeignType;
+    use objc2::{class, msg_send};
+    let event_ptr = event.as_ptr().cast::<EncodedCGEvent>();
+    msg_send![class!(NSEvent), eventWithCGEvent: event_ptr]
+}
+
 /// Construct, but never post, a directly owned standard HID-source CG Return.
 /// The production caller above proves main-thread execution for this entire
 /// function, including the pre-tag baseline and all NSEvent character reads.
@@ -535,8 +556,7 @@ fn construct_window_tagged_return_event(
         event_source::{CGEventSource, CGEventSourceStateID},
     };
     use foreign_types::ForeignType;
-    use objc2::{class, msg_send};
-    use objc2_app_kit::{NSEvent, NSEventType};
+    use objc2_app_kit::NSEventType;
     if window_id == 0 {
         anyhow::bail!("window-tagged Return requires an exact nonzero window");
     }
@@ -578,9 +598,7 @@ fn construct_window_tagged_return_event(
         } else {
             NSEventType::KeyUp
         };
-        let event_ptr = event.as_ptr().cast::<c_void>();
-        let readback: *mut NSEvent = msg_send![class!(NSEvent), eventWithCGEvent: event_ptr];
-        let readback = readback
+        let readback = nsevent_readback(&event)
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("standard Return cannot be read back"))?;
         let native_characters = readback.characters().map(|s| s.to_string());
@@ -3698,9 +3716,7 @@ mod tests {
             crate::foreground_activity::mark_generated(&event);
             sample("cookie", 7_654_321);
             objc2::rc::autoreleasepool(|_| unsafe {
-                use objc2::{class, msg_send};
-                use objc2_app_kit::NSEvent;
-                let native: *mut NSEvent = msg_send![class!(NSEvent), eventWithCGEvent: event.as_ptr().cast::<std::ffi::c_void>()];
+                let native = super::nsevent_readback(&event);
                 let native = native.as_ref().unwrap();
                 assert_eq!(
                     native
@@ -3743,9 +3759,7 @@ mod tests {
             // Match the constructor's native readback for this standard CG
             // control; CG Unicode may legitimately be empty on this thread.
             objc2::rc::autoreleasepool(|_| unsafe {
-                use objc2::{class, msg_send};
-                use objc2_app_kit::NSEvent;
-                let native: *mut NSEvent = msg_send![class!(NSEvent), eventWithCGEvent: event.as_ptr().cast::<std::ffi::c_void>()];
+                let native = super::nsevent_readback(event);
                 let native = native
                     .as_ref()
                     .expect("standard CG event has native readback");
