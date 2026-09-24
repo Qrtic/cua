@@ -804,16 +804,37 @@ fn exact_target_is_frontmost(lease: Lease) -> bool {
 /// Cursor restoration is optional after completed input. A shortcut can open a
 /// new window or sheet, so a changed target skips this write without revoking
 /// the completed action. Activity/owner checks still run, and an actual restore
-/// must pass the strict input guard immediately before the native write.
+/// must still prove the exact target immediately before the native write.
 pub(crate) fn restore_cursor_if_target_unchanged(
     restore: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let lease = LEASE
         .with(Cell::get)
         .ok_or_else(|| anyhow::anyhow!("bounded foreground episode is required"))?;
-    check_activity(lease)?;
-    if exact_target_is_frontmost(lease) {
-        check_input()?;
+    restore_cursor_with(
+        || check_activity(lease),
+        || exact_target_is_frontmost(lease),
+        restore,
+    )
+}
+
+fn restore_cursor_with(
+    mut check_live: impl FnMut() -> anyhow::Result<()>,
+    mut target_matches: impl FnMut() -> bool,
+    restore: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    check_live()?;
+    let matched = target_matches();
+    check_live()?;
+    if !matched {
+        return Ok(());
+    }
+    // Focus can change between these reads when a completed shortcut opens a
+    // sheet. This optional write must decline without marking input interrupted.
+    // The restore callback must not re-enter the mandatory input guard.
+    let matched = target_matches();
+    check_live()?;
+    if matched {
         restore()?;
     }
     Ok(())
@@ -1530,6 +1551,48 @@ mod episode_lifecycle_tests {
         event::CGEventFlags,
         event_source::{CGEventSource, CGEventSourceStateID},
     };
+
+    #[test]
+    fn cursor_restore_skips_focus_change_during_final_check_without_interrupting_input() {
+        for sequence in [vec![false], vec![true, false], vec![true, true]] {
+            let writes = Cell::new(0);
+            let mut samples = sequence.clone().into_iter();
+            restore_cursor_with(
+                || Ok(()),
+                || samples.next().expect("unexpected extra focus check"),
+                || {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(writes.get(), usize::from(sequence == [true, true]));
+            assert!(samples.next().is_none());
+        }
+    }
+
+    #[test]
+    fn cursor_restore_does_not_mask_activity_or_owner_loss_during_focus_reads() {
+        for fail_at in 1..=3 {
+            let checks = Cell::new(0);
+            let writes = Cell::new(0);
+            let error = restore_cursor_with(
+                || {
+                    checks.set(checks.get() + 1);
+                    anyhow::ensure!(checks.get() != fail_at, "owner/activity ended");
+                    Ok(())
+                },
+                || true,
+                || {
+                    writes.set(writes.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "owner/activity ended");
+            assert_eq!(writes.get(), 0);
+        }
+    }
 
     #[test]
     fn admission_refusal_retains_the_failed_snapshot_without_dispatch_or_identity() {

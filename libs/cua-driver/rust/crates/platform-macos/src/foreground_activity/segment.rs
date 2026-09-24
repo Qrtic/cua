@@ -508,7 +508,8 @@ impl Call {
         // WindowServer finishes its animation. Preserve the ORIGINAL lease,
         // owner, panel and deadline. No input can use the new target until a
         // fresh observation; the current call's exact target never changes.
-        settle_dialog_condition(
+        let started = Instant::now();
+        let settled = settle_dialog_condition(
             Duration::from_millis(350),
             || {
                 check_live()?;
@@ -601,7 +602,23 @@ impl Call {
                 inner.dialog_observation_required = true;
                 true
             },
-        )
+        );
+        if matches!(settled, Ok(false)) {
+            let windows = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+            let relevant: Vec<_> = windows
+                .windows
+                .iter()
+                .filter(|window| window.pid == self.target.pid)
+                .take(64)
+                .map(|window| (window.window_id, window.is_on_screen))
+                .collect();
+            tracing::warn!(pid=self.target.pid, window_id=self.target.window_id,
+                host=?self.segment.dialog_host, panel=?self.segment.dialog_panel,
+                focused_window_id=?bounded_focused_window(self.target.pid),
+                elapsed_ms=started.elapsed().as_millis(), snapshot_succeeded=windows.succeeded,
+                windows=?relevant, "dialog settlement could not prove the resulting window");
+        }
+        settled
     }
 
     pub(super) fn dialog_closed_summary(&self) -> Option<Value> {

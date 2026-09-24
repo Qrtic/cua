@@ -287,6 +287,17 @@ impl QuartzForegroundKeyboardPointer {
             .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
         Ok(Self { source })
     }
+
+    // Both callers establish their own mandatory/optional foreground admission
+    // immediately before this write. Restoration must not re-run check_input,
+    // which would misclassify a newly opened sheet as an interrupted chord.
+    fn warp_admitted(point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
+        use core_graphics::display::CGDisplay;
+        CGDisplay::warp_mouse_cursor_position(CGPoint::new(point.x, point.y))
+            .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
+        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+        Ok(())
+    }
 }
 
 impl ForegroundKeyboardPointerBackend for QuartzForegroundKeyboardPointer {
@@ -301,19 +312,15 @@ impl ForegroundKeyboardPointerBackend for QuartzForegroundKeyboardPointer {
     }
 
     fn warp(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
-        use core_graphics::display::CGDisplay;
         crate::foreground_activity::check_input()?;
-        CGDisplay::warp_mouse_cursor_position(CGPoint::new(point.x, point.y))
-            .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
-        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-        Ok(())
+        Self::warp_admitted(point)
     }
 
     fn restore_if_target_unchanged(
         &mut self,
         point: ForegroundKeyboardAnchor,
     ) -> anyhow::Result<()> {
-        crate::foreground_activity::restore_cursor_if_target_unchanged(|| self.warp(point))
+        crate::foreground_activity::restore_cursor_if_target_unchanged(|| Self::warp_admitted(point))
     }
 
     fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
