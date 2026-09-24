@@ -447,6 +447,11 @@ impl Tool for ActivityGuardedTool {
             Err(result) => return result,
         };
         if self.def().name == "get_window_state" && segment_call.is_none() {
+            // Start passive coverage while reading the first observation, not
+            // only when the first mutation asks for a health snapshot. The
+            // read still needs no idle lease; later input must independently
+            // satisfy unchanged permission, health and activity guards.
+            start_monitor();
             return self.inner.invoke(args).await;
         }
         if self.def().name == "move_cursor"
