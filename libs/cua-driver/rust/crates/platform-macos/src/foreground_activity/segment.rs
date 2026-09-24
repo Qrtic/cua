@@ -60,6 +60,13 @@ fn failure(code: &str, message: &str, refused: bool) -> ToolResult {
     }))
 }
 
+fn admission_failure(reason: &str, message: &str) -> ToolResult {
+    ToolResult::error(message).with_structured(json!({
+        "code": "foreground_activity_unavailable", "effect": "refused", "retryable": false,
+        "foreground_failure": {"reason": reason},
+    }))
+}
+
 fn owner_from_args(
     args: &Value,
 ) -> Result<(Owner, Arc<cua_driver_core::session::TransportOwner>), ToolResult> {
@@ -723,35 +730,42 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
         target,
         id: format!("fgs_{}", uuid::Uuid::new_v4().simple()),
     };
-    let mut policy =
-        match Segment::begin(binding.clone(), clock_ms(), snapshot(), Limits::default()) {
-            Ok(policy) => policy,
-            Err(_) => {
-                return failure(
-                    "foreground_activity_unavailable",
-                    "Five seconds of reliable idle are required",
-                    true,
-                )
-            }
-        };
+    let activity = snapshot();
+    let mut policy = match Segment::begin(binding.clone(), clock_ms(), activity, Limits::default())
+    {
+        Ok(policy) => policy,
+        Err(_) => {
+            let reason = if !activity.reliable {
+                "monitor_unavailable"
+            } else if activity.state == State::Active {
+                "user_active"
+            } else if activity.idle_ms < 5000 {
+                "idle_threshold_not_met"
+            } else {
+                "activity_unknown"
+            };
+            return admission_failure(reason, "Five seconds of reliable idle are required");
+        }
+    };
     // No activation or other write in begin. A cancelled capture cannot leave input.
     let (original, dialog_host) = match tokio::task::spawn_blocking(move || {
         if !matches!(
             crate::windows::resolve_window_owner(target.pid, target.window_id),
             crate::windows::WindowOwner::SamePid
         ) {
-            return None;
+            return Err("target_window_unavailable");
         }
         let dialog_host = if dialog {
             Some(ExactWindowTarget {
                 pid: target.pid,
-                window_id: crate::ax::attached_sheet::focused_dialog_host(target.pid, target.window_id)?,
+                window_id: crate::ax::attached_sheet::focused_dialog_host(target.pid, target.window_id)
+                    .ok_or("dialog_attachment_unproven")?,
             })
         } else { None };
-        let pid = crate::apps::frontmost_pid()?;
+        let pid = crate::apps::frontmost_pid().ok_or("original_frontmost_unavailable")?;
         let original = ExactWindowTarget {
             pid,
-            window_id: bounded_focused_window(pid)?,
+            window_id: bounded_focused_window(pid).ok_or("original_focused_window_unavailable")?,
         };
         (exact_front(original)
             && matches!(
@@ -759,15 +773,15 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
                 crate::windows::WindowOwner::SamePid
             ))
         .then_some((original, dialog_host))
+        .ok_or("original_window_unproven")
     })
     .await
     {
-        Ok(Some(proof)) => proof,
-        _ => {
-            return failure(
-                "foreground_activity_unavailable",
+        Ok(Ok(proof)) => proof,
+        result => {
+            return admission_failure(
+                match result { Ok(Err(reason)) => reason, _ => "native_evidence_worker_failed" },
                 "Exact original window, target ownership, or requested Open/Save attachment is unavailable",
-                true,
             )
         }
     };
@@ -776,10 +790,9 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
         || cua_driver_core::session::is_runtime_scope_suspended(&binding.owner.runtime_scope)
         || policy.check(&binding, clock_ms(), snapshot()).is_err()
     {
-        return failure(
-            "foreground_activity_unavailable",
+        return admission_failure(
+            "native_admission_changed",
             "Foreground admission changed during preparation",
-            true,
         );
     }
     let segment = Arc::new(NativeSegment {
