@@ -38,7 +38,7 @@ objc2-foundation = { version = "0.2", features = [
     "NSArray", "NSString", "NSDictionary", "NSRunLoop",
     "NSThread", "NSObject", "NSValue",
     "NSAppleEventDescriptor", "NSNotification", "NSOperation",
-    "NSURL", "NSDate", "NSError",
+    "NSURL", "NSDate", "NSError", "NSData",
     "block2", "libc",
 ] }
 objc2-app-kit = { version = "0.2", features = [
@@ -49,6 +49,7 @@ objc2-app-kit = { version = "0.2", features = [
     # NSImage for live and fallback screenshots; NSPanel/NSImageCell are
     # reachable via transitive deps.
     "NSImage", "NSImageView", "NSTextField", "NSControl", "NSCell",
+    "NSPasteboard", "NSPasteboardItem",
     "block2", "libc",
 ] }
 

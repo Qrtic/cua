@@ -1354,11 +1354,11 @@ fn whole_native_selection(
         && value.is_some_and(|value| !value.is_empty() && Some(value) == selected)
 }
 
-/// Replacing a completely selected native field is equivalent to setting its
-/// value. Unlike typing, this does not invite spelling/capitalization changes.
-/// Only run inside the exact foreground guard. An attempted write never falls
-/// through to keyboard replay, even when a control's AX setter is ineffective.
-fn replace_whole_native_selection(
+/// Paste one literal replacement into a completely selected native editor.
+/// App-specific AX setters can acknowledge without changing the document, while
+/// typing can trigger capitalization. Keep this operation inside the exact
+/// foreground guard, with clipboard ownership preserved for the full readback.
+fn paste_whole_native_selection(
     pid: i32,
     window_id: Option<u32>,
     explicit: Option<(usize, Option<usize>)>,
@@ -1391,21 +1391,24 @@ fn replace_whole_native_selection(
             return Ok(None);
         }
         crate::foreground_activity::check_request()?;
-        let err = unsafe { set_string_attr(element, "AXValue", text) };
-        tracing::debug!(err, "whole native selection replacement attempted");
-        if err != kAXErrorSuccess {
-            return Ok(Some((false, None)));
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        loop {
-            if unsafe { copy_string_attr(element, "AXValue") }.as_deref() == Some(text) {
-                return Ok(Some((true, Some(text.chars().count()))));
+        let delivery = crate::input::pasteboard::with_literal_text(text, || {
+            crate::foreground_activity::check_request()?;
+            crate::input::keyboard::press_key_global("v", &["command"])?;
+            // Keep the clipboard payload available while AppKit processes the
+            // paste. The readback must come from the same retained editor.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
+            loop {
+                if unsafe { copy_string_attr(element, "AXValue") }.as_deref() == Some(text) {
+                    return Ok((true, Some(text.chars().count())));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok((false, None));
+                }
+                std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
             }
-            if std::time::Instant::now() >= deadline {
-                return Ok(Some((false, None)));
-            }
-            std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
-        }
+        })?;
+        Ok(Some(delivery))
     })();
     unsafe { CFRelease(element as _) };
     result
@@ -1661,18 +1664,18 @@ fn type_text_blocking(
         // dropped. 200ms covers that re-grab without penalizing an already
         // armed interactive stream on every text chunk.
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
-        let mut native_replacement = false;
+        let mut literal_paste = false;
         let mut do_type = || {
             super::with_prepared_foreground_focus(foreground_pixel_focus, || {
                 if !is_terminal_target
                     && !screen_sharing_target
                     && delay_ms <= crate::input::keyboard::DEFAULT_UNICODE_CADENCE_MS
                 {
-                    trace_focused_text_target(pid, window_id, "before_literal_replacement");
+                    trace_focused_text_target(pid, window_id, "before_literal_paste");
                     if let Some(delivery) =
-                        replace_whole_native_selection(pid, window_id, element_ptr_and_idx, text)?
+                        paste_whole_native_selection(pid, window_id, element_ptr_and_idx, text)?
                     {
-                        native_replacement = true;
+                        literal_paste = true;
                         return Ok(delivery);
                     }
                 }
@@ -1766,22 +1769,13 @@ fn type_text_blocking(
         };
         // Only claim the `_fg` path when an exact window was guarded; the
         // window-less fallback remains background keystrokes and must say so.
-        if native_replacement && !verified {
-            return Ok(TypeTextDelivery::AxUnverifiable);
-        }
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-            detail: if native_replacement {
-                " via exact native field replacement".to_owned()
+            detail: if literal_paste {
+                " via literal paste into the selected native field".to_owned()
             } else {
                 format!(" via foreground keystrokes ({delay_ms}ms delay)")
             },
-            path: if native_replacement {
-                PATH_AX
-            } else if fronted {
-                PATH_KEY_EVENTS_FG
-            } else {
-                path
-            },
+            path: if fronted { PATH_KEY_EVENTS_FG } else { path },
             delivered_chars,
             verified,
         }));

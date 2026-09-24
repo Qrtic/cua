@@ -13,6 +13,7 @@ mod background_keyboard;
 pub mod interactive;
 pub mod keyboard;
 pub mod mouse;
+pub(crate) mod pasteboard;
 pub mod return_main_thread;
 pub(crate) mod return_trace;
 pub mod skylight;
