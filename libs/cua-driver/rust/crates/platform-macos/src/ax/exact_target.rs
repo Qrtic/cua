@@ -14,62 +14,25 @@ use cua_driver_core::background_input::{
 use std::collections::{HashMap, HashSet};
 
 use super::bindings::{
-    ax_get_window_id, copy_ax_windows, copy_bool_attr, copy_element_attr, copy_string_attr,
-    focused_element_of_pid, kAXErrorAttributeUnsupported, kAXErrorSuccess, try_copy_ax_windows,
-    try_copy_bool_attr, AXError, AXUIElementCreateApplication, AXUIElementRef,
-    AXUIElementSetMessagingTimeout,
+    ax_get_window_id, copy_ax_windows, copy_bool_attr, focused_element_of_pid,
+    kAXErrorAttributeUnsupported, kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr,
+    AXError, AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use crate::windows::{all_automation_windows, resolve_window_owner, WindowOwner};
 
-/// Bounded `AXParent` ascent used when an element does not expose `AXWindow`.
-const MAX_ANCESTRY_DEPTH: usize = 40;
-
 /// Resolve the CGWindowID of the top-level AX window that owns `element`.
 ///
-/// Prefers the element's `AXWindow` attribute and falls back to a bounded
-/// `AXParent` walk. `None` means ancestry could not be proven — callers must
+/// Uses the nearest window or sheet on the bounded `AXParent` chain. AppKit
+/// may report a sheet control's document host through `AXWindow`; that host
+/// must not replace the nearer sheet's identity. `None` means ancestry could
+/// not be proven — callers must
 /// treat that as "not the requested window", never as a wildcard.
 ///
 /// # Safety
 ///
 /// `element` must be a valid `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
-    if let Some(window) = copy_element_attr(element, "AXWindow") {
-        let window_id = ax_get_window_id(window);
-        CFRelease(window as CFTypeRef);
-        if window_id.is_some() {
-            return window_id;
-        }
-    }
-    // Fallback: ascend AXParent until a window role, then map it.
-    let mut current: AXUIElementRef = element;
-    let mut owned = false;
-    let mut resolved = None;
-    for _ in 0..MAX_ANCESTRY_DEPTH {
-        match copy_string_attr(current, "AXRole").as_deref() {
-            Some("AXWindow") | Some("AXSheet") => {
-                resolved = ax_get_window_id(current);
-                break;
-            }
-            Some("AXApplication") | None => break,
-            _ => {}
-        }
-        let parent = copy_element_attr(current, "AXParent");
-        if owned {
-            CFRelease(current as CFTypeRef);
-        }
-        match parent {
-            Some(parent) => {
-                current = parent;
-                owned = true;
-            }
-            None => return None,
-        }
-    }
-    if owned {
-        CFRelease(current as CFTypeRef);
-    }
-    resolved
+    super::element_ancestry::window_id(element)
 }
 
 /// The process's focused AX element, but only when it provably belongs to the

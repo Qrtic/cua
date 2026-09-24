@@ -22,6 +22,7 @@ pub(crate) mod attached_popover;
 pub(crate) mod attached_sheet;
 pub mod bindings;
 pub mod cache;
+mod element_ancestry;
 pub mod enablement;
 pub mod exact_target;
 pub mod tree;
