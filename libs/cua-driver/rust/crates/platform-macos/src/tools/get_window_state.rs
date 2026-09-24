@@ -1609,6 +1609,9 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if let Some(tree) = published_tree_result {
+            structured["tree_truncated"] = serde_json::json!(tree.truncated);
+        }
         if let Some((_, context, _)) = app_context_observation.as_ref() {
             structured["selection"] = context.selection_json(true);
         }

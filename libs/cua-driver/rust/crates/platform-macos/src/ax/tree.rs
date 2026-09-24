@@ -137,7 +137,7 @@ fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<b
 pub struct TreeWalkResult {
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
-    /// True when the walk was cut short by the MAX_ELEMENTS cap.
+    /// True when an actual node was omitted by the node or depth limit.
     pub truncated: bool,
     /// Whether the requested `window_id` actually resolved to an AX surface,
     /// and if not, why. `None` when no `window_id` was requested.
@@ -216,11 +216,7 @@ fn walk_tree_bounded_with_projection(
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
-    // Shared visited-node counter passed into walk_element to enforce the cap.
-    let mut visited_count = 0usize;
-    // Set to true only when walk_element actually stops early due to the cap —
-    // avoids a false-positive when the tree naturally ends on exactly the cap.
-    let mut truncated = false;
+    let mut limits = WalkLimits::new(max_elements, max_depth);
     let mut window_scope: Option<WindowScope> = None;
 
     unsafe {
@@ -345,10 +341,7 @@ fn walk_tree_bounded_with_projection(
                 &mut nodes,
                 &mut lines,
                 &mut index_counter,
-                &mut visited_count,
-                &mut truncated,
-                max_elements,
-                max_depth,
+                &mut limits,
             );
         }
 
@@ -360,7 +353,7 @@ fn walk_tree_bounded_with_projection(
         CFRelease(app_elem as CFTypeRef);
     }
 
-    let truncated_flag = truncated;
+    let truncated_flag = limits.truncated();
     let raw_markdown = render_lines(&lines);
     let mut tree_markdown = if let Some(q) = query {
         filter_tree(&raw_markdown, q)
@@ -368,20 +361,76 @@ fn walk_tree_bounded_with_projection(
         raw_markdown
     };
 
-    if truncated_flag {
-        tree_markdown.push_str(&format!(
-            "\n⚠️  AX tree truncated at {max_elements} nodes \
-             (app has a very large accessibility tree — Arc, Electron, or similar). \
-             Element indices above are still valid. Use pixel clicks for elements \
-             not visible in this partial tree."
-        ));
-    }
+    tree_markdown.push_str(&limits.notice());
 
     TreeWalkResult {
         tree_markdown,
         nodes,
         truncated: truncated_flag,
         window_scope,
+    }
+}
+
+/// Count visited AX objects, including collapsed layout containers, and record
+/// why actual descendants were omitted. Reaching a boundary without another
+/// object to visit is not truncation.
+struct WalkLimits {
+    max_nodes: usize,
+    max_depth: usize,
+    visited: usize,
+    nodes_omitted: bool,
+    depth_omitted: bool,
+}
+
+impl WalkLimits {
+    fn new(max_nodes: usize, max_depth: usize) -> Self {
+        Self {
+            max_nodes,
+            max_depth,
+            visited: 0,
+            nodes_omitted: false,
+            depth_omitted: false,
+        }
+    }
+
+    fn admit(&mut self, depth: usize) -> bool {
+        if depth > self.max_depth {
+            self.depth_omitted = true;
+            return false;
+        }
+        if self.visited >= self.max_nodes {
+            self.nodes_omitted = true;
+            return false;
+        }
+        self.visited += 1;
+        true
+    }
+
+    fn truncated(&self) -> bool {
+        self.nodes_omitted || self.depth_omitted
+    }
+
+    fn notice(&self) -> String {
+        let mut reasons = Vec::new();
+        if self.nodes_omitted {
+            reasons.push(format!("{} nodes", self.max_nodes));
+        }
+        if self.depth_omitted {
+            reasons.push(format!("depth {}", self.max_depth));
+        }
+        if reasons.is_empty() {
+            return String::new();
+        }
+        let depth_hint = if self.depth_omitted {
+            " Increase max_depth for omitted descendants; increasing only max_elements cannot reveal them."
+        } else {
+            " Increase max_elements only when the needed controls are missing."
+        };
+        format!(
+            "\n⚠️  AX tree truncated at {}. Element indices above are still valid.{} \
+             A screenshot can provide visual evidence for a missing target; do not guess its coordinates.",
+            reasons.join(" and "), depth_hint
+        )
     }
 }
 
@@ -394,21 +443,11 @@ unsafe fn walk_element(
     nodes: &mut Vec<AXNode>,
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
-    visited_count: &mut usize,
-    truncated: &mut bool,
-    max_elements: usize,
-    max_depth: usize,
+    limits: &mut WalkLimits,
 ) {
-    if depth > max_depth {
+    if !limits.admit(depth) {
         return;
     }
-    // Enforce total-node cap — mirrors Swift's maxElements guard.
-    // Set the truncated flag only when we actually stop early.
-    if *visited_count >= max_elements {
-        *truncated = true;
-        return;
-    }
-    *visited_count += 1;
 
     // Messaging timeouts are per AX object, not inherited from the application
     // element, so every descendant must be bounded before any attribute read.
@@ -433,10 +472,7 @@ unsafe fn walk_element(
                 nodes,
                 lines,
                 counter,
-                visited_count,
-                truncated,
-                max_elements,
-                max_depth,
+                limits,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -501,10 +537,7 @@ unsafe fn walk_element(
                 nodes,
                 lines,
                 counter,
-                visited_count,
-                truncated,
-                max_elements,
-                max_depth,
+                limits,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -624,10 +657,7 @@ unsafe fn walk_element(
             nodes,
             lines,
             counter,
-            visited_count,
-            truncated,
-            max_elements,
-            max_depth,
+            limits,
         );
         CFRelease(child as CFTypeRef);
     }
@@ -640,6 +670,61 @@ fn is_web_content_role(role: &str) -> bool {
         .flat_map(char::to_lowercase)
         .collect::<String>();
     normalized.contains("webarea") || normalized.contains("documentweb") || normalized == "document"
+}
+
+#[cfg(test)]
+mod walk_limit_tests {
+    use super::WalkLimits;
+
+    #[test]
+    fn omitted_submenu_is_reported_even_with_a_large_node_budget() {
+        for budget in [160, 4000] {
+            let mut limits = WalkLimits::new(budget, 4);
+            // Menu bar -> File -> menu -> Export To -> menu -> Excel.
+            assert!((0..=4).all(|depth| limits.admit(depth)));
+            assert!(!limits.admit(5));
+            assert!(limits.truncated());
+            assert!(limits.notice().contains("depth 4"));
+            assert!(!limits.nodes_omitted);
+        }
+        let mut deeper = WalkLimits::new(160, 6);
+        assert!((0..=5).all(|depth| deeper.admit(depth)));
+        assert!(!deeper.truncated());
+    }
+
+    #[test]
+    fn depth_omission_does_not_spend_the_budget_for_a_shallow_sibling() {
+        let mut limits = WalkLimits::new(3, 1);
+        assert!(limits.admit(0));
+        assert!(limits.admit(1));
+        assert!(!limits.admit(2));
+        assert!(limits.admit(1));
+        assert_eq!(limits.visited, 3);
+        assert!(!limits.nodes_omitted);
+        assert!(limits.depth_omitted);
+    }
+
+    #[test]
+    fn naturally_ending_at_the_exact_boundary_is_not_truncated() {
+        let mut limits = WalkLimits::new(2, 1);
+        assert!(limits.admit(0));
+        assert!(limits.admit(1));
+        assert!(!limits.truncated());
+        assert!(limits.notice().is_empty());
+        assert!(!limits.admit(1));
+        assert!(limits.truncated());
+        assert!(limits.notice().contains("2 nodes"));
+        assert!(!limits.notice().contains("depth"));
+    }
+
+    #[test]
+    fn both_omission_reasons_are_retained() {
+        let mut limits = WalkLimits::new(1, 1);
+        assert!(limits.admit(0));
+        assert!(!limits.admit(2));
+        assert!(!limits.admit(1));
+        assert!(limits.notice().contains("1 nodes and depth 1"));
+    }
 }
 
 #[cfg(test)]
