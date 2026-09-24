@@ -1858,12 +1858,14 @@ fn perform_attached_popover_click(
         return Err(ApplicationMenuRefusal(refusal).into());
     }
     let advertised = unsafe { copy_action_names(element) };
+    let role = unsafe { copy_string_attr(element, "AXRole") };
     let native =
-        crate::ax::attached_popover::advertised_action(action, &advertised).ok_or_else(|| {
-            anyhow::anyhow!(
-                "attached-popover action is not supported and advertised; no input was sent"
-            )
-        })?;
+        crate::ax::attached_popover::advertised_action(role.as_deref(), action, &advertised)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "attached-popover action is not supported and advertised; no input was sent"
+                )
+            })?;
     crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
     crate::foreground_activity::check_request()?;
     let error = unsafe { crate::ax::bindings::perform_action(element, native) };

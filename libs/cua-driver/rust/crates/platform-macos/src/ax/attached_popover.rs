@@ -1,4 +1,4 @@
-//! Semantic-only proof for a control in an AXPopover attached to one host window.
+//! Semantic-only proof for an AXPopover or its button attached to one host window.
 //!
 //! Pages color swatches name the popover (a distinct CGWindowID) as AXWindow,
 //! while the popover's reciprocal AXParent chain and AXWindow name the document.
@@ -49,12 +49,15 @@ fn prove_checked<T: PopoverTree>(
     host_id: u32,
     element: &T::Node,
 ) -> Result<(), &'static str> {
-    // This route deliberately covers controls, not text/value writes or focus.
-    if tree.role(element).as_deref() != Some("AXButton") {
-        return Err("element_not_button");
-    }
-    let Some(popover) = tree.window(element) else {
-        return Err("element_window_missing");
+    // The root can advertise AXCancel. Its AXWindow names the host, whereas a
+    // button's AXWindow names the popover. Keep both physical identities intact.
+    let is_popover_root = tree.role(element).as_deref() == Some("AXPopover");
+    let popover = if is_popover_root {
+        element.clone()
+    } else if tree.role(element).as_deref() == Some("AXButton") {
+        tree.window(element).ok_or("element_window_missing")?
+    } else {
+        return Err("element_not_button_or_popover");
     };
     let popover_role = tree.role(&popover);
     if popover_role.as_deref() != Some("AXPopover") {
@@ -100,9 +103,13 @@ fn prove_checked<T: PopoverTree>(
             let unchanged = crossed_popover
                 && tree.window_id(&current) == Some(host_id)
                 && tree.window_id(&popover) == Some(popover_id)
-                && tree
-                    .window(element)
-                    .is_some_and(|node| tree.same(&node, &popover))
+                && if is_popover_root {
+                    tree.same(element, &popover)
+                        && tree.role(element).as_deref() == Some("AXPopover")
+                } else {
+                    tree.window(element)
+                        .is_some_and(|node| tree.same(&node, &popover))
+                }
                 && tree
                     .window(&popover)
                     .is_some_and(|node| tree.same(&node, &host))
@@ -138,11 +145,16 @@ fn prove_checked<T: PopoverTree>(
 }
 
 /// No unknown-action mapping, selection writes, ancestor or pixel fallback.
-pub(crate) fn advertised_action(action: &str, advertised: &[String]) -> Option<&'static str> {
-    let native = match action {
-        "press" | "click" => "AXPress",
-        "pick" => "AXPick",
-        "show_menu" => "AXShowMenu",
+pub(crate) fn advertised_action(
+    role: Option<&str>,
+    action: &str,
+    advertised: &[String],
+) -> Option<&'static str> {
+    let native = match (role, action) {
+        (Some("AXPopover"), "cancel") => "AXCancel",
+        (Some("AXButton"), "press" | "click") => "AXPress",
+        (Some("AXButton"), "pick") => "AXPick",
+        (Some("AXButton"), "show_menu") => "AXShowMenu",
         _ => return None,
     };
     advertised
@@ -244,6 +256,9 @@ fn requires_host_attachment(
 /// Cheap classification only. Exact popover-window targets keep the ordinary
 /// route; the full attachment proof is mandatory only for a displaced host.
 pub(crate) unsafe fn has_displaced_popover_window(element: AXUIElementRef, host_id: u32) -> bool {
+    if copy_string_attr(element, "AXRole").as_deref() == Some("AXPopover") {
+        return requires_host_attachment(Some("AXPopover"), ax_get_window_id(element), host_id);
+    }
     let Some(window) = copy_element_attr(element, "AXWindow").and_then(|ptr| AxNode::owned(ptr))
     else {
         return false;
@@ -388,6 +403,32 @@ mod tests {
         assert!(prove(&pages(), 42, 700, &0));
     }
     #[test]
+    fn popover_root_proves_its_own_attachment_for_direct_cancel() {
+        assert!(prove(&pages(), 42, 700, &2));
+        // The physical popover is not interchangeable with its host.
+        assert!(!prove(&pages(), 42, 900, &2));
+        assert!(!prove(&pages(), 42, 701, &2));
+        for i in 2..=6 {
+            let mut tree = pages();
+            tree.nodes.get_mut(&i).unwrap().owner = 99;
+            assert!(!prove(&tree, 42, 700, &2), "foreign ancestor {i}");
+        }
+        for i in 3..=6 {
+            let mut tree = pages();
+            tree.nodes.get_mut(&i).unwrap().children.clear();
+            assert!(!prove(&tree, 42, 700, &2), "detached ancestor {i}");
+        }
+        let mut tree = pages();
+        tree.reattach = true;
+        assert!(!prove(&tree, 42, 700, &2));
+        let mut tree = pages();
+        tree.nodes.get_mut(&2).unwrap().id = None;
+        assert!(!prove(&tree, 42, 700, &2));
+        let mut tree = pages();
+        tree.nodes.get_mut(&2).unwrap().window = None;
+        assert!(!prove(&tree, 42, 700, &2));
+    }
+    #[test]
     fn refusal_diagnostics_distinguish_attachment_and_ancestry_failures() {
         let mut tree = pages();
         tree.nodes.get_mut(&2).unwrap().window = None;
@@ -501,16 +542,46 @@ mod tests {
     #[test]
     fn only_advertised_direct_semantic_actions_are_allowed() {
         assert_eq!(
-            advertised_action("press", &["AXPress".into()]),
+            advertised_action(Some("AXButton"), "press", &["AXPress".into()]),
             Some("AXPress")
         );
         assert_eq!(
-            advertised_action("pick", &["AXPick".into()]),
+            advertised_action(Some("AXButton"), "pick", &["AXPick".into()]),
             Some("AXPick")
         );
         for action in ["focus", "confirm", "set_value", "type_text", "unknown"] {
-            assert_eq!(advertised_action(action, &["AXPress".into()]), None);
+            assert_eq!(
+                advertised_action(Some("AXButton"), action, &["AXPress".into()]),
+                None
+            );
         }
-        assert_eq!(advertised_action("press", &["AXShowMenu".into()]), None);
+        assert_eq!(
+            advertised_action(Some("AXButton"), "press", &["AXShowMenu".into()]),
+            None
+        );
+    }
+    #[test]
+    fn popover_root_only_accepts_explicitly_advertised_cancel() {
+        assert_eq!(
+            advertised_action(Some("AXPopover"), "cancel", &["AXCancel".into()]),
+            Some("AXCancel")
+        );
+        assert_eq!(advertised_action(Some("AXPopover"), "cancel", &[]), None);
+        for role in [Some("AXButton"), Some("AXWindow"), Some("AXSheet"), None] {
+            assert_eq!(
+                advertised_action(role, "cancel", &["AXCancel".into()]),
+                None
+            );
+        }
+        for action in ["press", "click", "pick", "show_menu", "focus", "confirm"] {
+            assert_eq!(
+                advertised_action(
+                    Some("AXPopover"),
+                    action,
+                    &["AXPress".into(), "AXCancel".into()]
+                ),
+                None
+            );
+        }
     }
 }
