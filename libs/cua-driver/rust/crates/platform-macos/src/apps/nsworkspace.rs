@@ -482,12 +482,38 @@ fn wait_for_launch_signal<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        application_event_id, reconciliation_pid, wait_for_launch_signal, LaunchError,
-        K_AE_OPEN_APPLICATION, K_AE_REOPEN_APPLICATION,
+        application_event_id, build_configuration, reconciliation_pid, wait_for_launch_signal,
+        LaunchError, OpenConfig, Reconciliation, K_AE_OPEN_APPLICATION, K_AE_REOPEN_APPLICATION,
     };
     use std::collections::HashSet;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn url_handoff_configuration_keeps_background_delivery() {
+        // Inspect the actual AppKit configuration, without launching anything.
+        // URL delivery supplies its own open-documents event; adding an oapp or
+        // rapp event can replace that delivery and open the wrong window.
+        for creates_new_instance in [false, true] {
+            let cfg = OpenConfig {
+                arguments: vec!["--fixture".to_owned()],
+                creates_new_instance,
+                ..Default::default()
+            };
+            let reconciliation = Reconciliation {
+                bundle_id: None,
+                pids_before_request: HashSet::new(),
+                require_new_pid: creates_new_instance,
+            };
+            let config = build_configuration(&cfg, &reconciliation);
+            unsafe {
+                assert!(!config.activates());
+                assert!(!config.addsToRecentItems());
+                assert!(config.appleEvent().is_none());
+                assert_eq!(config.createsNewApplicationInstance(), creates_new_instance);
+            }
+        }
+    }
 
     #[test]
     fn running_application_receives_reopen_without_restarting_it() {

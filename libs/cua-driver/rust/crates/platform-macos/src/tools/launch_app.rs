@@ -14,11 +14,11 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "launch_app".into(),
         description:
-            "Launch a macOS app in the background — the target does NOT come to the foreground.\n\n\
+            "Request a background macOS app launch with bounded protection against app self-activation.\n\n\
              Provide either `bundle_id` (preferred — unambiguous, e.g. `com.apple.calculator`) \
              or `name` (e.g. \"Calculator\"). If both are given, bundle_id wins.\n\n\
-             Optional `urls` are handed to the app as open targets — for Finder, pass a folder \
-             path only after Finder handoff has a supported bounded foreground episode.\n\n\
+             Optional `urls` are handed to the app as open targets. Finder folder paths use \
+             the normal background URL handoff with the same bounded focus protection.\n\n\
              Browser DevTools setup belongs to `browser_prepare`, which can prove that a \
              separate isolated profile is driver-owned before enabling CDP.\n\n\
              Optional `webkit_inspector_port`: opens a WebKit inspector server on the specified \
@@ -199,30 +199,15 @@ impl Tool for LaunchAppTool {
             })
             .unwrap_or_default();
         let prior_frontmost = crate::apps::frontmost_pid();
-        let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
-            additional_arguments.is_empty()
-                && env.is_empty()
-                && !creates_new_instance
-                && crate::apps::finder_folder_handoff(bundle_id, &urls)
+        // Every handoff, including a Finder folder, uses the normal
+        // activates=false NSWorkspace configuration and the same lease.
+        let wildcard_lease = prior_frontmost.map(|prior| {
+            crate::focus_steal::FocusStealPreventer::begin_suppression(
+                None,
+                prior,
+                "LaunchAppTool.pre",
+            )
         });
-
-        if finder_folder_handoff {
-            return ToolResult::error("Finder folder handoff requires a bounded native foreground episode; no launch was dispatched")
-                .with_structured(serde_json::json!({"code": "foreground_activity_unavailable", "effect": "refused"}));
-        }
-
-        // Finder's synchronous folder-open selector must be allowed to activate
-        // long enough to perform the request. Use the ordinary targeted
-        // post-launch guard to restore the prior foreground app immediately.
-        let wildcard_lease = prior_frontmost
-            .filter(|_| !finder_folder_handoff)
-            .map(|prior| {
-                crate::focus_steal::FocusStealPreventer::begin_suppression(
-                    None,
-                    prior,
-                    "LaunchAppTool.pre",
-                )
-            });
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
         // Same condition that selects the `openURLs:withApplicationAtURL:`
@@ -313,7 +298,11 @@ impl Tool for LaunchAppTool {
                     // observed late activation without extending the lease's
                     // original deadline or deferring restoration after return.
                     let cold_launch = !previously_running_pids.contains(pid);
-                    let window_ms: u64 = if slow_launch_path || cold_launch { 2500 } else { 500 };
+                    let window_ms: u64 = if slow_launch_path || cold_launch {
+                        2500
+                    } else {
+                        500
+                    };
                     tracing::debug!(target: "cua_focus_restore", target_pid = *pid,
                         cold_launch, settle_ms = window_ms,
                         "Holding bounded post-launch focus protection");
