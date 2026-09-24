@@ -1153,6 +1153,99 @@ fn exact_ax_activation_steps(
     Ok(statuses)
 }
 
+/// This classification means the bounded read found no exact AX window and
+/// performed no AX write. Never classify an AX timeout/write error this way.
+#[derive(Debug)]
+struct ExactActivationWindowUnavailable;
+
+impl std::fmt::Display for ExactActivationWindowUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("exact activation AX window is unavailable")
+    }
+}
+
+impl std::error::Error for ExactActivationWindowUnavailable {}
+
+/// WindowServer activation can precede AppKit's AX publication (for example
+/// for a newly opened native window tab). Request Cocoa activation at most
+/// once, without ActivateAllWindows, then wait only for the exact AX window.
+/// A failed/uncertain AX write is terminal: this loop never repeats one.
+fn complete_activation_with_bounded_cocoa_request(
+    mut complete: impl FnMut() -> anyhow::Result<[i32; 3]>,
+    mut activate: impl FnMut() -> anyhow::Result<()>,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(),
+) -> anyhow::Result<[i32; 3]> {
+    check()?;
+    match complete() {
+        Ok(statuses) => return Ok(statuses),
+        Err(error)
+            if error
+                .downcast_ref::<ExactActivationWindowUnavailable>()
+                .is_none() =>
+        {
+            return Err(error);
+        }
+        Err(_) => {}
+    }
+    check()?;
+    if elapsed() >= ACTIVATION_WAIT_TIMEOUT {
+        anyhow::bail!("exact AX window publication timed out before Cocoa activation");
+    }
+    activate()?;
+    loop {
+        check()?;
+        if elapsed() >= ACTIVATION_WAIT_TIMEOUT {
+            anyhow::bail!("exact AX window remained unavailable after bounded Cocoa activation");
+        }
+        match complete() {
+            Ok(statuses) => {
+                check()?;
+                return Ok(statuses);
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<ExactActivationWindowUnavailable>()
+                    .is_none() =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+        check()?;
+        pause();
+    }
+}
+
+fn request_cocoa_activation_without_all_windows(
+    pid: i32,
+    window_id: u32,
+    mut check_activity: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+
+    check_exact_activation_owner(pid, window_id, &mut check_activity)?;
+    let window = crate::windows::window_info_by_id(window_id)
+        .ok_or_else(|| anyhow::anyhow!("Cocoa activation target no longer exists"))?;
+    // This recovery is for an ordinary, exact same-process window. A floating
+    // panel or delegated/system surface needs its existing separate proof.
+    if window.pid != pid
+        || window.layer != 0
+        || window.bounds.width <= 0.0
+        || window.bounds.height <= 0.0
+    {
+        anyhow::bail!("Cocoa AX publication requires an ordinary exact target window");
+    }
+    let app = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }
+        .ok_or_else(|| anyhow::anyhow!("Cocoa activation process no longer exists"))?;
+    check_exact_activation_owner(pid, window_id, &mut check_activity)?;
+    if !unsafe { app.activateWithOptions(NSApplicationActivationOptions::empty()) } {
+        anyhow::bail!("Cocoa refused the bounded application activation request");
+    }
+    check_exact_activation_owner(pid, window_id, check_activity)
+}
+
 /// Finish only the requested native window's activation. Process activation
 /// alone can leave a sibling window key, especially within the same process.
 /// Attribute support varies, so receipts are diagnostic only: exact readiness
@@ -1230,8 +1323,7 @@ fn complete_exact_ax_window_activation(
             }
         }
     }
-    let target =
-        target.ok_or_else(|| anyhow::anyhow!("exact activation AX window is unavailable"))?;
+    let target = target.ok_or(ExactActivationWindowUnavailable)?;
     if unsafe { copy_string_attr(target.0, "AXRole") }.as_deref() != Some("AXWindow") {
         anyhow::bail!("exact activation requires an AXWindow, not a child or delegated surface");
     }
@@ -2822,8 +2914,18 @@ fn with_foreground_hid_activation_inner(
             post_exact_key_window_records_guarded(target_psn, target_wid, || {
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())
             })?;
-            let ax_statuses =
-                complete_exact_ax_window_activation(target_pid, target_wid, || episode.check())?;
+            let publication_started = std::time::Instant::now();
+            let ax_statuses = complete_activation_with_bounded_cocoa_request(
+                || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
+                || {
+                    request_cocoa_activation_without_all_windows(target_pid, target_wid, || {
+                        episode.check()
+                    })
+                },
+                || episode.check(),
+                || publication_started.elapsed(),
+                || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
+            )?;
             await_exact_window_ready_guarded(target_pid, target_wid, target_psn, || {
                 episode.check()
             })
@@ -3070,6 +3172,10 @@ pub fn with_menu_shortcut_activation(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        complete_activation_with_bounded_cocoa_request, ExactActivationWindowUnavailable,
+        ACTIVATION_WAIT_TIMEOUT,
+    };
     #[test]
     fn window_return_public_post_requires_exact_opt_in() {
         use super::WindowReturnPostRoute;
@@ -3919,6 +4025,124 @@ mod tests {
             class,
             super::sel_register(c"cuaMissingAuthenticationFactoryForRegressionTest:")
         ));
+    }
+
+    #[test]
+    fn foreground_ax_publication_missing_waits_once_without_repeating_writes() {
+        let reads = Cell::new(0);
+        let writes = Cell::new(0);
+        let activations = Cell::new(0);
+        let millis = Cell::new(0);
+        let result = complete_activation_with_bounded_cocoa_request(
+            || {
+                reads.set(reads.get() + 1);
+                if reads.get() < 3 {
+                    Err(ExactActivationWindowUnavailable.into())
+                } else {
+                    writes.set(writes.get() + 1);
+                    Ok([0; 3])
+                }
+            },
+            || {
+                activations.set(activations.get() + 1);
+                Ok(())
+            },
+            || Ok(()),
+            || std::time::Duration::from_millis(millis.get()),
+            || millis.set(millis.get() + 10),
+        );
+        assert_eq!(result.unwrap(), [0; 3]);
+        assert_eq!(reads.get(), 3);
+        assert_eq!(writes.get(), 1);
+        assert_eq!(activations.get(), 1);
+    }
+
+    #[test]
+    fn foreground_ax_publication_known_window_skips_cocoa() {
+        let result = complete_activation_with_bounded_cocoa_request(
+            || Ok([0; 3]),
+            || panic!("an available exact AX window must not activate Cocoa again"),
+            || Ok(()),
+            || std::time::Duration::ZERO,
+            || panic!("no publication wait is needed"),
+        );
+        assert_eq!(result.unwrap(), [0; 3]);
+    }
+
+    #[test]
+    fn foreground_ax_publication_never_repeats_an_uncertain_ax_write() {
+        for initially_missing in [false, true] {
+            let attempts = Cell::new(0);
+            let activations = Cell::new(0);
+            let result = complete_activation_with_bounded_cocoa_request(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    if initially_missing && attempts.get() == 1 {
+                        Err(ExactActivationWindowUnavailable.into())
+                    } else {
+                        anyhow::bail!("AXCannotComplete; an activation write may have occurred")
+                    }
+                },
+                || {
+                    activations.set(activations.get() + 1);
+                    Ok(())
+                },
+                || Ok(()),
+                || std::time::Duration::ZERO,
+                || panic!("uncertain writes are not publication misses"),
+            );
+            assert!(result.is_err());
+            assert_eq!(activations.get(), usize::from(initially_missing));
+            assert_eq!(attempts.get(), 1 + usize::from(initially_missing));
+        }
+    }
+
+    #[test]
+    fn foreground_ax_publication_intervention_after_cocoa_stops_before_hid() {
+        let active = Cell::new(false);
+        let reads = Cell::new(0);
+        let hid = Cell::new(false);
+        let result = complete_activation_with_bounded_cocoa_request(
+            || {
+                reads.set(reads.get() + 1);
+                Err(ExactActivationWindowUnavailable.into())
+            },
+            || {
+                active.set(true);
+                Ok(())
+            },
+            || {
+                anyhow::ensure!(!active.get(), "native input intervention");
+                Ok(())
+            },
+            || std::time::Duration::ZERO,
+            || panic!("intervention ends the episode"),
+        )
+        .map(|_| hid.set(true));
+        assert!(result.is_err());
+        assert_eq!(reads.get(), 1);
+        assert!(!hid.get());
+    }
+
+    #[test]
+    fn foreground_ax_publication_deadline_does_not_reactivate_or_dispatch() {
+        let activations = Cell::new(0);
+        let elapsed = Cell::new(std::time::Duration::ZERO);
+        let hid = Cell::new(false);
+        let result = complete_activation_with_bounded_cocoa_request(
+            || Err(ExactActivationWindowUnavailable.into()),
+            || {
+                activations.set(activations.get() + 1);
+                Ok(())
+            },
+            || Ok(()),
+            || elapsed.get(),
+            || elapsed.set(ACTIVATION_WAIT_TIMEOUT),
+        )
+        .map(|_| hid.set(true));
+        assert!(result.is_err());
+        assert_eq!(activations.get(), 1);
+        assert!(!hid.get());
     }
 
     #[test]
