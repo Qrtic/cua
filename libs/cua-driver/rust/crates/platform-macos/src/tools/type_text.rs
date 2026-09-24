@@ -1320,6 +1320,7 @@ fn trace_focused_text_target(pid: i32, window_id: Option<u32>, phase: &'static s
             let selected_chars =
                 copy_string_attr(element, "AXSelectedText").map(|s| s.chars().count());
             let selected_text_settable = is_attribute_settable(element, "AXSelectedText");
+            let value_settable = is_attribute_settable(element, "AXValue");
             let enabled = copy_bool_attr(element, "AXEnabled");
             tracing::debug!(
                 phase,
@@ -1327,6 +1328,7 @@ fn trace_focused_text_target(pid: i32, window_id: Option<u32>, phase: &'static s
                 ?value_chars,
                 ?selected_chars,
                 selected_text_settable,
+                value_settable,
                 ?enabled,
                 "literal text target witness"
             );
@@ -1335,6 +1337,78 @@ fn trace_focused_text_target(pid: i32, window_id: Option<u32>, phase: &'static s
             tracing::debug!(phase, "literal text target has no exact focused element");
         }
     }
+}
+
+fn whole_native_selection(
+    role: &str,
+    enabled: Option<bool>,
+    value_settable: bool,
+    value: Option<&str>,
+    selected: Option<&str>,
+    in_web_area: bool,
+) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea")
+        && enabled != Some(false)
+        && value_settable
+        && !in_web_area
+        && value.is_some_and(|value| !value.is_empty() && Some(value) == selected)
+}
+
+/// Replacing a completely selected native field is equivalent to setting its
+/// value. Unlike typing, this does not invite spelling/capitalization changes.
+/// Only run inside the exact foreground guard. An attempted write never falls
+/// through to keyboard replay, even when a control's AX setter is ineffective.
+fn replace_whole_native_selection(
+    pid: i32,
+    window_id: Option<u32>,
+    explicit: Option<(usize, Option<usize>)>,
+    text: &str,
+) -> anyhow::Result<Option<(bool, Option<usize>)>> {
+    let Some(wid) = window_id else {
+        return Ok(None);
+    };
+    let Some(element) = (unsafe { crate::ax::exact_target::focused_element_in_window(pid, wid) })
+    else {
+        return Ok(None);
+    };
+    let result = (|| {
+        if let Some((ptr, _)) = explicit {
+            if unsafe { core_foundation::base::CFEqual(element as _, ptr as _) } == 0 {
+                return Ok(None);
+            }
+        }
+        let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+        let value = unsafe { copy_string_attr(element, "AXValue") };
+        let selected = unsafe { copy_string_attr(element, "AXSelectedText") };
+        if !whole_native_selection(
+            &role,
+            unsafe { copy_bool_attr(element, "AXEnabled") },
+            unsafe { is_attribute_settable(element, "AXValue") },
+            value.as_deref(),
+            selected.as_deref(),
+            target_in_web_area(pid, Some((element as usize, None)), window_id),
+        ) {
+            return Ok(None);
+        }
+        crate::foreground_activity::check_request()?;
+        let err = unsafe { set_string_attr(element, "AXValue", text) };
+        tracing::debug!(err, "whole native selection replacement attempted");
+        if err != kAXErrorSuccess {
+            return Ok(Some((false, None)));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            if unsafe { copy_string_attr(element, "AXValue") }.as_deref() == Some(text) {
+                return Ok(Some((true, Some(text.chars().count()))));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(Some((false, None)));
+            }
+            std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
+        }
+    })();
+    unsafe { CFRelease(element as _) };
+    result
 }
 
 /// True when the addressed (or focused) AX element sits inside a web-content
@@ -1586,8 +1660,21 @@ fn type_text_blocking(
         // dropped. 200ms covers that re-grab without penalizing an already
         // armed interactive stream on every text chunk.
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
-        let do_type = || {
+        let mut native_replacement = false;
+        let mut do_type = || {
             super::with_prepared_foreground_focus(foreground_pixel_focus, || {
+                if !is_terminal_target
+                    && !screen_sharing_target
+                    && delay_ms <= crate::input::keyboard::DEFAULT_UNICODE_CADENCE_MS
+                {
+                    trace_focused_text_target(pid, window_id, "before_literal_replacement");
+                    if let Some(delivery) =
+                        replace_whole_native_selection(pid, window_id, element_ptr_and_idx, text)?
+                    {
+                        native_replacement = true;
+                        return Ok(delivery);
+                    }
+                }
                 let focused_before = if foreground_pixel_focus.is_some() {
                     read_axvalue_bound(pid, element_ptr_and_idx, window_id)
                 } else {
@@ -1679,8 +1766,18 @@ fn type_text_blocking(
         // Only claim the `_fg` path when an exact window was guarded; the
         // window-less fallback remains background keystrokes and must say so.
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-            detail: format!(" via foreground keystrokes ({delay_ms}ms delay)"),
-            path: if fronted { PATH_KEY_EVENTS_FG } else { path },
+            detail: if native_replacement {
+                " via exact native field replacement".to_owned()
+            } else {
+                format!(" via foreground keystrokes ({delay_ms}ms delay)")
+            },
+            path: if native_replacement {
+                PATH_AX
+            } else if fronted {
+                PATH_KEY_EVENTS_FG
+            } else {
+                path
+            },
             delivered_chars,
             verified,
         }));
@@ -1893,6 +1990,74 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_value_replacement_requires_the_entire_editable_field_selected() {
+        assert!(whole_native_selection(
+            "AXTextArea",
+            Some(true),
+            true,
+            Some("Table 111"),
+            Some("Table 111"),
+            false
+        ));
+        assert!(!whole_native_selection(
+            "AXTextArea",
+            Some(true),
+            true,
+            Some("Table 111"),
+            Some("111"),
+            false
+        ));
+        assert!(!whole_native_selection(
+            "AXTextArea",
+            Some(true),
+            true,
+            Some("Table 111"),
+            Some(""),
+            false
+        ));
+        assert!(!whole_native_selection(
+            "AXTextArea",
+            Some(true),
+            true,
+            Some(""),
+            Some(""),
+            false
+        ));
+        assert!(!whole_native_selection(
+            "AXTextArea",
+            Some(false),
+            true,
+            Some("Table 111"),
+            Some("Table 111"),
+            false
+        ));
+        assert!(!whole_native_selection(
+            "AXTextArea",
+            Some(true),
+            false,
+            Some("Table 111"),
+            Some("Table 111"),
+            false
+        ));
+        assert!(!whole_native_selection(
+            "AXTextArea",
+            Some(true),
+            true,
+            Some("Table 111"),
+            Some("Table 111"),
+            true
+        ));
+        assert!(!whole_native_selection(
+            "AXTable",
+            Some(true),
+            true,
+            Some("Table 111"),
+            Some("Table 111"),
+            false
+        ));
+    }
 
     #[test]
     fn implicit_ax_insert_requires_an_editable_role() {
