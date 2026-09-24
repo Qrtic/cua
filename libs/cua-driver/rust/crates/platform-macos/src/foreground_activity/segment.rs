@@ -735,16 +735,11 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
     {
         Ok(policy) => policy,
         Err(_) => {
-            let reason = if !activity.reliable {
-                "monitor_unavailable"
-            } else if activity.state == State::Active {
-                "user_active"
-            } else if activity.idle_ms < 5000 {
-                "idle_threshold_not_met"
-            } else {
-                "activity_unknown"
-            };
-            return admission_failure(reason, "Five seconds of reliable idle are required");
+            return admission_refusal(
+                activity_admission_reason(activity),
+                activity,
+                "Five seconds of reliable idle are required",
+            );
         }
     };
     // No activation or other write in begin. A cancelled capture cannot leave input.

@@ -461,16 +461,17 @@ impl Tool for ActivityGuardedTool {
                 .or_else(|| args.get("capture_scope"))
                 .and_then(serde_json::Value::as_str)
                 == Some("desktop");
-        if unsupported || !snapshot().reliable {
+        let activity = snapshot();
+        if unsupported || !activity.reliable {
             if let Some(call) = &segment_call {
                 call.revoke();
                 call.settle();
             }
-            return cua_driver_core::protocol::ToolResult::error(
-                "Native activity coverage or a bounded foreground episode is unavailable; no input was dispatched.")
-                .with_structured(serde_json::json!({
-                    "code": "foreground_activity_unavailable", "effect": "refused", "retryable": false,
-                }));
+            return admission_refusal(
+                if unsupported { "unsupported_activity_route" } else { "monitor_unavailable" },
+                activity,
+                "Native activity coverage or a bounded foreground episode is unavailable; no input was dispatched.",
+            );
         }
         let foreground = crate::tools::DeliveryMode::parse(
             args.get("delivery_mode")
@@ -498,8 +499,10 @@ impl Tool for ActivityGuardedTool {
                     .as_deref()
                     .is_some_and(|value| !value.is_empty())
             {
-                return cua_driver_core::protocol::ToolResult::error("Canonical foreground owner and exact process are required; no input was dispatched.")
-                    .with_structured(serde_json::json!({"code": "foreground_activity_unavailable", "effect": "refused", "retryable": false}));
+                return admission_refusal(
+                    "canonical_foreground_owner_unavailable", activity,
+                    "Canonical foreground owner and exact process are required; no input was dispatched.",
+                );
             }
             pid
         } else {
@@ -518,12 +521,12 @@ impl Tool for ActivityGuardedTool {
         let foreground_admission = if let Some(call) = &segment_call {
             Some(call.activity_lease())
         } else if foreground {
-            let Some(lease) = EpisodeLease::begin(clock_ms(), snapshot()) else {
-                return cua_driver_core::protocol::ToolResult::error(
-                    "Foreground input requires five seconds of reliable native idle evidence; no input was dispatched.")
-                    .with_structured(serde_json::json!({
-                        "code": "foreground_activity_unavailable", "effect": "refused", "retryable": false,
-                    }));
+            let activity = snapshot();
+            let Some(lease) = EpisodeLease::begin(clock_ms(), activity) else {
+                return admission_refusal(
+                    activity_admission_reason(activity), activity,
+                    "Foreground input requires five seconds of reliable native idle evidence; no input was dispatched.",
+                );
             };
             Some(lease)
         } else {
@@ -1450,6 +1453,36 @@ fn diagnostic_state_from_snapshot(current: Snapshot) -> serde_json::Value {
     })
 }
 
+fn activity_admission_reason(activity: Snapshot) -> &'static str {
+    if !activity.reliable {
+        "monitor_unavailable"
+    } else if activity.state == State::Active {
+        "user_active"
+    } else if activity.idle_ms < 5000 {
+        "idle_threshold_not_met"
+    } else {
+        "activity_unknown"
+    }
+}
+
+/// Report the snapshot used for the refusal, not a later readiness sample.
+fn admission_refusal(
+    reason: &str,
+    activity: Snapshot,
+    message: &str,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(message).with_structured(serde_json::json!({
+        "code": "foreground_activity_unavailable", "effect": "refused", "retryable": false,
+        "foreground_failure": { "reason": reason },
+        "activity_evidence": {
+            "monitor": if activity.reliable { "ready" } else { "unknown" },
+            "state": match activity.state { State::Idle => "idle", State::Active => "active", State::Unknown => "unknown" },
+            "idle_ms": activity.idle_ms,
+            "generation": activity.generation,
+        },
+    }))
+}
+
 #[cfg(test)]
 mod episode_lifecycle_tests {
     use super::*;
@@ -1457,6 +1490,37 @@ mod episode_lifecycle_tests {
         event::CGEventFlags,
         event_source::{CGEventSource, CGEventSourceStateID},
     };
+
+    #[test]
+    fn admission_refusal_retains_the_failed_snapshot_without_dispatch_or_identity() {
+        for (reliable, state, idle_ms, reason) in [
+            (false, State::Unknown, 0, "monitor_unavailable"),
+            (true, State::Active, 0, "user_active"),
+            (true, State::Unknown, 4999, "idle_threshold_not_met"),
+            (true, State::Unknown, 5000, "activity_unknown"),
+        ] {
+            let activity = Snapshot {
+                reliable,
+                state,
+                idle_ms,
+                generation: 17,
+            };
+            assert_eq!(activity_admission_reason(activity), reason);
+            let result = admission_refusal(reason, activity, "No input was dispatched.");
+            assert_eq!(result.is_error, Some(true));
+            let value = result.structured_content.unwrap();
+            assert_eq!(value["effect"], "refused");
+            assert_eq!(value["retryable"], false);
+            assert_eq!(value["foreground_failure"]["reason"], reason);
+            assert_eq!(value["activity_evidence"]["idle_ms"], idle_ms);
+            assert_eq!(value["activity_evidence"]["generation"], 17);
+            assert_eq!(
+                value["activity_evidence"]["monitor"],
+                if reliable { "ready" } else { "unknown" }
+            );
+            assert_eq!(value["activity_evidence"].as_object().unwrap().len(), 4);
+        }
+    }
 
     #[test]
     fn foreground_capabilities_preserve_runtime_admission_evidence() {
