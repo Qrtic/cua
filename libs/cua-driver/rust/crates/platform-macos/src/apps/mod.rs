@@ -95,7 +95,7 @@ fn list_running_apps_native() -> Vec<AppInfo> {
 ///     without needing a separate `list_running_apps` lookup, so we
 ///     can't race a same-bundle-id helper that happens to be running.
 pub fn launch_app(bundle_id: &str) -> anyhow::Result<i32> {
-    if bundle_id == system_dialogs::BUNDLE_ID {
+    if system_dialogs::is_system_dialog_bundle(bundle_id) {
         anyhow::bail!(
             "System dialogs must already exist; observe the system app instead of launching it"
         );

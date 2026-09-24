@@ -86,8 +86,8 @@ impl Tool for ListWindowsTool {
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;
         let mut separately_enumerated_ids = std::collections::HashSet::new();
-        // UserNotificationCenter permission alerts use an accessory layer.
-        // Add only its signed, visible AXSystemDialog windows, not every menu,
+        // Dedicated macOS permission alerts use an accessory layer.
+        // Add only their signed, visible system-dialog windows, not every menu,
         // tooltip or system helper on a nonzero layer.
         for dialog in crate::apps::system_dialogs::visible_windows() {
             if !windows
