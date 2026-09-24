@@ -1,8 +1,10 @@
-//! Resolve the nearest AX window/sheet, rather than a sheet's document host.
+//! Resolve the nearest AX window, sheet or popover, rather than its host.
 //!
 //! AppKit controls in a sheet can expose AXWindow = the document while their
-//! AXParent chain reaches a distinct AXSheet first. The nearest native surface
-//! is the input owner. An unmappable sheet is not permission to use its host.
+//! AXParent chain reaches a distinct AXSheet first. The same rule applies to
+//! attached AXPopovers: their semantic route must prove attachment to the host,
+//! not silently inherit the host's identity. An unmappable surface is not
+//! permission to use its host.
 
 use super::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess, AXUIElementGetPid,
@@ -36,14 +38,14 @@ fn resolve<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
         }
         let role = tree.role(&node)?;
         match role.as_str() {
-            "AXWindow" | "AXSheet" => return tree.window_id(&node),
+            "AXWindow" | "AXSheet" | "AXPopover" => return tree.window_id(&node),
             "AXApplication" => return None,
             _ => {}
         }
         let Some(parent) = tree.relation(&node, "AXParent") else {
             // Some accessibility implementations omit parent links. Retain
             // the existing direct AXWindow proof only when no nearer surface
-            // was encountered, never after an unmappable sheet or a cycle.
+            // was encountered, never after an unmappable sheet/popover or a cycle.
             let window = tree.relation(start, "AXWindow")?;
             return (tree.within_budget() && tree.owner(&window) == Some(pid))
                 .then(|| tree.window_id(&window))
@@ -161,6 +163,28 @@ mod tests {
         let mut t = sheet();
         t.nodes.get_mut(&1).unwrap().3 = None;
         assert_eq!(resolve(&t, &0), None);
+    }
+    #[test]
+    fn attached_popover_controls_keep_their_surface_identity() {
+        let mut t = sheet();
+        t.nodes.get_mut(&1).unwrap().0 = "AXPopover";
+        // A host-directed semantic click must use the attachment proof rather
+        // than the ordinary host-descendant route, even when AXWindow=host.
+        assert_eq!(resolve(&t, &0), Some(8));
+        assert_eq!(resolve(&t, &1), Some(8));
+        assert_ne!(resolve(&t, &0), Some(7));
+        // Some controls instead report AXWindow=popover. Parent traversal and
+        // that attribute must produce the same surface identity.
+        t.nodes.get_mut(&0).unwrap().2 = Some(1);
+        assert_eq!(resolve(&t, &0), Some(8));
+    }
+    #[test]
+    fn unmappable_popover_never_inherits_its_host_id() {
+        let mut t = sheet();
+        t.nodes.get_mut(&1).unwrap().0 = "AXPopover";
+        t.nodes.get_mut(&1).unwrap().3 = None;
+        assert_eq!(resolve(&t, &0), None);
+        assert_eq!(resolve(&t, &1), None);
     }
     #[test]
     fn sibling_sheet_is_not_the_requested_sheet() {
