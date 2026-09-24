@@ -317,7 +317,7 @@ impl Tool for TypeTextTool {
         // of the cache so a concurrent get_window_state can't free it before
         // the blocking type below dereferences it (use-after-free → daemon
         // crash). Each detached blocking worker owns a cloned retain as well.
-        let element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
+        let mut element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
             (element_index, window_id, snapshot_id)
         {
             match self.state.element_cache.get_element_retained_for_snapshot(
@@ -326,7 +326,7 @@ impl Tool for TypeTextTool {
                 snapshot_id,
                 idx,
             ) {
-                Some(e) => Some((e, idx)),
+                Some(e) => Some((e, Some(idx))),
                 None => {
                     return cua_driver_core::element_token::stale_element_cache_result(
                         "type_text",
@@ -339,6 +339,26 @@ impl Tool for TypeTextTool {
         } else {
             None
         };
+        // A focused native editor can be absent from a truncated AX tree while
+        // still exposing an exact-window, writable AXSelectedText. Retain that
+        // same object before the background gate. Otherwise a multi-window app
+        // is refused as ambiguous before its safe semantic rung is considered.
+        // Pixel requests and terminal/web surfaces keep their event-only path.
+        if element_guard.is_none()
+            && !delivery_mode.is_foreground()
+            && px.is_none()
+            && py.is_none()
+            && !crate::terminal::is_terminal_pid(pid)
+        {
+            if let Some(wid) = window_id {
+                element_guard = crate::foreground_activity::spawn_blocking(move || {
+                    retained_native_insert_target(pid, wid).map(|element| (element, None))
+                })
+                .await
+                .ok()
+                .flatten();
+            }
+        }
         if let Some((element, _)) = element_guard.as_ref() {
             if unsafe {
                 super::ensure_app_context_element_window(
@@ -430,7 +450,7 @@ impl Tool for TypeTextTool {
             // element_index stays None → the type path below writes to the now-
             // focused element via the CGEvent (key_events) rung.
         }
-        if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
+        if let (Some((element, Some(_))), Some(wid)) = (element_guard.as_ref(), window_id) {
             let center_element = element.clone();
             if let Ok(Some((screen_x, screen_y))) =
                 crate::foreground_activity::spawn_blocking(move || unsafe {
@@ -456,9 +476,7 @@ impl Tool for TypeTextTool {
                     .update_position(&cursor_key, screen_x, screen_y);
             }
         }
-        let element_ptr = element_guard
-            .as_ref()
-            .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+        let element_ptr = element_guard.as_ref().map(|(g, idx)| (g.as_ptr(), *idx));
 
         let text_clone = text.clone();
         let char_count = text.chars().count();
@@ -495,7 +513,7 @@ impl Tool for TypeTextTool {
                 crate::foreground_activity::spawn_blocking(move || {
                     let element_ptr = blocking_element
                         .as_ref()
-                        .map(|(element, index)| (element.as_ptr(), Some(*index)));
+                        .map(|(element, index)| (element.as_ptr(), *index));
                     type_text_blocking(
                         pid,
                         &text_clone,
@@ -929,6 +947,30 @@ fn implicit_ax_insert_eligible(
         && !in_web_area
 }
 
+/// Resolve one native insertion target without changing focus. The returned
+/// retain binds eligibility, the exact-target gate and the write to one object;
+/// no later process-wide focus lookup can substitute a sibling window's field.
+fn retained_native_insert_target(
+    pid: i32,
+    window_id: u32,
+) -> Option<crate::ax::cache::RetainedElement> {
+    unsafe {
+        let element = crate::ax::exact_target::focused_element_in_window(pid, window_id)?;
+        let retained = crate::ax::cache::RetainedElement::retain(element as usize);
+        CFRelease(element as _);
+        let role = copy_string_attr(element, "AXRole").unwrap_or_default();
+        let before = copy_string_attr(element, "AXValue");
+        let eligible = implicit_ax_insert_eligible(
+            &role,
+            copy_bool_attr(element, "AXEnabled"),
+            is_attribute_settable(element, "AXSelectedText"),
+            before.as_deref(),
+            target_in_web_area(pid, Some((element as usize, None)), Some(window_id)),
+        );
+        eligible.then_some(retained)
+    }
+}
+
 fn unverifiable_ax_result(pid: i32, window_id: Option<u32>) -> ToolResult {
     let mut structured = serde_json::json!({
         "code": "type_text_ax_unverifiable",
@@ -1217,9 +1259,10 @@ fn verify_typed(before: Option<&str>, after: Option<&str>, text: &str) -> bool {
     matches!(typed_progress(before, after, text), TypedProgress::Complete)
 }
 
-/// Classify an observable insertion without mistaking a prefix for complete
-/// delivery. A positive length delta is an exact delivered-character count for
-/// insert-at-cursor typing; it is capped at the request size defensively.
+/// A length change alone does not identify delivered characters: a selection
+/// can be replaced, an IME can transform input, or a renderer can normalize it.
+/// Only report a partial count when one literal prefix insertion explains the
+/// complete before/after values. Unknown edits must not authorize suffix replay.
 fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> TypedProgress {
     if text.is_empty() {
         return TypedProgress::Complete;
@@ -1227,22 +1270,37 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
     let Some(after) = after else {
         return TypedProgress::Unverifiable;
     };
+    if before == Some(after) {
+        return TypedProgress::Unchanged;
+    }
     if after.contains(text) {
         return TypedProgress::Complete;
     }
     let Some(before) = before else {
         return TypedProgress::Unverifiable;
     };
-    let delivered = after
-        .chars()
-        .count()
-        .saturating_sub(before.chars().count())
-        .min(text.chars().count());
-    if delivered == 0 {
-        TypedProgress::Unchanged
-    } else {
-        TypedProgress::Partial(delivered)
+    let before_chars: Vec<char> = before.chars().collect();
+    let after_chars: Vec<char> = after.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let Some(delivered) = after_chars.len().checked_sub(before_chars.len()) else {
+        return TypedProgress::Unverifiable;
+    };
+    if delivered == 0 || delivered >= text_chars.len() {
+        return TypedProgress::Unverifiable;
     }
+    // Test the first differing position in linear time. Ambiguous repeated
+    // text may remain unverifiable; it must never invent a retry position.
+    let common_prefix = before_chars
+        .iter()
+        .zip(&after_chars)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if after_chars[common_prefix..common_prefix + delivered] == text_chars[..delivered]
+        && after_chars[common_prefix + delivered..] == before_chars[common_prefix..]
+    {
+        return TypedProgress::Partial(delivered);
+    }
+    TypedProgress::Unverifiable
 }
 
 /// Read the focused/target field's `AXValue`, for before/after read-back.
@@ -1290,6 +1348,9 @@ fn read_axvalue_bound(
 /// Diagnostics deliberately exclude field contents. They distinguish a native
 /// insertion target from an app canvas or a renderer without recording user text.
 fn trace_focused_text_target(pid: i32, window_id: Option<u32>, phase: &'static str) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     unsafe {
         let element = match window_id {
             Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
@@ -2462,6 +2523,34 @@ mod tests {
             Some("BEGINpayload"),
             "BEGINpayloadEND"
         ));
+    }
+
+    #[test]
+    fn transformed_or_replaced_text_does_not_invent_a_retry_offset() {
+        assert_eq!(
+            typed_progress(Some("Table 1"), Some("Table 111"), "table 111"),
+            TypedProgress::Unverifiable
+        );
+        assert_eq!(
+            typed_progress(Some("abcdefgh"), Some("BEGIN"), "BEGINpayload"),
+            TypedProgress::Unverifiable
+        );
+        assert_eq!(
+            typed_progress(Some("old"), Some("xyz12"), "abcdef"),
+            TypedProgress::Unverifiable
+        );
+        assert_eq!(
+            typed_progress(Some("hi"), Some("hi"), "hi"),
+            TypedProgress::Unchanged
+        );
+        assert_eq!(
+            typed_progress(Some("[]"), Some("[BEGIN]"), "BEGINpayload"),
+            TypedProgress::Partial(5)
+        );
+        assert_eq!(
+            typed_progress(Some("aa"), Some("aaa"), "abc"),
+            TypedProgress::Partial(1)
+        );
     }
 
     #[test]
