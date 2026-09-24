@@ -71,7 +71,11 @@ fn def() -> &'static ToolDef {
             PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
             indexed row with `element_index`, `role`, `label`, `value` (the \
             element's text/AXValue when present — use it to verify what a field \
-            holds), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            holds), `frame: {x,y,w,h}`, `parent_index`, `depth`, `tree_order`). \
+            Unfiltered observations also include `read_only_elements`: display-only \
+            rows with `context_only:true` and no action index/token. Merge by \
+            `tree_order` for text/state evidence; they cannot authorize actions. \
+            These rows are omitted for query-filtered responses. The markdown \
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
@@ -1576,6 +1580,12 @@ impl Tool for GetWindowStateTool {
             query.as_deref(),
             &tree_md,
         );
+        let read_only_elements = match published_tree_result {
+            Some(r) if scope_matched && plan.include_elements => {
+                build_read_only_elements(&r.nodes, query.as_deref())
+            }
+            _ => Vec::new(),
+        };
         let filtered_element_count = elements_json.len();
         // The structured array intentionally contains only actionable nodes,
         // and AX child reads can fail independently of the element/depth caps.
@@ -1593,6 +1603,7 @@ impl Tool for GetWindowStateTool {
             "elements_complete": elements_complete,
             "tree_markdown": tree_md,
             "elements": elements_json,
+            "read_only_elements": read_only_elements,
             "_note": "Prefer `elements` — `tree_markdown` will continue to work \
                 but new fields will only be added to the structured side. \
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
@@ -2014,97 +2025,131 @@ pub(crate) fn build_elements_array_with_token(
 ) -> Vec<serde_json::Value> {
     nodes
         .iter()
-        .filter_map(|node| {
-            let idx = node.element_index?;
-            // `label` is a best-effort human-readable string: title first,
-            // then description, then value, then identifier. Mirrors what
-            // a human reading the markdown row would call this element.
-            let label = node
-                .title
-                .clone()
-                .or_else(|| node.description.clone())
-                .or_else(|| node.value.clone())
-                .or_else(|| node.identifier.clone());
-            let frame = node
-                .frame
-                .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
-            let mut entry = serde_json::json!({
-                "element_index": idx,
-                // Surface 6: opaque token paired to the integer index.
-                // Tools accept either; the token has explicit validity
-                // (invalidated when the next snapshot supersedes this
-                // one in the per-pid LRU). See cua-driver-core's
-                // `element_token` module.
-                "element_token": cua_driver_core::element_token::token_for(snapshot_id, idx),
-                "role": node.role,
-                "depth": node.depth,
-            });
-            if let Some(label) = label {
-                entry["label"] = serde_json::Value::String(label);
-            }
-            // Surface the element's AXValue separately from `label`. `label`
-            // collapses title→description→value→identifier into one display
-            // string, so on a control that has BOTH a title/description AND a
-            // value (e.g. a "Compose message" text field holding typed text),
-            // the value is shadowed and invisible to a caller reading the
-            // structured side — it only showed up in `tree_markdown`, forcing a
-            // markdown grep to verify what landed. Emit it explicitly so the
-            // verify-then-escalate loop can read the typed text structurally.
-            // `value_state` widens the string-only AXValue read to all CF
-            // types (CFNumber sliders → "8", CFBoolean checkboxes/radios →
-            // "1"/"0") — controls whose state was previously invisible here.
-            // Falls back to `value` so the field never regresses for
-            // string-valued elements.
-            if let Some(value) = node
-                .value_state
-                .clone()
-                .or_else(|| node.value.clone())
-                .filter(|v| !v.is_empty())
-            {
-                entry["value"] = serde_json::Value::String(value);
-            }
-            if let Some(desc) = node.value_description.clone() {
-                entry["value_description"] = serde_json::Value::String(desc);
-            }
-            // Only surface a real range: WebKit reports AXMinValue/AXMaxValue
-            // as 0.0/0.0 on non-range controls (checkboxes, radios), which
-            // would be pure noise on every two-state element.
-            if let (Some(min), Some(max)) = (node.min_value, node.max_value) {
-                if max > min {
-                    entry["min"] = serde_json::json!(min);
-                    entry["max"] = serde_json::json!(max);
-                }
-            }
-            if let Some(enabled) = node.enabled {
-                entry["enabled"] = serde_json::Value::Bool(enabled);
-            }
-            let selected = node.selected.or_else(|| {
-                let role = node.role.to_ascii_lowercase();
-                if role.contains("checkbox") || role.contains("radiobutton") {
-                    node.value_state.as_deref().and_then(|value| match value {
-                        "1" | "true" | "on" => Some(true),
-                        "0" | "false" | "off" => Some(false),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            });
-            if let Some(selected) = selected {
-                entry["selected"] = serde_json::Value::Bool(selected);
-            }
-            if node.in_web_content {
-                entry["in_web_content"] = serde_json::Value::Bool(true);
-            }
-            if let Some(frame) = frame {
-                entry["frame"] = frame;
-            }
-            if let Some(parent) = node.parent_element_index {
-                entry["parent_index"] = serde_json::json!(parent);
-            }
+        .enumerate()
+        .filter_map(|(order, node)| {
+            let index = node.element_index?;
+            let mut entry = build_element_observation(node, order);
+            entry["element_index"] = serde_json::json!(index);
+            entry["element_token"] = serde_json::json!(cua_driver_core::element_token::token_for(
+                snapshot_id,
+                index
+            ));
             Some(entry)
         })
         .collect()
+}
+
+/// Display-only AX rows are evidence, never addressable action targets.
+/// Preserve the complete DFS order (including containers) so consumers can
+/// filter menu/secure/denied subtrees consistently across both arrays. Query
+/// responses omit this extension until a display-row projection is available;
+/// do not leak unrelated rows from the retained, unfiltered native snapshot.
+fn build_read_only_elements(
+    nodes: &[crate::ax::tree::AXNode],
+    query: Option<&str>,
+) -> Vec<serde_json::Value> {
+    if query.is_some() {
+        return Vec::new();
+    }
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(order, node)| {
+            if node.element_index.is_some() {
+                return None;
+            }
+            let mut entry = build_element_observation(node, order);
+            entry["context_only"] = serde_json::json!(true);
+            Some(entry)
+        })
+        .collect()
+}
+
+fn build_element_observation(
+    node: &crate::ax::tree::AXNode,
+    tree_order: usize,
+) -> serde_json::Value {
+    // `label` is a best-effort human-readable string: title first,
+    // then description, then value, then identifier. Mirrors what
+    // a human reading the markdown row would call this element.
+    let label = node
+        .title
+        .clone()
+        .or_else(|| node.description.clone())
+        .or_else(|| node.value.clone())
+        .or_else(|| node.identifier.clone());
+    let frame = node
+        .frame
+        .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
+    let mut entry = serde_json::json!({
+        "tree_order": tree_order,
+        "role": node.role,
+        "depth": node.depth,
+    });
+    if let Some(label) = label {
+        entry["label"] = serde_json::Value::String(label);
+    }
+    // Surface the element's AXValue separately from `label`. `label`
+    // collapses title→description→value→identifier into one display
+    // string, so on a control that has BOTH a title/description AND a
+    // value (e.g. a "Compose message" text field holding typed text),
+    // the value is shadowed and invisible to a caller reading the
+    // structured side — it only showed up in `tree_markdown`, forcing a
+    // markdown grep to verify what landed. Emit it explicitly so the
+    // verify-then-escalate loop can read the typed text structurally.
+    // `value_state` widens the string-only AXValue read to all CF
+    // types (CFNumber sliders → "8", CFBoolean checkboxes/radios →
+    // "1"/"0") — controls whose state was previously invisible here.
+    // Falls back to `value` so the field never regresses for
+    // string-valued elements.
+    if let Some(value) = node
+        .value_state
+        .clone()
+        .or_else(|| node.value.clone())
+        .filter(|v| !v.is_empty())
+    {
+        entry["value"] = serde_json::Value::String(value);
+    }
+    if let Some(desc) = node.value_description.clone() {
+        entry["value_description"] = serde_json::Value::String(desc);
+    }
+    // Only surface a real range: WebKit reports AXMinValue/AXMaxValue
+    // as 0.0/0.0 on non-range controls (checkboxes, radios), which
+    // would be pure noise on every two-state element.
+    if let (Some(min), Some(max)) = (node.min_value, node.max_value) {
+        if max > min {
+            entry["min"] = serde_json::json!(min);
+            entry["max"] = serde_json::json!(max);
+        }
+    }
+    if let Some(enabled) = node.enabled {
+        entry["enabled"] = serde_json::Value::Bool(enabled);
+    }
+    let selected = node.selected.or_else(|| {
+        let role = node.role.to_ascii_lowercase();
+        if role.contains("checkbox") || role.contains("radiobutton") {
+            node.value_state.as_deref().and_then(|value| match value {
+                "1" | "true" | "on" => Some(true),
+                "0" | "false" | "off" => Some(false),
+                _ => None,
+            })
+        } else {
+            None
+        }
+    });
+    if let Some(selected) = selected {
+        entry["selected"] = serde_json::Value::Bool(selected);
+    }
+    if node.in_web_content {
+        entry["in_web_content"] = serde_json::Value::Bool(true);
+    }
+    if let Some(frame) = frame {
+        entry["frame"] = frame;
+    }
+    if let Some(parent) = node.parent_element_index {
+        entry["parent_index"] = serde_json::json!(parent);
+    }
+    entry
 }
 
 /// Back-compat wrapper for callers that don't yet have a snapshot id
@@ -2794,6 +2839,42 @@ mod tests {
             vec![0, 1, 2],
             "ordering must match DFS / element_index assignment"
         );
+    }
+
+    #[test]
+    fn display_only_status_is_structured_without_action_authority() {
+        let mut status = node(None, "AXStaticText", None, 1, Some(0), None);
+        status.value = Some("Saved: example".into());
+        let nodes = vec![
+            node(Some(0), "AXWindow", Some("Document"), 0, None, None),
+            status,
+            node(Some(1), "AXButton", Some("Save"), 1, Some(0), None),
+        ];
+        let actions = build_elements_array_with_token(&nodes, 17);
+        let evidence = build_read_only_elements(&nodes, None);
+        assert_eq!(actions[1]["element_index"], 1);
+        assert_eq!(actions[1]["tree_order"], 2);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["label"], "Saved: example");
+        assert_eq!(evidence[0]["value"], "Saved: example");
+        assert_eq!(evidence[0]["tree_order"], 1);
+        assert_eq!(evidence[0]["parent_index"], 0);
+        assert_eq!(evidence[0]["context_only"], true);
+        assert!(evidence[0].get("element_index").is_none());
+        assert!(evidence[0].get("element_token").is_none());
+    }
+
+    #[test]
+    fn query_does_not_expose_unfiltered_display_rows() {
+        let nodes = vec![node(
+            None,
+            "AXStaticText",
+            Some("Unrelated private text"),
+            0,
+            None,
+            None,
+        )];
+        assert!(build_read_only_elements(&nodes, Some("Search")).is_empty());
     }
 
     #[test]
