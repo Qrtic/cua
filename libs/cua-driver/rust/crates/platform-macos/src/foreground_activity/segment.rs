@@ -509,8 +509,9 @@ impl Call {
         // owner, panel and deadline. No input can use the new target until a
         // fresh observation; the current call's exact target never changes.
         let started = Instant::now();
+        let mut replacement_candidate = None;
         let settled = settle_dialog_condition(
-            Duration::from_millis(350),
+            Duration::from_secs(2),
             || {
                 check_live()?;
                 self.segment.check_liveness()
@@ -520,32 +521,37 @@ impl Call {
                 {
                     return true;
                 }
-                if let (Some(host), Some(panel)) =
+                let replacement = if let (Some(host), Some(panel)) =
                     (self.segment.dialog_host, self.segment.dialog_panel)
                 {
-                    if let Some(window_id) = crate::ax::attached_sheet::replaced_dialog_host(
+                    crate::ax::attached_sheet::replaced_dialog_host(
                         self.target.pid,
                         panel,
                         host.window_id,
-                    ) {
-                        let destination = ExactWindowTarget {
-                            pid: self.target.pid,
-                            window_id,
-                        };
-                        if exact_front(destination) {
-                            let mut inner =
-                                self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
-                            if inner
-                                .policy
-                                .check(&self.segment.binding, clock_ms(), snapshot())
-                                .is_ok()
-                            {
-                                inner.dialog_closed = true;
-                                inner.dialog_closed_destination = Some(destination);
-                                return true;
-                            }
-                        }
+                    )
+                    .map(|window_id| ExactWindowTarget {
+                        pid: self.target.pid,
+                        window_id,
+                    })
+                    .filter(|destination| exact_front(*destination))
+                } else {
+                    None
+                };
+                if stable_replacement(&mut replacement_candidate, replacement, Instant::now()) {
+                    let mut inner =
+                        self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if inner
+                        .policy
+                        .check(&self.segment.binding, clock_ms(), snapshot())
+                        .is_ok()
+                    {
+                        inner.dialog_closed = true;
+                        inner.dialog_closed_destination = replacement;
+                        return true;
                     }
+                }
+                if replacement.is_some() {
+                    return false;
                 }
                 let before = self
                     .segment
@@ -636,6 +642,27 @@ impl Call {
     }
 }
 
+// Saving an untitled Xcode workspace briefly focuses another existing document
+// before the replacement is ready. A single coherent read is not a stable
+// destination. Missing AX, a changed ID, or a changed owner restarts this proof.
+fn stable_replacement(
+    pending: &mut Option<(ExactWindowTarget, Instant)>,
+    candidate: Option<ExactWindowTarget>,
+    now: Instant,
+) -> bool {
+    let Some(candidate) = candidate else {
+        *pending = None;
+        return false;
+    };
+    if let Some((previous, since)) = pending {
+        if *previous == candidate {
+            return now.saturating_duration_since(*since) >= Duration::from_millis(100);
+        }
+    }
+    *pending = Some((candidate, now));
+    false
+}
+
 fn dialog_transition_allowed(
     before: &crate::ax::attached_sheet::DialogAttachment,
     after: &crate::ax::attached_sheet::DialogAttachment,
@@ -660,12 +687,12 @@ fn settle_dialog_condition(
         // A successful AX/WindowServer read cannot override intervening input,
         // cancellation, ended ownership or an exhausted native segment.
         check_live()?;
-        if returned {
-            return Ok(true);
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(false);
+        }
+        if returned {
+            return Ok(true);
         }
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
@@ -1360,6 +1387,46 @@ pub(crate) fn stop_runtime_segments(runtime_scope: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_waits_past_a_transient_old_document_and_ax_blackout() {
+        let start = Instant::now();
+        let old = ExactWindowTarget { pid: 42, window_id: 700 };
+        let new = ExactWindowTarget { pid: 42, window_id: 800 };
+        let foreign = ExactWindowTarget { pid: 99, window_id: 800 };
+        let mut pending = None;
+        for (millis, candidate, expected) in [
+            (0, Some(old), false),
+            (40, Some(old), false),
+            (50, None, false),
+            (700, Some(new), false),
+            (770, Some(new), false),
+            (810, Some(new), true),
+            (820, None, false),
+            (900, Some(new), false),
+            (950, Some(foreign), false),
+            (1020, Some(new), false),
+            (1120, Some(new), true),
+        ] {
+            assert_eq!(
+                stable_replacement(&mut pending, candidate, start + Duration::from_millis(millis)),
+                expected,
+                "replacement at {millis} ms",
+            );
+        }
+    }
+
+    #[test]
+    fn dialog_return_read_cannot_accept_a_proof_after_its_local_budget() {
+        assert!(!settle_dialog_condition(
+            Duration::from_millis(1),
+            || Ok(()),
+            || {
+                std::thread::sleep(Duration::from_millis(3));
+                true
+            },
+        ).unwrap());
+    }
 
     #[test]
     fn dialog_return_waits_for_appkit_and_windowserver_to_agree() {
