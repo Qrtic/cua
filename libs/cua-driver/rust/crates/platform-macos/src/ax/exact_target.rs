@@ -200,10 +200,10 @@ fn classify_ax_window_lifecycle(
 /// Gather one bounded, fresh `AXWindows` membership snapshot for a process and
 /// classify the requested CGWindowIDs against it.
 ///
-/// This is intentionally opt-in from `list_windows`: the ordinary enumeration
-/// stays a cheap WindowServer read, while teardown/lifecycle consumers can ask
-/// for the additional proof needed to distinguish a minimized or off-Space AX
-/// window from a stale WindowServer-only row.
+/// Global `list_windows` enumeration stays a cheap WindowServer read. Exact-pid
+/// inventory also uses this when accessory-layer candidates need positive AX
+/// membership proof; lifecycle consumers can explicitly request it to
+/// distinguish minimized or off-Space AX windows from WindowServer-only rows.
 pub(crate) fn gather_ax_window_lifecycle_evidence(
     pid: i32,
     window_ids: impl IntoIterator<Item = u32>,

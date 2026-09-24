@@ -13,6 +13,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_windows".into(),
         description: "List public layer-0 top-level windows and verified visible macOS system dialogs currently known to WindowServer. \
+            With an exact pid, also include that regular application's accessory windows proven by fresh AXWindows membership. \
             Includes off-screen windows (minimized, on another Space, hidden-launched). \
             Private trusted system helpers such as the AppKit Open/Save panel service are omitted; \
             observe those only through the original host application's app_context. \
@@ -34,7 +35,7 @@ fn def() -> &'static ToolDef {
             "properties": {
                 "pid": {
                     "type": "integer",
-                    "description": "Optional pid filter. When set, only this pid's windows are returned."
+                    "description": "Optional pid filter. When set, only this pid's windows are returned, including same-process accessory panels with fresh AXWindows membership."
                 },
                 "on_screen_only": {
                     "type": "boolean",
@@ -84,7 +85,7 @@ impl Tool for ListWindowsTool {
         };
         let current_space_id = enumeration.current_space_id;
         let mut windows = enumeration.windows;
-        let mut added_system_dialog_ids = std::collections::HashSet::new();
+        let mut separately_enumerated_ids = std::collections::HashSet::new();
         // UserNotificationCenter permission alerts use an accessory layer.
         // Add only its signed, visible AXSystemDialog windows, not every menu,
         // tooltip or system helper on a nonzero layer.
@@ -93,8 +94,33 @@ impl Tool for ListWindowsTool {
                 .iter()
                 .any(|window| window.window_id == dialog.window_id)
             {
-                added_system_dialog_ids.insert(dialog.window_id);
+                separately_enumerated_ids.insert(dialog.window_id);
                 windows.push(dialog);
+            }
+        }
+
+        // A normal app's floating inspector may live above layer 0. Only an
+        // exact-pid query may look for these, and only for a public regular
+        // application. Do not turn global inventory into an AX scan of every
+        // application or publish arbitrary tooltips/menu surfaces.
+        let mut auxiliary_candidates = Vec::new();
+        if let Some(pid) = pid_filter {
+            let public_app = crate::apps::list_running_apps().into_iter().find(|app| {
+                app.pid == pid
+                    && !crate::ax::app_context::hide_open_save_panel_from_inventory(pid, &app.name)
+            });
+            if public_app.is_some() {
+                let auxiliary = if on_screen_only {
+                    crate::windows::visible_windows_including_accessory_layers_with_snapshot()
+                } else {
+                    crate::windows::all_windows_including_accessory_layers_with_snapshot()
+                };
+                auxiliary_candidates = auxiliary
+                    .windows
+                    .into_iter()
+                    .filter(|window| window.pid == pid && window.layer != 0)
+                    .filter(|window| window.bounds.width > 0.0 && window.bounds.height > 0.0)
+                    .collect();
             }
         }
 
@@ -111,16 +137,25 @@ impl Tool for ListWindowsTool {
                 )
             })
         });
+        auxiliary_candidates = filter_private_helper_windows(auxiliary_candidates, |window| {
+            *helper_pids.entry(window.pid).or_insert_with(|| {
+                crate::ax::app_context::hide_open_save_panel_from_inventory(
+                    window.pid,
+                    &window.app_name,
+                )
+            })
+        });
 
         if let Some(pid) = pid_filter {
             windows.retain(|w| w.pid == pid);
         }
 
         let lifecycle_evidence = if let Some(pid) =
-            pid_filter.filter(|_| include_lifecycle_evidence)
+            pid_filter.filter(|_| include_lifecycle_evidence || !auxiliary_candidates.is_empty())
         {
             let window_ids = windows
                 .iter()
+                .chain(auxiliary_candidates.iter())
                 .map(|window| window.window_id)
                 .collect::<Vec<_>>();
             let fallback_ids = window_ids.clone();
@@ -153,16 +188,23 @@ impl Tool for ListWindowsTool {
         } else {
             None
         };
+        if let (Some(pid), Some(evidence)) = (pid_filter, lifecycle_evidence.as_ref()) {
+            for panel in verified_auxiliary_windows(pid, &windows, auxiliary_candidates, evidence) {
+                separately_enumerated_ids.insert(panel.window_id);
+                windows.push(panel);
+            }
+        }
         let windows_json: Vec<Value> = windows
             .iter()
             .map(|window| {
                 let evidence = lifecycle_evidence
                     .as_ref()
+                    .filter(|_| include_lifecycle_evidence)
                     .and_then(|evidence| evidence.get(&window.window_id))
                     .copied();
                 let mut record = window_record_with_lifecycle_evidence(window, evidence);
-                if added_system_dialog_ids.contains(&window.window_id) {
-                    // This row came from a separate on-screen snapshot; its
+                if separately_enumerated_ids.contains(&window.window_id) {
+                    // This row came from a separate WindowServer snapshot; its
                     // rank is not comparable to the original inventory ranks.
                     record["z_index"] = Value::Null;
                 }
@@ -177,6 +219,30 @@ impl Tool for ListWindowsTool {
             }),
         )
     }
+}
+
+fn verified_auxiliary_windows(
+    pid: i32,
+    existing: &[crate::windows::WindowInfo],
+    candidates: Vec<crate::windows::WindowInfo>,
+    evidence: &std::collections::HashMap<u32, crate::ax::exact_target::AxWindowLifecycleEvidence>,
+) -> Vec<crate::windows::WindowInfo> {
+    use crate::ax::exact_target::AxWindowLifecycleEvidence;
+
+    let mut seen: std::collections::HashSet<u32> =
+        existing.iter().map(|window| window.window_id).collect();
+    candidates
+        .into_iter()
+        .filter(|window| {
+            window.pid == pid
+                && window.layer != 0
+                && matches!(
+                    evidence.get(&window.window_id),
+                    Some(AxWindowLifecycleEvidence::AxPresent { .. })
+                )
+                && seen.insert(window.window_id)
+        })
+        .collect()
 }
 
 pub(super) fn filter_private_helper_windows(
@@ -297,6 +363,85 @@ mod tests {
         let public = filter_private_helper_windows(windows, |window| window.pid == 20);
         assert_eq!(public.len(), 1);
         assert_eq!(public[0].window_id, 1);
+    }
+
+    #[test]
+    fn auxiliary_inspector_needs_positive_same_pid_ax_membership() {
+        let mut inspector = window(2, 10, "Preview");
+        inspector.layer = 3;
+        inspector.is_on_screen = false;
+        let mut foreign = inspector.clone();
+        foreign.pid = 20;
+        foreign.window_id = 3;
+        let mut unmapped = inspector.clone();
+        unmapped.window_id = 4;
+        let mut unreadable = inspector.clone();
+        unreadable.window_id = 5;
+        let mut absent = inspector.clone();
+        absent.window_id = 6;
+        let live = AxWindowLifecycleEvidence::AxPresent {
+            minimized: Some(false),
+            app_hidden: Some(false),
+            // Positive membership survives an unreadable unrelated AX row.
+            snapshot_complete: false,
+        };
+        let evidence = std::collections::HashMap::from([
+            (2, live),
+            (3, live),
+            (
+                4,
+                AxWindowLifecycleEvidence::WindowServerOnly {
+                    app_hidden: Some(false),
+                },
+            ),
+            (
+                5,
+                AxWindowLifecycleEvidence::AxUnavailable {
+                    app_hidden: None,
+                    query_succeeded: false,
+                },
+            ),
+        ]);
+        let admitted = verified_auxiliary_windows(
+            10,
+            &[window(1, 10, "Preview")],
+            vec![inspector, foreign, unmapped, unreadable, absent],
+            &evidence,
+        );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].window_id, 2);
+        assert!(!admitted[0].is_on_screen);
+    }
+
+    #[test]
+    fn auxiliary_inventory_does_not_duplicate_or_reintroduce_private_helpers() {
+        let mut inspector = window(2, 10, "Preview");
+        inspector.layer = 3;
+        let mut private = window(3, 20, "Private Helper");
+        private.layer = 3;
+        let live = AxWindowLifecycleEvidence::AxPresent {
+            minimized: Some(false),
+            app_hidden: Some(false),
+            snapshot_complete: true,
+        };
+        let evidence = std::collections::HashMap::from([(1, live), (2, live), (3, live)]);
+        let candidates = filter_private_helper_windows(
+            vec![
+                window(1, 10, "Preview"),
+                inspector.clone(),
+                inspector.clone(),
+                private,
+            ],
+            |window| window.pid == 20,
+        );
+        assert_eq!(
+            verified_auxiliary_windows(10, &[], candidates.clone(), &evidence).len(),
+            1
+        );
+        assert!(
+            verified_auxiliary_windows(10, &[inspector], candidates.clone(), &evidence).is_empty()
+        );
+        assert!(verified_auxiliary_windows(20, &[], candidates, &evidence).is_empty());
     }
 
     #[test]

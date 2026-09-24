@@ -123,10 +123,11 @@ pub(crate) fn visible_automation_windows_with_space_snapshot() -> WindowEnumerat
 /// Enumerate windows on every CGWindow layer, including the accessory layers
 /// (`layer != 0`) that [`all_windows`] hides.
 ///
-/// Only used to answer "does this CGWindowID exist, and who owns it?" — the
-/// question `list_windows` must NOT answer, because surfacing tooltips,
-/// popovers, the Dock and every NSMenu window would swamp callers. Keeping the
-/// layer filter on enumeration and off identity lookup is what lets
+/// Used to answer "does this CGWindowID exist, and who owns it?". Public global
+/// inventory must not expose this raw list: tooltips, the Dock and every NSMenu
+/// window would swamp callers. An exact-pid inventory may admit accessory
+/// panels only after proving same-application AXWindows membership. Keeping the
+/// layer filter on broad enumeration and off identity lookup is what lets
 /// `get_window_state` tell "no such window" apart from "exists, but is not a
 /// layer-0 window" (issue #2237).
 pub(crate) fn all_windows_including_accessory_layers() -> Vec<WindowInfo> {
