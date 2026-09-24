@@ -103,7 +103,7 @@ impl InvocationContext {
         self.interrupted.store(true, Ordering::Release);
     }
 
-    fn check(&self) -> anyhow::Result<()> {
+    fn check_liveness(&self) -> anyhow::Result<()> {
         if self.cleanup_unconfirmed.load(Ordering::Acquire) {
             anyhow::bail!("native_cleanup_unconfirmed: stop task input until cleanup is confirmed");
         }
@@ -140,6 +140,11 @@ impl InvocationContext {
             }
             anyhow::bail!("foreground_activity_interrupted: native activity changed after foreground admission; stop task input");
         }
+        Ok(())
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        self.check_liveness()?;
         if let Some(call) = &self.segment_call {
             if let Err(error) = call.check() {
                 if call.cleanup_is_unknown() {
@@ -577,11 +582,28 @@ impl Tool for ActivityGuardedTool {
                 if let Err(error) = context.check() {
                     return cua_driver_core::protocol::ToolResult::error(error.to_string());
                 }
-                if let Some(pid) = held_pid {
+                let result = if let Some(pid) = held_pid {
                     crate::background_mutation::with_held_lease(pid, self.inner.invoke(args)).await
                 } else {
                     self.inner.invoke(args).await
+                };
+                if let Some(call) = &context.segment_call {
+                    if call.is_dialog() && self.def().name != "get_window_state" {
+                        let call = Arc::clone(call);
+                        let checked = Arc::clone(&context);
+                        let settled = spawn_blocking(move || {
+                            call.settle_dialog_return(|| checked.check_liveness())
+                        })
+                        .await;
+                        if !matches!(settled, Ok(Ok(true))) {
+                            context.mark_interrupted("dialog_return_unproven");
+                        }
+                    } else if self.def().name == "get_window_state" && result.is_error != Some(true)
+                    {
+                        call.mark_dialog_observed();
+                    }
                 }
+                result
             })
             .await;
         let _ = context.check();

@@ -1169,15 +1169,14 @@ fn complete_exact_ax_window_activation(
 
     check_exact_activation_owner(pid, window_id, &mut check_activity)?;
     if let Some(host_id) = crate::ax::attached_sheet::focused_dialog_host(pid, window_id) {
-        use crate::ax::bindings::copy_element_attr;
         let sheet = OwnedActivationAx(
             crate::ax::attached_sheet::copy_focused_attached_sheet(pid, window_id)
                 .ok_or_else(|| anyhow::anyhow!("dialog attachment changed before activation"))?,
         );
-        let host = OwnedActivationAx(unsafe {
-            copy_element_attr(sheet.0, "AXParent")
-                .ok_or_else(|| anyhow::anyhow!("dialog host is unavailable"))?
-        });
+        let host = OwnedActivationAx(
+            crate::ax::attached_sheet::copy_focused_dialog_host(pid, window_id)
+                .ok_or_else(|| anyhow::anyhow!("dialog host is unavailable"))?,
+        );
         bound_activation_ax(&sheet)?;
         bound_activation_ax(&host)?;
         return exact_ax_activation_steps(
@@ -1193,14 +1192,8 @@ fn complete_exact_ax_window_activation(
                         anyhow::bail!("dialog activation target identity changed");
                     }
                 }
-                for relation in ["AXParent", "AXWindow"] {
-                    let current = OwnedActivationAx(unsafe {
-                        copy_element_attr(sheet.0, relation)
-                            .ok_or_else(|| anyhow::anyhow!("dialog detached during activation"))?
-                    });
-                    if unsafe { core_foundation::base::CFEqual(current.0 as _, host.0 as _) } == 0 {
-                        anyhow::bail!("dialog host changed during activation");
-                    }
+                if crate::ax::attached_sheet::focused_dialog_host(pid, window_id) != Some(host_id) {
+                    anyhow::bail!("dialog attachment changed during activation");
                 }
                 check_activity()
             },
