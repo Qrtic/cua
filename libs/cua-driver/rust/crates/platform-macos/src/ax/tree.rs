@@ -106,15 +106,23 @@ struct ControlState {
     selected: Option<bool>,
 }
 
-fn read_control_state_if_actionable<F>(is_actionable: bool, read: F) -> ControlState
+fn read_control_state_if_actionable<F>(
+    is_actionable: bool,
+    observed_enabled: Option<bool>,
+    read: F,
+) -> ControlState
 where
     F: FnOnce() -> ControlState,
 {
-    if is_actionable {
+    let mut state = if is_actionable {
         read()
     } else {
         ControlState::default()
-    }
+    };
+    // Negative capability is useful display evidence. Keep an already-read
+    // AXEnabled=false even though that very value prevents an action index.
+    state.enabled = observed_enabled;
+    state
 }
 
 fn role_supports_value_addressing(role: &str) -> bool {
@@ -519,7 +527,7 @@ unsafe fn walk_element(
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
-    let enabled = if !actions.is_empty() || value_settable {
+    let enabled = if !actions.is_empty() || value_settable || role == "AXMenuItem" {
         copy_bool_attr(element, "AXEnabled")
     } else {
         None
@@ -548,7 +556,7 @@ unsafe fn walk_element(
     let frame = element_screen_rect(element);
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
-    let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
+    let control_state = read_control_state_if_actionable(is_actionable, enabled, || ControlState {
         value_state: copied_value
             .map(|copied| copied.state_value)
             .filter(|v| !v.trim().is_empty())
@@ -751,6 +759,9 @@ fn format_node_line(node: &AXNode) -> String {
     } else {
         parts.push_str(&format!("- {}", node.role));
     }
+    if node.enabled == Some(false) {
+        parts.push_str(" [disabled]");
+    }
 
     // AXTitle → "title"
     if let Some(t) = &node.title {
@@ -895,7 +906,7 @@ mod tests {
     #[test]
     fn control_state_reads_are_gated_by_actionability() {
         let reads = Cell::new(0);
-        let display_only = read_control_state_if_actionable(false, || {
+        let display_only = read_control_state_if_actionable(false, Some(false), || {
             reads.set(reads.get() + 1);
             ControlState {
                 enabled: Some(true),
@@ -903,9 +914,10 @@ mod tests {
             }
         });
         assert_eq!(reads.get(), 0, "display-only nodes must not read state");
-        assert_eq!(display_only.enabled, None);
+        assert_eq!(display_only.enabled, Some(false));
+        assert!(display_only.value_description.is_none());
 
-        let actionable = read_control_state_if_actionable(true, || {
+        let actionable = read_control_state_if_actionable(true, Some(true), || {
             reads.set(reads.get() + 1);
             ControlState {
                 enabled: Some(true),
@@ -914,5 +926,35 @@ mod tests {
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
         assert_eq!(actionable.enabled, Some(true));
+    }
+
+    #[test]
+    fn disabled_menu_text_explains_why_it_has_no_action_index() {
+        let mut node = AXNode {
+            element_index: None,
+            role: "AXMenuItem".into(),
+            title: Some("Open…".into()),
+            value: None,
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr: 0,
+            depth: 2,
+            parent_element_index: None,
+            frame: None,
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: Some(false),
+            selected: None,
+            in_web_content: false,
+        };
+        assert_eq!(format_node_line(&node), "- AXMenuItem [disabled] \"Open…\"");
+        for enabled in [None, Some(true)] {
+            node.enabled = enabled;
+            assert_eq!(format_node_line(&node), "- AXMenuItem \"Open…\"");
+        }
     }
 }

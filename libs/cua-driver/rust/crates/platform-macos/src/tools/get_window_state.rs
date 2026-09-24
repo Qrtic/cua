@@ -2799,6 +2799,18 @@ mod tests {
     }
 
     #[test]
+    fn disabled_display_control_preserves_negative_capability_without_tokens() {
+        let mut disabled = node(None, "AXMenuItem", Some("Open…"), 2, None, None);
+        disabled.enabled = Some(false);
+        let rows = build_read_only_elements(&[disabled], None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["enabled"], false);
+        assert_eq!(rows[0]["context_only"], true);
+        assert!(rows[0].get("element_index").is_none());
+        assert!(rows[0].get("element_token").is_none());
+    }
+
+    #[test]
     fn elements_match_indexed_node_count() {
         // Mix of indexed + non-indexed nodes; only indexed should surface.
         let nodes = vec![
