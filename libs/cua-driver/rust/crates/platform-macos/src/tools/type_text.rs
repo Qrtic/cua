@@ -1554,9 +1554,10 @@ fn await_typed_delivery(
             }
             TypedProgress::Unverifiable => return (false, None),
             TypedProgress::Unchanged => {
-                // A readable unchanged value is an observed zero-character
-                // delivery, not an unverifiable success.
-                best_partial.get_or_insert(0);
+                // An unchanged value can also be a same-value replacement or
+                // an edit normalized by the app. It cannot prove that zero
+                // characters landed and must not authorize full-input replay.
+                best_partial = None;
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -1765,6 +1766,9 @@ fn type_text_blocking(
         };
         // Only claim the `_fg` path when an exact window was guarded; the
         // window-less fallback remains background keystrokes and must say so.
+        if native_replacement && !verified {
+            return Ok(TypeTextDelivery::AxUnverifiable);
+        }
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: if native_replacement {
                 " via exact native field replacement".to_owned()
@@ -2706,6 +2710,17 @@ mod tests {
             || Some("BEGIN".to_owned()),
         );
         assert_eq!(delivery, (false, Some(5)));
+    }
+
+    #[test]
+    fn unchanged_normalized_text_does_not_authorize_full_input_replay() {
+        let delivery = await_typed_delivery(
+            Some("Table 111"),
+            "table 111",
+            std::time::Instant::now(),
+            || Some("Table 111".to_owned()),
+        );
+        assert_eq!(delivery, (false, None));
     }
 
     #[test]
