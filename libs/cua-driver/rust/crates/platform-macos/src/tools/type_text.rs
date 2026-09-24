@@ -317,7 +317,7 @@ impl Tool for TypeTextTool {
         // of the cache so a concurrent get_window_state can't free it before
         // the blocking type below dereferences it (use-after-free → daemon
         // crash). Each detached blocking worker owns a cloned retain as well.
-        let element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
+        let mut element_guard = if let (Some(idx), Some(wid), Some(snapshot_id)) =
             (element_index, window_id, snapshot_id)
         {
             match self.state.element_cache.get_element_retained_for_snapshot(
@@ -326,7 +326,7 @@ impl Tool for TypeTextTool {
                 snapshot_id,
                 idx,
             ) {
-                Some(e) => Some((e, idx)),
+                Some(e) => Some((e, Some(idx))),
                 None => {
                     return cua_driver_core::element_token::stale_element_cache_result(
                         "type_text",
@@ -339,6 +339,26 @@ impl Tool for TypeTextTool {
         } else {
             None
         };
+        // A whole selected native editor can be missing from AXChildren (for
+        // example Numbers' table-title editor). Address that exact retained
+        // field before evaluating process-wide keyboard ambiguity. This only
+        // admits the semantic write, never input to a competing sibling window.
+        if element_guard.is_none()
+            && !delivery_mode.is_foreground()
+            && px.is_none()
+            && py.is_none()
+            && delay_ms <= crate::input::keyboard::DEFAULT_UNICODE_CADENCE_MS
+            && !crate::terminal::is_terminal_pid(pid)
+        {
+            if let Some(wid) = window_id {
+                element_guard = crate::foreground_activity::spawn_blocking(move || {
+                    retained_whole_selection(pid, wid).map(|element| (element, None))
+                })
+                .await
+                .ok()
+                .flatten();
+            }
+        }
         if let Some((element, _)) = element_guard.as_ref() {
             if unsafe {
                 super::ensure_app_context_element_window(
@@ -456,9 +476,7 @@ impl Tool for TypeTextTool {
                     .update_position(&cursor_key, screen_x, screen_y);
             }
         }
-        let element_ptr = element_guard
-            .as_ref()
-            .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+        let element_ptr = element_guard.as_ref().map(|(g, idx)| (g.as_ptr(), *idx));
 
         let text_clone = text.clone();
         let char_count = text.chars().count();
@@ -495,7 +513,7 @@ impl Tool for TypeTextTool {
                 crate::foreground_activity::spawn_blocking(move || {
                     let element_ptr = blocking_element
                         .as_ref()
-                        .map(|(element, index)| (element.as_ptr(), Some(*index)));
+                        .map(|(element, index)| (element.as_ptr(), *index));
                     type_text_blocking(
                         pid,
                         &text_clone,
@@ -1354,10 +1372,33 @@ fn whole_native_selection(
         && value.is_some_and(|value| !value.is_empty() && Some(value) == selected)
 }
 
+fn retained_whole_selection(pid: i32, wid: u32) -> Option<crate::ax::cache::RetainedElement> {
+    trace_focused_text_target(pid, Some(wid), "before_whole_selection_gate");
+    unsafe {
+        let element = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
+        let role = copy_string_attr(element, "AXRole").unwrap_or_default();
+        let value = copy_string_attr(element, "AXValue");
+        let selected = copy_string_attr(element, "AXSelectedText");
+        let eligible = whole_native_selection(
+            &role,
+            copy_bool_attr(element, "AXEnabled"),
+            is_attribute_settable(element, "AXValue"),
+            value.as_deref(),
+            selected.as_deref(),
+            target_in_web_area(pid, Some((element as usize, None)), Some(wid)),
+        );
+        let retained =
+            eligible.then(|| crate::ax::cache::RetainedElement::retain(element as usize));
+        CFRelease(element as _);
+        retained
+    }
+}
+
 /// Replacing a completely selected native field is equivalent to setting its
 /// value. Unlike typing, this does not invite spelling/capitalization changes.
-/// Only run inside the exact foreground guard. An attempted write never falls
-/// through to keyboard replay, even when a control's AX setter is ineffective.
+/// Run only under the exact foreground guard or an admitted background semantic
+/// mutation lease. An attempted write never falls through to keyboard replay,
+/// even when a control's AX setter is ineffective.
 fn replace_whole_native_selection(
     pid: i32,
     window_id: Option<u32>,
@@ -1781,6 +1822,21 @@ fn type_text_blocking(
             delivered_chars,
             verified,
         }));
+    }
+
+    // An implicitly retained whole-field target was admitted by the exact
+    // semantic background gate. Recheck the selection on that same object;
+    // losing the witness must stop, not change the operation to key events.
+    if element_ptr_and_idx.is_some_and(|(_, index)| index.is_none()) {
+        return match replace_whole_native_selection(pid, window_id, element_ptr_and_idx, text)? {
+            Some((verified, delivered_chars)) => Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                detail: " via exact native field replacement".to_owned(),
+                path: PATH_AX,
+                verified,
+                delivered_chars,
+            })),
+            None => Ok(TypeTextDelivery::AxUnverifiable),
+        };
     }
 
     // --- Background rung 0: terminal emulator → CGEvent only (AX is dropped). ---
