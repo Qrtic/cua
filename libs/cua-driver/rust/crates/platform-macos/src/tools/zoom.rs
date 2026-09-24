@@ -176,6 +176,7 @@ impl Tool for ZoomTool {
                         "width": w, "height": h, "format": "jpeg",
                         "mime_type": "image/jpeg"
                     })),
+                    meta: None,
                     action_record: None,
                 }
             }

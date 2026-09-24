@@ -289,6 +289,10 @@ pub struct ToolResult {
     pub is_error: Option<bool>,
     #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
+    /// MCP control-plane metadata for the native client, independent of the
+    /// closed ActionResult schema. Never derive this from application content.
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
     /// Rich actuator facts retained inside the daemon. This is deliberately
     /// skipped by serde so the nonbreaking truth-layer migration cannot alter
     /// the MCP result envelope or its legacy structured payload.

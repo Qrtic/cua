@@ -1837,6 +1837,7 @@ impl Tool for GetWindowStateTool {
             content,
             is_error: None,
             structured_content: Some(structured),
+            meta: None,
             action_record: None,
         }
     }

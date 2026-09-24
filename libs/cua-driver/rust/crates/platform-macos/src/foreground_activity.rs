@@ -184,7 +184,12 @@ impl InvocationContext {
             if !structured.is_object() {
                 *structured = serde_json::json!({});
             }
-            structured["foreground_dialog"] = summary;
+            structured["foreground_dialog"] = summary.clone();
+            let meta = result.meta.get_or_insert_with(|| serde_json::json!({}));
+            if !meta.is_object() {
+                *meta = serde_json::json!({});
+            }
+            meta["ai.cua/foreground"] = serde_json::json!({"dialog": summary});
         }
         if let Some(summary) = self
             .segment_call
@@ -197,7 +202,15 @@ impl InvocationContext {
             if !structured.is_object() {
                 *structured = serde_json::json!({});
             }
-            structured["foreground_segment"] = summary;
+            structured["foreground_segment"] = summary.clone();
+            let meta = result.meta.get_or_insert_with(|| serde_json::json!({}));
+            if !meta.is_object() {
+                *meta = serde_json::json!({});
+            }
+            if !meta["ai.cua/foreground"].is_object() {
+                meta["ai.cua/foreground"] = serde_json::json!({});
+            }
+            meta["ai.cua/foreground"]["segment"] = summary;
         }
         let cleanup_unconfirmed = self.cleanup_unconfirmed.load(Ordering::Acquire);
         if !cleanup_unconfirmed && !self.interrupted.load(Ordering::Acquire) {

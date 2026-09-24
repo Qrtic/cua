@@ -1580,6 +1580,7 @@ impl Tool for GetWindowStateTool {
                     content,
                     is_error: None,
                     structured_content: Some(structured),
+                    meta: None,
                     action_record: None,
                 }
             }
@@ -7824,6 +7825,7 @@ impl Tool for GetDesktopStateTool {
             content,
             is_error: None,
             structured_content: Some(structured),
+            meta: None,
             action_record: None,
         }
     }
@@ -8776,6 +8778,7 @@ impl Tool for ZoomTool {
                         "width": w, "height": h, "format": "jpeg",
                         "mime_type": "image/jpeg"
                     })),
+                    meta: None,
                     action_record: None,
                 }
             }

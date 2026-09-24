@@ -4810,6 +4810,44 @@ resources:
     }
 
     #[test]
+    fn canonical_action_projection_keeps_native_control_metadata_outside_closed_outcome_schema() {
+        let legacy = serde_json::json!({"effect":"unverifiable", "path":"key_events_fg",
+            "foreground_dialog":{"untrusted_legacy_field":"must be removed"}});
+        let mut result = ToolResult::text("key dispatched").with_structured(legacy.clone());
+        result.action_record = crate::action_record::ActionExecutionRecord::from_legacy(
+            "press_key",
+            &serde_json::json!({"delivery_mode":"foreground"}),
+            &legacy,
+        );
+        let metadata = serde_json::json!({"ai.cua/foreground":{"dialog":{
+            "phase":"transitioned", "foreground_segment_id":"fgs_fixture",
+            "pid":42, "window_id":7, "target_window_id":9, "observation_required":true,
+        }}});
+        result.meta = Some(metadata.clone());
+        publish_action_result(&mut result).unwrap();
+        assert!(result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("foreground_dialog")
+            .is_none());
+        cua_driver_contract::validate_success_output(
+            "press_key",
+            result.structured_content.clone().unwrap(),
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["_meta"], metadata);
+        assert!(wire.get("action_record").is_none());
+        assert!(!wire.to_string().contains("untrusted_legacy_field"));
+        result.meta = None;
+        assert!(serde_json::to_value(&result)
+            .unwrap()
+            .get("_meta")
+            .is_none());
+    }
+
+    #[test]
     fn action_projection_keeps_browser_refusal_diagnostics_and_closes_structured_content() {
         let legacy = serde_json::json!({
             "status": "refused",
