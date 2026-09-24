@@ -343,12 +343,16 @@ impl Tool for TypeTextTool {
         // still exposing an exact-window, writable AXSelectedText. Retain that
         // same object before the background gate. Otherwise a multi-window app
         // is refused as ambiguous before its safe semantic rung is considered.
-        // Pixel requests and terminal/web surfaces keep their event-only path.
+        // Inactive native canvas editors may acknowledge AX writes without
+        // applying them, so an implicit target is admitted here only while its
+        // app is already active. Otherwise the existing guarded foreground
+        // fallback acquires the editor before its first atomic write.
         if element_guard.is_none()
             && !delivery_mode.is_foreground()
             && px.is_none()
             && py.is_none()
             && !crate::terminal::is_terminal_pid(pid)
+            && apps::frontmost_pid() == Some(pid)
         {
             if let Some(wid) = window_id {
                 element_guard = crate::foreground_activity::spawn_blocking(move || {
@@ -552,7 +556,7 @@ impl Tool for TypeTextTool {
                 ax_attempt,
             })) => return synthesis_refusal_result(path, &refusal, ax_attempt),
             Ok(Ok(TypeTextDelivery::AxUnverifiable)) => {
-                return unverifiable_ax_result(pid, window_id);
+                return unverifiable_ax_result(pid, window_id, delivery_mode.is_foreground());
             }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
             Ok(Err(error)) => Ok(Err(error)),
@@ -725,6 +729,7 @@ impl Tool for TypeTextTool {
 /// Which delivery path was taken. Surfaced as `structuredContent.path`
 /// on success.
 const PATH_AX: &str = "ax";
+const PATH_AX_FG: &str = "ax_fg";
 const PATH_KEY_EVENTS: &str = "key_events";
 const PATH_KEY_EVENTS_FG: &str = "key_events_fg";
 
@@ -971,11 +976,11 @@ fn retained_native_insert_target(
     }
 }
 
-fn unverifiable_ax_result(pid: i32, window_id: Option<u32>) -> ToolResult {
+fn unverifiable_ax_result(pid: i32, window_id: Option<u32>, foreground: bool) -> ToolResult {
     let mut structured = serde_json::json!({
         "code": "type_text_ax_unverifiable",
         "effect": "unverifiable",
-        "path": PATH_AX,
+        "path": if foreground { PATH_AX_FG } else { PATH_AX },
         "pid": pid,
         "atomic_ax_effect": "unverifiable",
         "synthesized_chars": 0,
@@ -1094,7 +1099,7 @@ fn synthesis_refusal_result(
 }
 
 fn path_has_untrusted_web_readback(path: &str) -> bool {
-    path == PATH_AX || path == PATH_KEY_EVENTS || path == PATH_KEY_EVENTS_FG
+    path == PATH_AX || path == PATH_AX_FG || path == PATH_KEY_EVENTS || path == PATH_KEY_EVENTS_FG
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1630,6 +1635,43 @@ fn type_text_blocking(
         let foreground_settle_ms = foreground_settle_ms(pid, apps::frontmost_pid());
         let do_type = || {
             super::with_prepared_foreground_focus(foreground_pixel_focus, || {
+                // Native text insertion remains preferable after activation.
+                // The former foreground rung skipped it entirely, exposing
+                // selected text to IME/keystroke handling in iWork editors.
+                if !is_terminal_target {
+                    if let Some((ptr, _)) = element_ptr_and_idx {
+                        crate::input::ax_actions::focus_element(ptr)?;
+                    }
+                    if let Some(wid) = window_id {
+                        if let Some(target) =
+                            retained_native_insert_target(pid, wid).filter(|target| {
+                                element_ptr_and_idx.is_none_or(|(ptr, _)| unsafe {
+                                    core_foundation::base::CFEqual(ptr as _, target.as_ptr() as _)
+                                        != 0
+                                })
+                            })
+                        {
+                            let element = target.as_ptr() as AXUIElementRef;
+                            let before = unsafe { copy_string_attr(element, "AXValue") };
+                            crate::foreground_activity::check_request()?;
+                            let error = unsafe { set_string_attr(element, "AXSelectedText", text) };
+                            let result = if error == kAXErrorSuccess {
+                                await_typed_delivery(
+                                    before.as_deref(),
+                                    text,
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_millis(250),
+                                    || unsafe { copy_string_attr(element, "AXValue") },
+                                )
+                            } else {
+                                (false, None)
+                            };
+                            // An unconfirmed atomic write is never followed by
+                            // replaying the payload through keyboard events.
+                            return Ok((result.0, result.1.filter(|n| *n > 0), true));
+                        }
+                    }
+                }
                 let focused_before = if foreground_pixel_focus.is_some() {
                     read_axvalue_bound(pid, element_ptr_and_idx, window_id)
                 } else {
@@ -1645,9 +1687,10 @@ fn type_text_blocking(
                     window_id,
                     event_route,
                 )
+                .map(|(verified, delivered)| (verified, delivered, false))
             })
         };
-        let ((verified, delivered_chars), fronted) = match window_id {
+        let ((verified, delivered_chars, atomic_ax), fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
                 // Screen Sharing forwards physical HID transitions to the
                 // guest. PID-routed Unicode events all carry keycode 0 (the A
@@ -1672,14 +1715,14 @@ fn type_text_blocking(
                         })
                     },
                 )?;
-                ((false, None), true)
+                ((false, None, false), true)
             }
             Some(wid) => {
                 // Exact-window activate → pointer-context move → type → restore.
                 // Keep the read-back tuple outside the closure because the
                 // shared foreground helper deliberately exposes only whether
                 // the guarded action itself succeeded.
-                let mut typed_delivery = (false, None);
+                let mut typed_delivery = (false, None, false);
                 let type_action = || {
                     typed_delivery = do_type()?;
                     Ok(())
@@ -1720,9 +1763,22 @@ fn type_text_blocking(
         };
         // Only claim the `_fg` path when an exact window was guarded; the
         // window-less fallback remains background keystrokes and must say so.
+        if atomic_ax && !verified && delivered_chars.is_none() {
+            return Ok(TypeTextDelivery::AxUnverifiable);
+        }
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-            detail: format!(" via foreground keystrokes ({delay_ms}ms delay)"),
-            path: if fronted { PATH_KEY_EVENTS_FG } else { path },
+            detail: if atomic_ax {
+                " via foreground native insertion".to_owned()
+            } else {
+                format!(" via foreground keystrokes ({delay_ms}ms delay)")
+            },
+            path: if atomic_ax {
+                PATH_AX_FG
+            } else if fronted {
+                PATH_KEY_EVENTS_FG
+            } else {
+                path
+            },
             delivered_chars,
             verified,
         }));
@@ -2406,7 +2462,7 @@ mod tests {
     #[test]
     fn background_text_unknown_ax_result_has_no_replay_claim() {
         for window_id in [None, Some(7)] {
-            let result = unverifiable_ax_result(42, window_id);
+            let result = unverifiable_ax_result(42, window_id, false);
             assert_eq!(result.is_error, Some(true));
             let structured = result.structured_content.expect("unverifiable AX result");
             assert_eq!(structured["code"], "type_text_ax_unverifiable");
@@ -2607,7 +2663,7 @@ mod tests {
 
     #[test]
     fn ax_backed_web_readbacks_are_downgraded() {
-        for path in [PATH_AX, PATH_KEY_EVENTS, PATH_KEY_EVENTS_FG] {
+        for path in [PATH_AX, PATH_AX_FG, PATH_KEY_EVENTS, PATH_KEY_EVENTS_FG] {
             assert_eq!(
                 surface_verification(path, true, true),
                 SurfaceVerification {
