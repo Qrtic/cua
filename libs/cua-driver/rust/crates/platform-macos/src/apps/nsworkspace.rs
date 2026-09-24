@@ -14,9 +14,9 @@
 //!   * `addsToRecentItems = false` (don't pollute the Apple menu)
 //!   * `createsNewApplicationInstance = …`
 //!   * `arguments = …` / `environment = …`
-//!   * `appleEvent = oapp(<bundleId>)` — synthetic `aevt/oapp` AppleEvent so
-//!     LaunchServices reliably triggers window creation on cold launch /
-//!     state-restored apps (see comments in Swift `AppLauncher.swift`).
+//!   * `appleEvent = oapp/rapp(<bundleId>)` — cold launch receives `oapp`;
+//!     an existing process receives `rapp`, the normal reopen event that lets
+//!     document applications restore a window when all documents are closed.
 //!
 //! The Cocoa completion handler is bridged to a synchronous return value via
 //! `tokio::sync::oneshot` + a 30s timeout. A wedged launch surfaces as an
@@ -45,6 +45,7 @@ const fn fourcc(s: &[u8; 4]) -> u32 {
 
 const K_CORE_EVENT_CLASS: u32 = fourcc(b"aevt"); // kCoreEventClass
 const K_AE_OPEN_APPLICATION: u32 = fourcc(b"oapp"); // kAEOpenApplication
+const K_AE_REOPEN_APPLICATION: u32 = fourcc(b"rapp"); // kAEReopenApplication
 const K_AUTO_GENERATE_RETURN_ID: i16 = -1; // kAutoGenerateReturnID
 const K_ANY_TRANSACTION_ID: i32 = 0; // kAnyTransactionID
 
@@ -63,9 +64,8 @@ pub struct OpenConfig {
     pub environment: std::collections::HashMap<String, String>,
     /// Force a fresh application instance even if one is already running.
     pub creates_new_instance: bool,
-    /// Attach a synthetic `aevt/oapp` AppleEvent addressed to this bundle id.
-    /// Set this whenever the bundle id is known — see Swift `AppLauncher`
-    /// comment for the reasoning (cold-launch window-creation reliability).
+    /// Attach a launch/reopen AppleEvent addressed to this bundle id. Omit
+    /// for document URLs so LaunchServices supplies the normal `odoc` event.
     pub apple_event_bundle_id: Option<String>,
 }
 
@@ -116,8 +116,8 @@ pub fn open_application(
 ) -> Result<Retained<NSRunningApplication>, LaunchError> {
     let ws = unsafe { NSWorkspace::sharedWorkspace() };
     let url = resolve_application_url(&ws, app_url)?;
-    let config = build_configuration(cfg);
     let reconciliation = Reconciliation::new(cfg);
+    let config = build_configuration(cfg, &reconciliation);
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<CompletionResult>(1);
     // NSWorkspace may invoke its completion on another thread; retain atomic
@@ -152,8 +152,8 @@ pub fn open_urls_with_application(
 ) -> Result<Retained<NSRunningApplication>, LaunchError> {
     let ws = unsafe { NSWorkspace::sharedWorkspace() };
     let url = resolve_application_url(&ws, app_url)?;
-    let config = build_configuration(cfg);
     let reconciliation = Reconciliation::new(cfg);
+    let config = build_configuration(cfg, &reconciliation);
 
     let ns_urls: Vec<Retained<NSURL>> = urls
         .iter()
@@ -190,7 +190,10 @@ pub fn open_urls_with_application(
 ///
 /// Always sets `activates = false` and `addsToRecentItems = false` to match
 /// Swift's background-launch invariant.
-fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguration> {
+fn build_configuration(
+    cfg: &OpenConfig,
+    reconciliation: &Reconciliation,
+) -> Retained<NSWorkspaceOpenConfiguration> {
     let config = unsafe { NSWorkspaceOpenConfiguration::configuration() };
     unsafe {
         config.setActivates(false);
@@ -230,12 +233,30 @@ fn build_configuration(cfg: &OpenConfig) -> Retained<NSWorkspaceOpenConfiguratio
 
         if let Some(bid) = &cfg.apple_event_bundle_id {
             if !bid.is_empty() {
-                let event = apple_event::open_application_event(bid);
+                let event = apple_event::application_event(
+                    bid,
+                    application_event_id(
+                        !reconciliation.pids_before_request.is_empty(),
+                        cfg.creates_new_instance,
+                    ),
+                );
                 config.setAppleEvent(Some(&event));
             }
         }
     }
     config
+}
+
+/// Reopening a running document app is a different operation from its initial
+/// launch. Re-sending `oapp` can leave Keynote/Numbers running with no windows.
+/// Decide once, before dispatch; never retry an uncertain launch with a second
+/// event that might create an extra document.
+fn application_event_id(already_running: bool, creates_new_instance: bool) -> u32 {
+    if already_running && !creates_new_instance {
+        K_AE_REOPEN_APPLICATION
+    } else {
+        K_AE_OPEN_APPLICATION
+    }
 }
 
 /// Resolve a caller-supplied app reference (bundle id, path, or URL
@@ -460,10 +481,21 @@ fn wait_for_launch_signal<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{reconciliation_pid, wait_for_launch_signal, LaunchError};
+    use super::{
+        application_event_id, reconciliation_pid, wait_for_launch_signal, LaunchError,
+        K_AE_OPEN_APPLICATION, K_AE_REOPEN_APPLICATION,
+    };
     use std::collections::HashSet;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn running_application_receives_reopen_without_restarting_it() {
+        assert_eq!(application_event_id(true, false), K_AE_REOPEN_APPLICATION);
+        assert_eq!(application_event_id(false, false), K_AE_OPEN_APPLICATION);
+        assert_eq!(application_event_id(true, true), K_AE_OPEN_APPLICATION);
+        assert_eq!(application_event_id(false, true), K_AE_OPEN_APPLICATION);
+    }
 
     #[test]
     fn missing_callback_reconciles_registered_process() {
@@ -535,15 +567,15 @@ mod tests {
 /// is not exposed by `objc2-foundation 0.2.2`.
 mod apple_event {
     use super::{
-        NSAppleEventDescriptor, NSString, Retained, K_AE_OPEN_APPLICATION, K_ANY_TRANSACTION_ID,
+        NSAppleEventDescriptor, NSString, Retained, K_ANY_TRANSACTION_ID,
         K_AUTO_GENERATE_RETURN_ID, K_CORE_EVENT_CLASS,
     };
     use objc2::msg_send_id;
     use objc2::rc::Allocated;
     use objc2::ClassType;
 
-    /// Build an `aevt/oapp` AppleEvent addressed to the bundle id `bid`.
-    pub fn open_application_event(bid: &str) -> Retained<NSAppleEventDescriptor> {
+    /// Build the selected launch/reopen AppleEvent addressed to `bid`.
+    pub fn application_event(bid: &str, event_id: u32) -> Retained<NSAppleEventDescriptor> {
         let target_string = NSString::from_str(bid);
         let target: Retained<NSAppleEventDescriptor> =
             unsafe { NSAppleEventDescriptor::descriptorWithBundleIdentifier(&target_string) };
@@ -554,7 +586,7 @@ mod apple_event {
             let event: Retained<NSAppleEventDescriptor> = msg_send_id![
                 alloc,
                 initWithEventClass: K_CORE_EVENT_CLASS,
-                eventID: K_AE_OPEN_APPLICATION,
+                eventID: event_id,
                 targetDescriptor: &*target,
                 returnID: K_AUTO_GENERATE_RETURN_ID,
                 transactionID: K_ANY_TRANSACTION_ID,

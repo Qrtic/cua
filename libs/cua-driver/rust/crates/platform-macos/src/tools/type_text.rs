@@ -1287,6 +1287,37 @@ fn read_axvalue_bound(
     }
 }
 
+/// Diagnostics deliberately exclude field contents. They distinguish a native
+/// insertion target from an app canvas or a renderer without recording user text.
+fn trace_focused_text_target(pid: i32, window_id: Option<u32>, phase: &'static str) {
+    unsafe {
+        let element = match window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => focused_element_of_pid(pid),
+        };
+        if let Some(element) = element {
+            let role = copy_string_attr(element, "AXRole");
+            let value_chars = copy_string_attr(element, "AXValue").map(|s| s.chars().count());
+            let selected_chars =
+                copy_string_attr(element, "AXSelectedText").map(|s| s.chars().count());
+            let selected_text_settable = is_attribute_settable(element, "AXSelectedText");
+            let enabled = copy_bool_attr(element, "AXEnabled");
+            tracing::debug!(
+                phase,
+                ?role,
+                ?value_chars,
+                ?selected_chars,
+                selected_text_settable,
+                ?enabled,
+                "literal text target witness"
+            );
+            CFRelease(element as _);
+        } else {
+            tracing::debug!(phase, "literal text target has no exact focused element");
+        }
+    }
+}
+
 /// True when the addressed (or focused) AX element sits inside a web-content
 /// subtree — an `AXWebArea` ancestor. That covers every Chromium / WebKit /
 /// Electron rendered surface (Chrome, Safari, Slack, VS Code, X's compose box…),
@@ -1399,6 +1430,7 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
+    trace_focused_text_target(pid, window_id, "before_synthesis");
     dispatch_text_events(event_route, pid, text, delay_ms)?;
 
     // CGEvent posting is asynchronous with respect to the renderer. In
@@ -1683,6 +1715,7 @@ fn type_text_blocking(
     // Without an explicit element, a window-addressed request may only write
     // to the focused element when it provably belongs to the exact target
     // window — a sibling window's focused field is not the requested target.
+    trace_focused_text_target(pid, window_id, "before_atomic_insert");
     let ax_target: Option<(AXUIElementRef, bool, Option<usize>)> = match element_ptr_and_idx {
         Some((ptr, idx)) => Some((ptr as AXUIElementRef, /*owns=*/ false, idx)),
         None => match window_id {
