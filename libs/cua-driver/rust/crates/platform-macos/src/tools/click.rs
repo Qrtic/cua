@@ -70,12 +70,55 @@ struct SelectionPixelTarget {
     window_y: f64,
 }
 
-/// Choose one actuator before the exact-target gate. A pointer-selected text
-/// input must never enter the generic AX click/fallback implementation.
+/// Choose one actuator before the exact-target gate. Pointer-selected controls
+/// must never enter the generic AX click/fallback implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ElementClickRoute {
     AxSemantic,
     TextInputPointer,
+    QtCheckablePointer,
+}
+
+impl ElementClickRoute {
+    fn uses_pointer(self) -> bool {
+        matches!(self, Self::TextInputPointer | Self::QtCheckablePointer)
+    }
+}
+
+/// Qt's Cocoa bridge maps AXPress on a checkable button to toggleAction(),
+/// even when that same button advertises a separate pressAction(). Toggling
+/// emits no clicked signal, so checkable navigation/tool buttons do not run
+/// their activation handler. Require Qt's observed identifier and both press
+/// entries; ordinary AppKit checkboxes retain semantic delivery.
+fn qt_checkable_press_is_toggle(role: &str, identifier: &str, actions: &[String]) -> bool {
+    role == "AXCheckBox"
+        && identifier.starts_with("QApplication.")
+        && actions.iter().filter(|action| *action == "AXPress").count() == 2
+}
+
+fn primary_element_click_route(
+    role: &str,
+    identifier: &str,
+    actions: &[String],
+    selectable_ancestry: bool,
+    auxiliary_surface: bool,
+) -> ElementClickRoute {
+    if !selectable_ancestry
+        && !auxiliary_surface
+        && qt_checkable_press_is_toggle(role, identifier, actions)
+    {
+        ElementClickRoute::QtCheckablePointer
+    } else {
+        element_click_route(
+            "press",
+            "left",
+            false,
+            role,
+            actions,
+            selectable_ancestry,
+            auxiliary_surface,
+        )
+    }
 }
 
 fn element_click_route(
@@ -102,7 +145,7 @@ fn element_click_route(
 }
 
 /// The host-attached classifier deliberately excludes directly addressed
-/// popover windows. Neither case is part of the text-input pointer route.
+/// popover windows. Neither case is part of an element pointer route.
 fn text_input_pointer_has_auxiliary_window(element_ptr: usize) -> bool {
     unsafe {
         let Some(window) = copy_element_attr(element_ptr as AXUIElementRef, "AXWindow") else {
@@ -614,9 +657,9 @@ impl Tool for ClickTool {
             }
 
             // Right-click is still the semantic AXShowMenu request. Only a
-            // plain primary click on a non-selectable text input without
-            // AXPress chooses pointer delivery; AXConfirm/AXShowMenu are not
-            // substitutes for a click, and a failed AX attempt is not retried.
+            // plain primary click chooses a pointer route for a non-selectable
+            // text input without AXPress or a proven Qt checkable button whose
+            // AXPress means toggle. A failed AX attempt is never retried.
             let effective_action = if button_str == "right" && action == "press" {
                 "show_menu".to_string()
             } else {
@@ -648,26 +691,28 @@ impl Tool for ClickTool {
                         && !menu
                         && crate::ax::attached_popover::has_displaced_popover_window(element, wid);
                     let pointer_candidate = primary_press
-                        && matches!(role.as_str(), "AXTextField" | "AXTextArea")
+                        && matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXCheckBox")
                         && !menu
                         && !popover;
                     // Preserve the old collection-selection lookup condition.
-                    // Additional ancestry queries are only for text-pointer
+                    // Additional ancestry queries are only for pointer
                     // candidates, not confirm/show-menu or middle-click calls.
                     let selectable = ((selection_action && !menu && !popover) || pointer_candidate)
                         && crate::input::ax_actions::nearest_container_selection_state(element_ptr)
                             .is_some();
                     let route = if pointer_candidate && !selectable {
                         let actions = copy_action_names(element);
-                        let auxiliary = !actions.iter().any(|action| action == "AXPress")
-                            && (text_input_pointer_has_auxiliary_window(element_ptr)
-                                || (foreground
-                                    && crate::ax::attached_popover::has_displaced_popover_window(
-                                        element, wid,
-                                    )));
-                        element_click_route(
-                            "press", "left", false, &role, &actions, false, auxiliary,
-                        )
+                        let identifier = if role == "AXCheckBox" {
+                            copy_string_attr(element, "AXIdentifier").unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let auxiliary = text_input_pointer_has_auxiliary_window(element_ptr)
+                            || (foreground
+                                && crate::ax::attached_popover::has_displaced_popover_window(
+                                    element, wid,
+                                ));
+                        primary_element_click_route(&role, &identifier, &actions, false, auxiliary)
                     } else {
                         ElementClickRoute::AxSemantic
                     };
@@ -684,14 +729,12 @@ impl Tool for ClickTool {
                 };
 
             // ── Exact-target background gate (macOS background input v1) ──
-            // Text-input pointer delivery and button=middle both require the
+            // Element pointer delivery and button=middle both require the
             // stricter WindowPointer rung with the retained element proof. Gate
             // BEFORE any cursor/dispatch work so a stale or sibling-owned
             // target refuses instead of acting on the wrong window.
             let _mutation_lease = if !delivery_mode.is_foreground() {
-                let gate_action = if button_str == "middle"
-                    || element_route == ElementClickRoute::TextInputPointer
-                {
+                let gate_action = if button_str == "middle" || element_route.uses_pointer() {
                     cua_driver_core::background_input::BackgroundAction::WindowPointer
                 } else if background_menu {
                     cua_driver_core::background_input::BackgroundAction::ApplicationMenuSemantic
@@ -861,10 +904,7 @@ impl Tool for ClickTool {
                 selection_pixel = None;
             }
 
-            if background_menu
-                || background_popover
-                || element_route == ElementClickRoute::TextInputPointer
-            {
+            if background_menu || background_popover || element_route.uses_pointer() {
                 // Cursor feedback may have yielded while a dialog opened.
                 // Keep the original modal/helper guards immediately before
                 // the separate semantic menu dispatch as well.
@@ -924,8 +964,8 @@ impl Tool for ClickTool {
                                 element_ptr as AXUIElementRef,
                             )?;
                         }
-                        if element_route == ElementClickRoute::TextInputPointer {
-                            perform_text_input_pointer_click(
+                        if element_route.uses_pointer() {
+                            perform_element_pointer_click(
                                 element_ptr,
                                 idx,
                                 pid,
@@ -933,6 +973,7 @@ impl Tool for ClickTool {
                                 count,
                                 foreground,
                                 ax_app_context_route,
+                                element_route,
                             )
                         } else if foreground {
                             let mut outcome = None;
@@ -1079,7 +1120,7 @@ impl Tool for ClickTool {
                         super::background_refusal_result(pid, wid, &refusal.0)
                     } else if let Some(refusal) = e.downcast_ref::<ElementPointerRefusal>() {
                         refusal.result(pid, wid)
-                    } else if element_route == ElementClickRoute::TextInputPointer {
+                    } else if element_route.uses_pointer() {
                         ToolResult::error(format!("Element pointer click failed: {e}"))
                     } else {
                         ToolResult::error(format!("AX action failed: {e}"))
@@ -1252,14 +1293,21 @@ impl Tool for ClickTool {
                     let role = copy_string_attr(element, "AXRole").unwrap_or_default();
                     let enabled = copy_bool_attr(element, "AXEnabled");
                     let advertised_actions = copy_action_names(element);
+                    let identifier = if role == "AXCheckBox" {
+                        copy_string_attr(element, "AXIdentifier").unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
-                    } else if !background_pixel_ax_press_eligible(
-                        press_only,
-                        &role,
-                        &advertised_actions,
-                        enabled,
-                    ) {
+                    } else if qt_checkable_press_is_toggle(&role, &identifier, &advertised_actions)
+                        || !background_pixel_ax_press_eligible(
+                            press_only,
+                            &role,
+                            &advertised_actions,
+                            enabled,
+                        )
+                    {
                         false
                     } else {
                         if let Err(error) = crate::foreground_activity::check_request() {
@@ -1581,7 +1629,7 @@ impl std::fmt::Display for ElementPointerRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Frame(error) => {
-                write!(formatter, "text-input pointer frame unavailable: {error:?}")
+                write!(formatter, "element pointer frame unavailable: {error:?}")
             }
             Self::Target(reason) => formatter.write_str(reason),
         }
@@ -1592,13 +1640,14 @@ impl std::error::Error for ElementPointerRefusal {}
 /// Re-read the retained element and its exact window, not a cached coordinate
 /// or hit-test substitute. The selected route may become unavailable but may
 /// not change actuators after selection, focus preparation, or dispatch.
-fn live_text_input_pointer_target(
+fn live_element_pointer_target(
     element_ptr: usize,
     pid: i32,
     window_id: u32,
     frame: &super::px_frame::WindowPxFrame,
     foreground: bool,
     delegation: Option<&crate::ax::app_context::AppContextDelegationRoute>,
+    expected_route: ElementClickRoute,
 ) -> anyhow::Result<SelectionPixelTarget> {
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundAction, BackgroundInputDecision, ElementAncestry,
@@ -1609,26 +1658,30 @@ fn live_text_input_pointer_target(
     unsafe { super::ensure_app_context_element_window(delegation, element)? };
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let advertised = unsafe { copy_action_names(element) };
+    let identifier = if role == "AXCheckBox" {
+        unsafe { copy_string_attr(element, "AXIdentifier") }.unwrap_or_default()
+    } else {
+        String::new()
+    };
     let selectable =
         crate::input::ax_actions::nearest_container_selection_state(element_ptr).is_some();
-    if element_click_route(
-        "press",
-        "left",
-        false,
-        &role,
-        &advertised,
-        selectable,
-        text_input_pointer_has_auxiliary_window(element_ptr),
-    ) != ElementClickRoute::TextInputPointer
+    if !expected_route.uses_pointer()
+        || primary_element_click_route(
+            &role,
+            &identifier,
+            &advertised,
+            selectable,
+            text_input_pointer_has_auxiliary_window(element_ptr),
+        ) != expected_route
     {
         return Err(ElementPointerRefusal::Target(
-            "the retained element no longer qualifies for the selected text-input route",
+            "the retained element no longer qualifies for the selected pointer route",
         )
         .into());
     }
     if unsafe { copy_bool_attr(element, "AXEnabled") } != Some(true) {
         return Err(ElementPointerRefusal::Target(
-            "the text input is disabled or its enabled state is unproven",
+            "the control is disabled or its enabled state is unproven",
         )
         .into());
     }
@@ -1666,7 +1719,7 @@ fn live_text_input_pointer_target(
 /// Dispatch exactly one requested pointer gesture. This helper is reached only
 /// after route selection and runs inside the shared focus-suppression lifetime.
 /// Neither a preparation failure nor a native dispatch failure reaches AXPress.
-fn perform_text_input_pointer_click(
+fn perform_element_pointer_click(
     element_ptr: usize,
     idx: usize,
     pid: i32,
@@ -1674,18 +1727,20 @@ fn perform_text_input_pointer_click(
     count: usize,
     foreground: bool,
     delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
+    selected_route: ElementClickRoute,
 ) -> anyhow::Result<((String, bool, bool, bool, bool), bool)> {
     let frame = super::px_frame::resolve_window_px_frame(window_id)
         .map_err(ElementPointerRefusal::Frame)?;
     // Refuse invalid/disabled targets before even preparing synthetic focus or
     // using the caller-authorized foreground activation helper.
-    live_text_input_pointer_target(
+    live_element_pointer_target(
         element_ptr,
         pid,
         window_id,
         &frame,
         foreground,
         delegation.as_ref(),
+        selected_route,
     )?;
     if foreground {
         crate::input::skylight::with_foreground_hid_activation_delegated(
@@ -1693,13 +1748,14 @@ fn perform_text_input_pointer_click(
             window_id,
             delegation.clone(),
             || {
-                let target = live_text_input_pointer_target(
+                let target = live_element_pointer_target(
                     element_ptr,
                     pid,
                     window_id,
                     &frame,
                     true,
                     delegation.as_ref(),
+                    selected_route,
                 )?;
                 crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                     target.screen_x,
@@ -1714,13 +1770,14 @@ fn perform_text_input_pointer_click(
         let focus_context = crate::input::mouse::prepare_background_pixel_click(pid, window_id)?;
         // Preparation may yield to the target application. Re-prove the exact
         // retained ancestry, enabled state, and frame immediately before input.
-        let target = live_text_input_pointer_target(
+        let target = live_element_pointer_target(
             element_ptr,
             pid,
             window_id,
             &frame,
             false,
             delegation.as_ref(),
+            selected_route,
         )?;
         crate::input::mouse::click_at_xy_with_window_local(
             pid,
@@ -1738,10 +1795,10 @@ fn perform_text_input_pointer_click(
     Ok((
         (
             format!(
-                "Posted primary pointer click (count {count}) to text input [{idx}] in window \
+                "Posted primary pointer click (count {count}) to control [{idx}] in window \
                  {window_id}; not driver-verified — confirm via a fresh state snapshot."
             ),
-            true,
+            selected_route == ElementClickRoute::TextInputPointer,
             false,
             false,
             true,
@@ -2206,6 +2263,67 @@ mod tests {
                     ElementClickRoute::TextInputPointer,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn qt_checkable_activation_uses_pointer_instead_of_toggle() {
+        let actions = [
+            "AXPress".to_owned(),
+            "AXPress".to_owned(),
+            "AXRaise".to_owned(),
+        ];
+        let identifier = "QApplication.MainWindow.TabBar.environments";
+        assert!(qt_checkable_press_is_toggle(
+            "AXCheckBox",
+            identifier,
+            &actions
+        ));
+        let route = primary_element_click_route("AXCheckBox", identifier, &actions, false, false);
+        assert_eq!(route, ElementClickRoute::QtCheckablePointer);
+        assert!(route.uses_pointer());
+    }
+
+    #[test]
+    fn ordinary_and_unproven_checkboxes_preserve_semantic_delivery() {
+        let duplicate = ["AXPress".to_owned(), "AXPress".to_owned()];
+        for (role, identifier, actions) in [
+            ("AXCheckBox", "native-checkbox", duplicate.as_slice()),
+            ("AXCheckBox", "", duplicate.as_slice()),
+            ("AXCheckBox", "QApplication", duplicate.as_slice()),
+            (
+                "AXButton",
+                "QApplication.MainWindow.button",
+                duplicate.as_slice(),
+            ),
+            ("AXCheckBox", "QApplication.MainWindow.check", &[]),
+            (
+                "AXCheckBox",
+                "QApplication.MainWindow.check",
+                &duplicate[..1],
+            ),
+        ] {
+            assert!(!qt_checkable_press_is_toggle(role, identifier, actions));
+            assert_eq!(
+                primary_element_click_route(role, identifier, actions, false, false),
+                ElementClickRoute::AxSemantic,
+            );
+        }
+    }
+
+    #[test]
+    fn qt_checkable_does_not_gain_pointer_authority_on_auxiliary_or_selection_surfaces() {
+        let actions = ["AXPress".to_owned(), "AXPress".to_owned()];
+        for (selectable, auxiliary) in [(true, false), (false, true), (true, true)] {
+            let route = primary_element_click_route(
+                "AXCheckBox",
+                "QApplication.MainWindow.check",
+                &actions,
+                selectable,
+                auxiliary,
+            );
+            assert_eq!(route, ElementClickRoute::AxSemantic);
+            assert!(!route.uses_pointer());
         }
     }
 
