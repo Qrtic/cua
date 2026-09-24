@@ -185,23 +185,29 @@ where
         };
     }
 
-    // Matched: walk the requested window plus the non-window top-level children.
+    // Matched: walk the requested window plus the established native menu and
+    // sheet projections. Other application children do not belong to this
+    // window: Finder, for example, publishes Desktop icons as top-level
+    // AXImages. Inheriting every non-AXWindow role gave those icons indices
+    // and bounds relative to an unrelated document window.
     //
     // The menu bar is deliberately among them. MACOS.md documents a
     // two-snapshot menu flow whose first step reads `AXMenuBarItem` rows
     // straight out of this window-scoped tree, and `get_window_state` is the
     // only tool that returns a subtree — dropping AXMenuBar here would remove
-    // menu navigation with no replacement path. Keeping other non-window
-    // children is also what `browser/consent_ui.rs` relies on to reach a
-    // top-level `AXSheet` consent prompt.
+    // menu navigation with no replacement path. AXMenu keeps an already-open
+    // context menu observable. The existing AXSheet projection is also what
+    // `browser/consent_ui.rs` relies on to reach a top-level consent prompt;
+    // this compatibility does not establish a general parent-window binding.
     let walk = if include_inherited_top_level {
         let dialog_scope = matched.iter().any(|&i| candidates[i].is_dialog_like());
         candidates
             .iter()
             .enumerate()
             .filter(|(i, c)| {
-                (c.role != "AXWindow" || matched.contains(i))
-                    && !(dialog_scope && c.role == "AXMenuBar")
+                matched.contains(i)
+                    || matches!(c.role.as_str(), "AXMenu" | "AXSheet")
+                    || (c.role == "AXMenuBar" && !dialog_scope)
             })
             .map(|(i, _)| i)
             .collect()
@@ -242,6 +248,51 @@ mod tests {
         let d = decide_window_scope(&candidates, 22, never_called);
         assert_eq!(d.scope, WindowScope::Matched);
         assert_eq!(d.walk, vec![0, 2], "menu bar + requested window only");
+    }
+
+    #[test]
+    fn matched_finder_window_excludes_desktop_icons_and_unrelated_root_groups() {
+        let candidates = [
+            TopLevelCandidate::new("AXWindow", Some(11)),
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXImage", None).with_identifier("desktop-folder"),
+            TopLevelCandidate::new("AXGroup", None),
+            TopLevelCandidate::new("AXList", None),
+            TopLevelCandidate::new("AXWindow", Some(22)),
+        ];
+        let d = decide_window_scope(&candidates, 11, never_called);
+        assert_eq!(d.scope, WindowScope::Matched);
+        assert_eq!(
+            d.walk,
+            vec![0, 1],
+            "Desktop objects are not document-window controls"
+        );
+    }
+
+    #[test]
+    fn matched_window_retains_context_menu_and_existing_sheet_projection() {
+        let candidates = [
+            TopLevelCandidate::new("AXImage", None),
+            TopLevelCandidate::new("AXWindow", Some(11)),
+            TopLevelCandidate::new("AXMenu", None),
+            TopLevelCandidate::new("AXSheet", None),
+            TopLevelCandidate::new("AXGroup", None),
+        ];
+        let d = decide_window_scope(&candidates, 11, never_called);
+        assert_eq!(d.walk, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn matched_dialog_does_not_inherit_unrelated_app_level_content() {
+        let candidates = [
+            TopLevelCandidate::new("AXMenuBar", None),
+            TopLevelCandidate::new("AXImage", None),
+            TopLevelCandidate::new("AXWindow", Some(11)).with_subrole("AXDialog"),
+            TopLevelCandidate::new("AXGroup", None),
+            TopLevelCandidate::new("AXMenu", None),
+        ];
+        let d = decide_window_scope(&candidates, 11, never_called);
+        assert_eq!(d.walk, vec![2, 4]);
     }
 
     #[test]

@@ -291,7 +291,7 @@ fn walk_tree_bounded_with_projection(
             }
         }
 
-        // Scope: keep non-window children (menu bar) + the target window —
+        // Scope: keep permitted native menu/sheet projections + the target window —
         // but ONLY once the target window has actually been identified. When
         // nothing claims the requested id, `decide_window_scope` reports why
         // and walks nothing; it must never fall back to "everything that isn't
