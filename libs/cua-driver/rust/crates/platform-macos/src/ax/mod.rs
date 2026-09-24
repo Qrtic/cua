@@ -28,6 +28,7 @@ pub mod exact_target;
 pub mod tree;
 pub(crate) mod window_classification;
 pub mod window_scope;
+pub(crate) mod window_tabs;
 
 pub use cache::ElementCache;
 pub use tree::{

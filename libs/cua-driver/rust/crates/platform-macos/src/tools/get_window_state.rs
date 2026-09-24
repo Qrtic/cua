@@ -1730,6 +1730,13 @@ impl Tool for GetWindowStateTool {
         // before acting. Every action still revalidates — this is advisory,
         // not a promise. Old consumers ignore the extra field.
         if plan.include_elements && transient_target.is_none() {
+            if matches!(degradation, Degradation::AxWindowUnresolved { .. }) {
+                if let Ok(Some(hint)) = crate::foreground_activity::spawn_blocking(move || {
+                    crate::ax::window_tabs::find_hint(pid, window_id)
+                }).await {
+                    structured["window_tab_hint"] = serde_json::json!(hint);
+                }
+            }
             let capture_available = screenshot_dims.is_some();
             let report = crate::foreground_activity::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
