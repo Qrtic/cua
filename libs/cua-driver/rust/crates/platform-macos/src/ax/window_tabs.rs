@@ -160,7 +160,9 @@ pub(crate) fn find_hint(pid: i32, target_id: u32) -> Option<WindowTabHint> {
                         continue;
                     }
                     if let Some(label) = copy_string_attr(tab.0, "AXTitle") {
-                        let selected = copy_number_attr(tab.0, "AXValue") == Some(1.0)
+                        // AppKit native radio tabs expose CFBoolean here;
+                        // numeric-only reads discard the selected host tab.
+                        let selected = copy_bool_attr(tab.0, "AXValue") == Some(true)
                             || copy_bool_attr(tab.0, "AXSelected") == Some(true);
                         tabs.push((label, selected));
                     }
