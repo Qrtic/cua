@@ -429,6 +429,53 @@ pub(crate) fn dialog_returned_to_host(pid: i32, sheet_id: u32, host_id: u32) -> 
     }
 }
 
+// Some document apps replace an untitled workspace when Save completes. This
+// proves only that the old dialog has ended. The replacement never inherits
+// its input capability; the caller must close the segment and observe anew.
+fn prove_replaced_dialog_host<T: SheetTree>(
+    tree: &T,
+    snapshot: &crate::windows::WindowEnumeration,
+    pid: i32,
+    panel_id: u32,
+    old_host_id: u32,
+) -> Option<u32> {
+    let focused = tree.focused()?;
+    let destination = tree.window_id(&focused)?;
+    if destination == old_host_id
+        || !dialog_windows_allow_host_return(snapshot, pid, panel_id, destination)
+        // Hidden, off-space and reused old hosts are not closed hosts.
+        || snapshot.windows.iter().any(|w| w.window_id == old_host_id)
+        || tree.owner(&focused) != Some(pid)
+        || tree.role(&focused).as_deref() != Some("AXWindow")
+        || tree.minimized(&focused) != Ok(false)
+        || !tree.within_budget()
+    {
+        return None;
+    }
+    let windows = tree.windows()?;
+    if windows.iter().filter(|w| tree.same(w, &focused)).count() != 1
+        || windows
+            .iter()
+            .any(|w| tree.window_id(w) == Some(old_host_id))
+        || !tree.same(&tree.focused()?, &focused)
+        || !tree.within_budget()
+    {
+        return None;
+    }
+    Some(destination)
+}
+
+pub(crate) fn replaced_dialog_host(pid: i32, panel_id: u32, old_host_id: u32) -> Option<u32> {
+    let snapshot = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+    unsafe {
+        let tree = NativeTree {
+            app: Node::owned(AXUIElementCreateApplication(pid))?,
+            deadline: Instant::now() + Duration::from_millis(500),
+        };
+        prove_replaced_dialog_host(&tree, &snapshot, pid, panel_id, old_host_id)
+    }
+}
+
 /// Prove the unsupported AXMinimized case for one already retained sheet.
 /// The host supplies visibility evidence only; input remains bound to the
 /// sheet's own CGWindowID. Discovery alone never supplies this extra proof.
@@ -646,6 +693,78 @@ mod tests {
         snapshot.windows[0].is_on_screen = false;
         assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 700));
         assert!(!dialog_windows_allow_host_return(&snapshot, 42, 900, 900));
+    }
+
+    #[test]
+    fn replacement_after_save_requires_closed_old_host_and_stable_visible_document() {
+        use crate::windows::{WindowBounds, WindowEnumeration, WindowInfo};
+        let window = |id, pid, visible| WindowInfo {
+            window_id: id,
+            pid,
+            app_name: String::new(),
+            title: String::new(),
+            bounds: WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            layer: 0,
+            z_index: 0,
+            is_on_screen: visible,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        };
+        let make_tree = || {
+            let mut tree = pages();
+            tree.host.window = 800;
+            tree.sheet = tree.host.clone();
+            tree.sheet_minimized = Ok(false);
+            tree
+        };
+        let mut snapshot = WindowEnumeration {
+            windows: vec![window(800, 42, true)],
+            current_space_id: None,
+            succeeded: true,
+        };
+        assert_eq!(
+            prove_replaced_dialog_host(&make_tree(), &snapshot, 42, 900, 700),
+            Some(800)
+        );
+        for old in [
+            window(700, 42, true),
+            window(700, 42, false),
+            window(700, 99, false),
+            window(900, 42, true),
+            window(900, 99, false),
+        ] {
+            snapshot.windows.push(old);
+            assert!(prove_replaced_dialog_host(&make_tree(), &snapshot, 42, 900, 700).is_none());
+            snapshot.windows.pop();
+        }
+        snapshot.succeeded = false;
+        assert!(prove_replaced_dialog_host(&make_tree(), &snapshot, 42, 900, 700).is_none());
+        snapshot.succeeded = true;
+        for alter in [
+            |t: &mut Tree| t.sheet.role = "AXSheet",
+            |t: &mut Tree| t.sheet.owner = 99,
+            |t: &mut Tree| t.sheet_minimized = Ok(true),
+            |t: &mut Tree| t.sheet_minimized = Err(kAXErrorAttributeUnsupported),
+            |t: &mut Tree| t.host_listed = false,
+            |t: &mut Tree| t.focus_changed = true,
+            |t: &mut Tree| t.budget.set(0),
+            |t: &mut Tree| t.host.window = 700,
+        ] {
+            let mut tree = make_tree();
+            alter(&mut tree);
+            assert!(prove_replaced_dialog_host(&tree, &snapshot, 42, 900, 700).is_none());
+        }
+        snapshot.windows[0].pid = 99;
+        assert!(prove_replaced_dialog_host(&make_tree(), &snapshot, 42, 900, 700).is_none());
+        snapshot.windows[0].pid = 42;
+        snapshot.windows[0].is_on_screen = false;
+        assert!(prove_replaced_dialog_host(&make_tree(), &snapshot, 42, 900, 700).is_none());
     }
 
     #[test]

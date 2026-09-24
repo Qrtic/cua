@@ -22,6 +22,7 @@ struct Inner {
     restoring: bool,
     activated: bool,
     dialog_closed: bool,
+    dialog_closed_destination: Option<ExactWindowTarget>,
     dialog_target: Option<crate::ax::attached_sheet::DialogAttachment>,
     dialog_observation_required: bool,
     cleanup_unknown: bool,
@@ -211,7 +212,12 @@ impl NativeSegment {
     }
 
     fn accept_dialog_return(&self) -> bool {
-        let Some(host) = self.dialog_host else {
+        let destination = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dialog_closed_destination;
+        let Some(host) = destination.or(self.dialog_host) else {
             return false;
         };
         if !self
@@ -228,10 +234,9 @@ impl NativeSegment {
         {
             return false;
         }
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .dialog_closed = true;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.dialog_closed = true;
+        inner.dialog_closed_destination = Some(host);
         true
     }
 
@@ -513,6 +518,33 @@ impl Call {
                 if exact_front(self.segment.current_target()) || self.segment.accept_dialog_return()
                 {
                     return true;
+                }
+                if let (Some(host), Some(panel)) =
+                    (self.segment.dialog_host, self.segment.dialog_panel)
+                {
+                    if let Some(window_id) = crate::ax::attached_sheet::replaced_dialog_host(
+                        self.target.pid,
+                        panel,
+                        host.window_id,
+                    ) {
+                        let destination = ExactWindowTarget {
+                            pid: self.target.pid,
+                            window_id,
+                        };
+                        if exact_front(destination) {
+                            let mut inner =
+                                self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
+                            if inner
+                                .policy
+                                .check(&self.segment.binding, clock_ms(), snapshot())
+                                .is_ok()
+                            {
+                                inner.dialog_closed = true;
+                                inner.dialog_closed_destination = Some(destination);
+                                return true;
+                            }
+                        }
+                    }
                 }
                 let before = self
                     .segment
@@ -951,6 +983,7 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
             restoring: false,
             activated: false,
             dialog_closed: false,
+            dialog_closed_destination: None,
             dialog_target: attachment,
             dialog_observation_required: false,
             cleanup_unknown: false,
@@ -1410,6 +1443,7 @@ mod tests {
                 restoring: false,
                 activated: false,
                 dialog_closed: false,
+                dialog_closed_destination: None,
                 dialog_target: None,
                 dialog_observation_required: false,
                 cleanup_unknown: false,
@@ -1493,6 +1527,15 @@ mod tests {
             .is_ok());
         let ticket = call(&segment);
         segment.inner.lock().unwrap().dialog_closed = true;
+        segment.inner.lock().unwrap().dialog_closed_destination = Some(ExactWindowTarget {
+            pid: 42,
+            window_id: 100,
+        });
+        assert_eq!(
+            segment.current_target().window_id,
+            71,
+            "replacement never inherits input"
+        );
         for tool in [
             "prepare_dialog",
             "get_window_state",
