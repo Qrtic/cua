@@ -1073,7 +1073,9 @@ impl Tool for ClickTool {
                     ToolResult::text(msg).with_structured(structured)
                 }
                 Ok(Err(e)) => {
-                    if let Some(refusal) = e.downcast_ref::<ApplicationMenuRefusal>() {
+                    if let Some(unconfirmed) = e.downcast_ref::<AxActionResponseUnconfirmed>() {
+                        unconfirmed.result()
+                    } else if let Some(refusal) = e.downcast_ref::<ApplicationMenuRefusal>() {
                         super::background_refusal_result(pid, wid, &refusal.0)
                     } else if let Some(refusal) = e.downcast_ref::<ElementPointerRefusal>() {
                         refusal.result(pid, wid)
@@ -1759,6 +1761,38 @@ impl std::fmt::Display for ApplicationMenuRefusal {
 }
 impl std::error::Error for ApplicationMenuRefusal {}
 
+/// AppKit can finish the requested action after AX's response timeout. Neither
+/// success nor a no-effect refusal is justified, and a second actuator is unsafe.
+#[derive(Debug)]
+struct AxActionResponseUnconfirmed;
+
+impl std::fmt::Display for AxActionResponseUnconfirmed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "The application did not complete its AX action response; an effect is possible",
+        )
+    }
+}
+impl std::error::Error for AxActionResponseUnconfirmed {}
+
+impl AxActionResponseUnconfirmed {
+    fn result(&self) -> ToolResult {
+        ToolResult::error(
+            "The application did not complete its AX action response. The requested action may already have occurred. Observe the requested outcome once; do not replay or send fallback input automatically.",
+        ).with_structured(serde_json::json!({
+            "code": "ax_action_response_unconfirmed", "effect": "unverifiable",
+            "verified": false, "retryable": false,
+        }))
+    }
+}
+
+fn check_ax_action_response(error: crate::ax::bindings::AXError) -> anyhow::Result<()> {
+    if error == crate::ax::bindings::kAXErrorCannotComplete {
+        return Err(AxActionResponseUnconfirmed.into());
+    }
+    Ok(())
+}
+
 /// The menu route deliberately cannot reach perform_ax_click's selection,
 /// pointer or ancestor-action fallbacks. Its single actuator is the requested
 /// advertised AX action, checked against fresh app-local context after any
@@ -1792,6 +1826,7 @@ fn perform_application_menu_click(
     crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
     crate::foreground_activity::check_request()?;
     let error = unsafe { crate::ax::bindings::perform_action(element, native) };
+    check_ax_action_response(error)?;
     if error != kAXErrorSuccess {
         anyhow::bail!(
             "AXUIElementPerformAction({native}) returned {error}; no fallback was attempted"
@@ -1832,6 +1867,7 @@ fn perform_attached_popover_click(
     crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
     crate::foreground_activity::check_request()?;
     let error = unsafe { crate::ax::bindings::perform_action(element, native) };
+    check_ax_action_response(error)?;
     if error != kAXErrorSuccess {
         anyhow::bail!(
             "AXUIElementPerformAction({native}) returned {error}; no fallback was attempted"
@@ -1991,10 +2027,10 @@ fn perform_ax_click(
 
     crate::foreground_activity::check_request()?;
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
+    check_ax_action_response(err)?;
     if err != crate::ax::bindings::kAXErrorSuccess {
-        // Some collection rows claim a click-like action but Finder returns
-        // kAXErrorCannotComplete. Use the same verified selection fallback
-        // before surfacing the dispatch error.
+        // Preserve the existing selection path for other dispatch errors, but
+        // never run another actuator after an indeterminate AX response.
         if ax_action == "AXPress" && modifiers.is_empty() {
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
@@ -2137,6 +2173,26 @@ fn map_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ax_response_timeout_is_possible_effect_not_a_retryable_refusal() {
+        let error =
+            check_ax_action_response(crate::ax::bindings::kAXErrorCannotComplete).unwrap_err();
+        let result = error
+            .downcast_ref::<AxActionResponseUnconfirmed>()
+            .unwrap()
+            .result();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap(),
+            serde_json::json!({
+                "code": "ax_action_response_unconfirmed", "effect": "unverifiable",
+                "verified": false, "retryable": false,
+            })
+        );
+        assert!(check_ax_action_response(kAXErrorSuccess).is_ok());
+        assert!(check_ax_action_response(crate::ax::bindings::kAXErrorActionUnsupported).is_ok());
+    }
 
     #[test]
     fn unadvertised_text_input_primary_click_selects_pointer_before_dispatch() {

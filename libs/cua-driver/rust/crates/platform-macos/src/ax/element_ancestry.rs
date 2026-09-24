@@ -95,13 +95,15 @@ impl Ancestry for Native {
 }
 
 /// # Safety
-/// `element` is a live retained AX reference for the duration of the call.
+/// `element` is a live retained AX reference with its caller's bounded messaging
+/// timeout for the duration of the call.
 pub(super) unsafe fn window_id(element: AXUIElementRef) -> Option<u32> {
     CFRetain(element as CFTypeRef);
     let node = Node(element);
-    if AXUIElementSetMessagingTimeout(element, 0.1) != kAXErrorSuccess {
-        return None;
-    }
+    // The observation retains this exact object for the later action. Lowering
+    // its per-object timeout here also lowers AXPress's timeout and can report
+    // CannotComplete while an AppKit sheet is already opening/closing. Bound
+    // newly copied ancestors, but preserve the caller's timeout on the start.
     resolve(&Native(Instant::now() + Duration::from_secs(1)), &node)
 }
 
