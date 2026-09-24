@@ -183,10 +183,21 @@ impl Tool for LaunchAppTool {
         // the original exact-window restoration evidence. A new capture
         // after the target activates can no longer prove the prior window.
         //
-        // After 500ms (enough for `applicationDidFinishLaunching` +
-        // any reflex `NSApp.activate(...)` to fire and get suppressed)
-        // both leases are dropped. Restoration requires uninterrupted native
-        // activity evidence; no later timer may undo a user activation.
+        // A newly launched native app can activate after its first window is
+        // published (Keka did so about 1.4s after launch return). The short
+        // reopen settle period is only suitable for an already-running pid.
+        // The original five-second lease cap and uninterrupted native activity
+        // evidence still apply; no later timer may undo a user activation.
+        let previously_running_pids: Vec<i32> = response_bundle_id
+            .as_deref()
+            .map(|bid| {
+                crate::apps::list_running_apps()
+                    .into_iter()
+                    .filter(|app| app.bundle_id.as_deref() == Some(bid))
+                    .map(|app| app.pid)
+                    .collect()
+            })
+            .unwrap_or_default();
         let prior_frontmost = crate::apps::frontmost_pid();
         let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
             additional_arguments.is_empty()
@@ -296,29 +307,16 @@ impl Tool for LaunchAppTool {
                                 "LaunchAppTool.post_fresh",
                             )
                         });
-                    // Hold the targeted lease long enough to cover the
-                    // ENTIRE post-launch activation window.
-                    //
-                    // - Fast path (bundle-only launch, no urls/args/env):
-                    //   500ms covers `applicationDidFinishLaunching` plus
-                    //   any reflex `NSApp.activate(...)`. Matches Swift
-                    //   LaunchAppTool.swift exactly.
-                    //
-                    // - Slow path (urls / additional_arguments / env /
-                    //   creates_new_instance): 2500ms. The slow-path
-                    //   `openURLs:withApplicationAtURL:` chain triggers a
-                    //   second activation when the file-open delivers to
-                    //   the just-launched app — Electron apps (VSCode,
-                    //   Cursor, Slack) re-`app.focus()` from inside their
-                    //   `open-file` JS handler, AFTER our 500ms window
-                    //   would have already closed. Empirically VSCode's
-                    //   late activation can land anywhere from ~700ms to
-                    //   ~2000ms after the openURLs return. The observer-
-                    //   based lease catches any activation that lands
-                    //   WHILE held, so widening the window converts the
-                    //   late activation from a contract violation into
-                    //   another auto-demote.
-                    let window_ms: u64 = if slow_launch_path { 2500 } else { 500 };
+                    // Cold launches and file/argument delivery get a bounded
+                    // 2.5s settle period. A simple reopen of the same running
+                    // pid keeps the shorter 500ms period. This covers the
+                    // observed late activation without extending the lease's
+                    // original deadline or deferring restoration after return.
+                    let cold_launch = !previously_running_pids.contains(pid);
+                    let window_ms: u64 = if slow_launch_path || cold_launch { 2500 } else { 500 };
+                    tracing::debug!(target: "cua_focus_restore", target_pid = *pid,
+                        cold_launch, settle_ms = window_ms,
+                        "Holding bounded post-launch focus protection");
                     tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
                     drop(targeted_lease);
 
