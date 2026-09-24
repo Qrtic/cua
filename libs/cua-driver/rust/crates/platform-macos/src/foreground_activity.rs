@@ -1023,18 +1023,28 @@ pub(crate) struct RestoreEvidence {
 
 pub(crate) fn capture_restore(pid: i32) -> Option<RestoreEvidence> {
     if crate::apps::frontmost_pid() != Some(pid) {
+        tracing::debug!(target: "cua_focus_restore", pid, reason = "prior_not_frontmost",
+            "Restoration evidence unavailable");
         return None;
     }
     let current = snapshot();
     if !current.reliable {
+        tracing::debug!(target: "cua_focus_restore", pid, reason = "monitor_unreliable",
+            "Restoration evidence unavailable");
         return None;
     }
     let generation = current.generation;
-    let window = crate::ax::bindings::focused_window_id_of_pid(pid)?;
+    let Some(window) = crate::ax::bindings::focused_window_id_of_pid(pid) else {
+        tracing::debug!(target: "cua_focus_restore", pid, reason = "focused_window_unresolved",
+            "Restoration evidence unavailable");
+        return None;
+    };
     if !matches!(
         crate::windows::resolve_window_owner(pid, window),
         crate::windows::WindowOwner::SamePid
     ) {
+        tracing::debug!(target: "cua_focus_restore", pid, window, reason = "window_owner_changed",
+            "Restoration evidence unavailable");
         return None;
     }
     Some(RestoreEvidence {
@@ -1055,7 +1065,14 @@ pub(crate) fn restore_background_focus(evidence: RestoreEvidence, expected_pid: 
             crate::windows::WindowOwner::SamePid
         )
     {
-        let _ = crate::input::skylight::submit_exact_window_restore(evidence.pid, evidence.window);
+        let submitted =
+            crate::input::skylight::submit_exact_window_restore(evidence.pid, evidence.window);
+        tracing::debug!(target: "cua_focus_restore", pid = evidence.pid,
+            window = evidence.window, submitted, "Exact prior-window restoration attempted");
+    } else {
+        tracing::debug!(target: "cua_focus_restore", pid = evidence.pid,
+            expected_pid, reason = "evidence_revoked_or_destination_changed",
+            "Prior-window restoration skipped");
     }
 }
 

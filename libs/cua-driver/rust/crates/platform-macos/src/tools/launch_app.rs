@@ -173,15 +173,15 @@ impl Tool for LaunchAppTool {
             s
         };
 
-        // ── Layer-3 focus-steal suppression (3-phase wrap) ───────────────
+        // ── Layer-3 focus-steal suppression ─────────────────────────────
         //
         // Captures the prior frontmost pid, arms a wildcard suppression
         // BEFORE the launch (covers self-activations the target fires
         // synchronously during `open()`), then upgrades to a targeted
-        // suppression keyed to the actual launched pid. Briefly holds
-        // BOTH leases so a self-activation arriving in the wildcard→
-        // targeted gap is still caught — that race is what hoang17's
-        // Swift PR #1521 explicitly fixes; we do not regress it here.
+        // suppression keyed to the actual launched pid. Narrow the SAME
+        // lease atomically: this has no wildcard→targeted gap and retains
+        // the original exact-window restoration evidence. A new capture
+        // after the target activates can no longer prove the prior window.
         //
         // After 500ms (enough for `applicationDidFinishLaunching` +
         // any reflex `NSApp.activate(...)` to fire and get suppressed)
@@ -277,9 +277,9 @@ impl Tool for LaunchAppTool {
         })
         .await;
 
-        // Upgrade to targeted suppression now that we know the real pid.
-        // Keep the wildcard lease alive until immediately AFTER we've
-        // armed the targeted one — that's the PR #1521 overlap window.
+        // Narrow to the real pid with the original deadline and input
+        // generation. If that lease already expired, a new one must obtain
+        // fresh evidence; it cannot revive the expired restoration proof.
         //
         // Report the actual foreground state at the end of suppression.
         // This does not prove who caused an activation or retry a demotion.
@@ -287,13 +287,15 @@ impl Tool for LaunchAppTool {
         if let Ok(Ok((pid, _, _))) = &launch_result {
             if let Some(prior) = prior_frontmost {
                 if *pid != prior {
-                    let targeted_lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                        Some(*pid),
-                        prior,
-                        "LaunchAppTool.post",
-                    );
-                    // Now safe to drop the wildcard — targeted is armed.
-                    drop(wildcard_lease);
+                    let targeted_lease = wildcard_lease
+                        .and_then(|lease| lease.narrow_to(*pid, "LaunchAppTool.post"))
+                        .unwrap_or_else(|| {
+                            crate::focus_steal::FocusStealPreventer::begin_suppression(
+                                Some(*pid),
+                                prior,
+                                "LaunchAppTool.post_fresh",
+                            )
+                        });
                     // Hold the targeted lease long enough to cover the
                     // ENTIRE post-launch activation window.
                     //

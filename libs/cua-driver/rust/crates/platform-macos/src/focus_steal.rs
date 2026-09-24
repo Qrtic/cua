@@ -239,6 +239,16 @@ pub struct SuppressionLease {
 }
 
 impl SuppressionLease {
+    /// Narrow an in-flight launch lease without recapturing the old foreground.
+    /// The app may already be active when LaunchServices returns. Recapturing
+    /// then would lose the original exact-window proof. Keep its generation,
+    /// deadline and cancellation identity; never renew or widen the lease.
+    pub fn narrow_to(self, target_pid: i32, origin: &'static str) -> Option<Self> {
+        self.dispatcher
+            .narrow_to(self.handle, target_pid, origin)
+            .then_some(self)
+    }
+
     /// Explicit release. Useful if the caller wants to drop the lease
     /// before its scope ends without taking the `Drop` path.
     pub fn release(mut self) {
@@ -293,7 +303,33 @@ impl Dispatcher {
         let evidence = crate::foreground_activity::capture_restore(pid);
         if let Some(entry) = self.entries.lock().unwrap().get_mut(&handle.0) {
             entry.activity_restore = evidence;
+            tracing::debug!(target: "cua_focus_restore", origin = entry.origin,
+                restore_pid = pid, has_restore_evidence = evidence.is_some(),
+                "Captured launch/action restoration evidence");
         }
+    }
+
+    fn narrow_to(&self, handle: SuppressionHandle, target_pid: i32, origin: &'static str) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(&handle.0) else {
+            return false;
+        };
+        if target_pid <= 0
+            || entry.target_pid.is_some()
+            || entry.allowed_pid.is_some()
+            || entry.restore_to == target_pid
+            || entry.returned_tail
+            || entry.deadline <= Instant::now()
+        {
+            return false;
+        }
+        entry.target_pid = Some(target_pid);
+        entry.origin = origin;
+        tracing::debug!(target: "cua_focus_restore", origin,
+            target_pid, restore_pid = entry.restore_to,
+            has_restore_evidence = entry.activity_restore.is_some(),
+            "Narrowed launch lease with original restoration evidence");
+        true
     }
 
     fn new() -> Self {
@@ -786,6 +822,49 @@ mod tests {
         assert_eq!(d.snapshot_matches(99, Some(99)), vec![7]);
         // pid 7 == restore_to → must NOT match (don't fight ourselves).
         assert!(d.snapshot_matches(7, Some(7)).is_empty());
+    }
+
+    #[test]
+    fn narrowing_launch_lease_retains_identity_and_original_deadline() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(None, 7, "test.launch_pre");
+        let deadline = d.entries.lock().unwrap()[&handle.0].deadline;
+        let lease = SuppressionLease {
+            handle,
+            dispatcher: Arc::clone(&d),
+            released: false,
+        };
+        let lease = lease.narrow_to(42, "test.launch_post").unwrap();
+        assert_eq!(lease.handle, handle);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, deadline);
+        assert_eq!(d.snapshot_matches(42, Some(42)), vec![7]);
+        assert!(d.snapshot_matches(99, Some(99)).is_empty());
+        drop(lease);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn narrowing_cannot_revive_or_retarget_a_cancelled_expired_or_scoped_lease() {
+        let d = Arc::new(Dispatcher::new());
+        let removed = d.add(None, 7, "test.removed");
+        d.remove(removed);
+        assert!(!d.narrow_to(removed, 42, "test.post"));
+        let expired = d.add(None, 7, "test.expired");
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&expired.0)
+            .unwrap()
+            .deadline = Instant::now();
+        assert!(!d.narrow_to(expired, 42, "test.post"));
+        let targeted = d.add(Some(42), 7, "test.targeted");
+        assert!(!d.narrow_to(targeted, 99, "test.post"));
+        let allowing = d.add_allowing(42, 7, "test.allowing");
+        assert!(!d.narrow_to(allowing, 99, "test.post"));
+        let wildcard = d.add(None, 7, "test.wildcard");
+        assert!(!d.narrow_to(wildcard, 7, "test.post"));
+        assert!(!d.narrow_to(wildcard, 0, "test.post"));
     }
 
     /// A background pixel click intentionally makes its target AppKit-active
