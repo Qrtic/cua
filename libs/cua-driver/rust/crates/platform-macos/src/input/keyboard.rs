@@ -16,6 +16,35 @@ const SHIFT_KEY_CODE: u16 = 56;
 
 /// Complete Unicode character cadence, not an additional key-down/up gap.
 pub(crate) const DEFAULT_UNICODE_CADENCE_MS: u64 = 5;
+const UNICODE_PACKET_UTF16_LIMIT: usize = 20;
+
+/// Literal text must reach the text system as a commit, rather than a series
+/// of physical-looking single-letter events that an active IME can compose.
+/// Quartz carries at most 20 UTF-16 units per event; never split a scalar.
+/// An explicitly slower cadence retains individual keystrokes for live input.
+fn unicode_text_packets(text: &str, inter_char_delay_ms: u64) -> Vec<&str> {
+    if inter_char_delay_ms > DEFAULT_UNICODE_CADENCE_MS {
+        return text
+            .char_indices()
+            .map(|(index, ch)| &text[index..index + ch.len_utf8()])
+            .collect();
+    }
+    let mut packets = Vec::new();
+    let mut start = 0;
+    let mut units = 0;
+    for (index, ch) in text.char_indices() {
+        if units + ch.len_utf16() > UNICODE_PACKET_UTF16_LIMIT {
+            packets.push(&text[start..index]);
+            start = index;
+            units = 0;
+        }
+        units += ch.len_utf16();
+    }
+    if start < text.len() {
+        packets.push(&text[start..]);
+    }
+    packets
+}
 
 /// A zero/short requested delay retains bounded event pacing rather than
 /// flooding the recipient. Physical key/chord timing does not use this policy.
@@ -31,10 +60,9 @@ fn dispatch_unicode_text_with<Event, Error>(
     mut before_down: impl FnMut() -> Result<(), Error>,
     mut pause: impl FnMut(std::time::Duration),
 ) -> Result<(), Error> {
-    for ch in text.chars() {
-        let value = ch.to_string();
-        let down = create(&value, true)?;
-        let up = create(&value, false)?;
+    for value in unicode_text_packets(text, inter_char_delay_ms) {
+        let down = create(value, true)?;
+        let up = create(value, false)?;
         // Construct the complete pair before posting either side. A failed
         // key-up allocation must not leave the target with an unmatched down.
         // Unicode payloads are literal text, not physical-key/IME composition.
@@ -42,7 +70,8 @@ fn dispatch_unicode_text_with<Event, Error>(
         post(&down)?;
         post(&up)?;
         pause(std::time::Duration::from_millis(
-            unicode_character_cadence_ms(inter_char_delay_ms),
+            unicode_character_cadence_ms(inter_char_delay_ms)
+                .saturating_mul(value.chars().count() as u64),
         ));
     }
     Ok(())
@@ -1088,7 +1117,7 @@ mod tests {
     use std::{cell::Cell, cell::RefCell, rc::Rc};
 
     #[test]
-    fn unicode_typing_has_one_five_ms_pause_per_literal_scalar() {
+    fn unicode_typing_commits_literal_text_in_one_packet() {
         let events = RefCell::new(Vec::new());
         dispatch_unicode_text_with(
             "A中🙂",
@@ -1106,20 +1135,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            *events.borrow(),
-            [
-                "A:true",
-                "A:false",
-                "wait:5",
-                "中:true",
-                "中:false",
-                "wait:5",
-                "🙂:true",
-                "🙂:false",
-                "wait:5"
-            ]
-        );
+        assert_eq!(*events.borrow(), ["A中🙂:true", "A中🙂:false", "wait:15"]);
     }
 
     #[test]
@@ -1175,7 +1191,7 @@ mod tests {
         let pauses = RefCell::new(Vec::new());
         let error = dispatch_unicode_text_with(
             "ab",
-            5,
+            30,
             |value, down| {
                 if value == "b" && !down {
                     Err("key-up creation failed")
@@ -1196,7 +1212,20 @@ mod tests {
             *posted.borrow(),
             [("a".to_owned(), true), ("a".to_owned(), false)]
         );
-        assert_eq!(*pauses.borrow(), [5]);
+        assert_eq!(*pauses.borrow(), [30]);
+    }
+
+    #[test]
+    fn literal_packets_respect_utf16_boundaries_and_preserve_every_scalar() {
+        let text = format!("{}🙂e\u{301}中文{}", "a".repeat(19), "b".repeat(31));
+        let packets = unicode_text_packets(&text, 5);
+        assert_eq!(packets.concat(), text);
+        assert_eq!(packets[0], "a".repeat(19));
+        assert!(packets
+            .iter()
+            .all(|packet| packet.encode_utf16().count() <= 20));
+        assert_eq!(unicode_text_packets("table 111", 5), ["table 111"]);
+        assert_eq!(unicode_text_packets("ab", 30), ["a", "b"]);
     }
 
     #[test]
