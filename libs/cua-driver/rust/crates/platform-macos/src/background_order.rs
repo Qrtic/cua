@@ -78,6 +78,8 @@ pub(crate) struct BackgroundOrderGuard {
     started: Instant,
     expires_at: Instant,
     attempted: bool,
+    #[cfg(test)]
+    observed_checks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl BackgroundOrderGuard {
@@ -91,11 +93,24 @@ impl BackgroundOrderGuard {
         if candidates.is_empty() { return None; }
         let started = Instant::now();
         let result = Self { pid, window, target_pid, candidates,
-            generation: activity.generation, started, expires_at: started + MAX_AGE, attempted: false };
+            generation: activity.generation, started, expires_at: started + MAX_AGE, attempted: false,
+            #[cfg(test)]
+            observed_checks: None,
+        };
         if !result.current() { return None; }
         tracing::debug!(target: "cua_window_order", pid, window, target_pid,
             candidates=result.candidates.len(), "Captured background window-order protection");
         Some(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observing_checks(checks: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let started = Instant::now();
+        // No candidate can cross: lifecycle tests observe the real polling
+        // path without authorizing any accessibility mutation on the desktop.
+        Self { pid: -1, window: 0, target_pid: -2, candidates: HashSet::new(),
+            generation: 0, started, expires_at: started + MAX_AGE, attempted: false,
+            observed_checks: Some(checks) }
     }
 
     /// The action may have returned before AppKit attaches and raises its
@@ -120,6 +135,10 @@ impl BackgroundOrderGuard {
     /// One cleanup attempt at most. Unlike focus restoration this must never
     /// activate an app or select a different window: a changed focus vetoes it.
     pub(crate) fn restore_if_crossed(&mut self, windows: &[WindowInfo]) {
+        #[cfg(test)]
+        if let Some(checks) = &self.observed_checks {
+            checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if self.attempted || !crossed(windows, self.pid, self.window, self.target_pid, &self.candidates) {
             return;
         }

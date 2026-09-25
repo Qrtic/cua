@@ -344,9 +344,12 @@ impl Snapshot {
             let protection_deadline = Instant::now() + focus_steal::ENTRY_DEADLINE;
             let mut snapshot = self;
             let lease = snapshot._lease.take();
-            let ordering = snapshot.ordering.take();
             snapshot.hold_targeted_lease_until_deadline = false;
-            let changes = snapshot.detect_with(timeout, DEFAULT_POLL_INTERVAL);
+            // The initial report can observe AppKit raising the target's
+            // document already. Keep the same guard active through that poll,
+            // then transfer it without recapturing focus or renewing its age.
+            let changes = snapshot.detect_report(timeout, DEFAULT_POLL_INTERVAL);
+            let ordering = snapshot.ordering.take();
             if let Some(lease) = lease {
                 if let Some(mut ordering) = ordering {
                     lease.defer_release_with_poll(protection_deadline, move |deadline| ordering.poll(deadline));
@@ -363,6 +366,10 @@ impl Snapshot {
     /// Same as `detect()` but with configurable timing — exposed for
     /// tests / callers that want a tighter or looser poll window.
     pub fn detect_with(mut self, timeout: Duration, poll_interval: Duration) -> Changes {
+        self.detect_report(timeout, poll_interval)
+    }
+
+    fn detect_report(&mut self, timeout: Duration, poll_interval: Duration) -> Changes {
         let deadline = Instant::now() + timeout;
         let mut first_change = None;
         loop {
@@ -497,6 +504,26 @@ mod tests {
             input_report_timeout(SuppressionScope::WildcardAllowing(42)),
             DEFAULT_TIMEOUT
         );
+    }
+
+    #[tokio::test]
+    async fn fast_input_checks_window_order_before_returning_its_report() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let snapshot = Snapshot {
+            window_ids: HashSet::new(),
+            front_pid: None,
+            _lease: None,
+            hold_targeted_lease_until_deadline: false,
+            suppression_scope: SuppressionScope::Target(-2),
+            ordering: Some(crate::background_order::BackgroundOrderGuard::observing_checks(
+                Arc::clone(&checks),
+            )),
+        };
+        snapshot.detect_input_async().await;
+        assert!(checks.load(Ordering::Relaxed) > 0,
+            "the response poll must retain ordering protection until its deferred handoff");
     }
 
     fn win(id: u32, pid: i32, app: &str, title: &str) -> WindowInfo {
