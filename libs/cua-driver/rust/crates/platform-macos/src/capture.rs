@@ -268,10 +268,11 @@ fn screenshot_window_bytes_shell(window_id: u32) -> anyhow::Result<Vec<u8>> {
 /// Hard ceiling on capture dimensions to avoid unbounded allocations.
 const MAX_CAPTURE_DIM: u32 = 16384;
 
-fn content_rect_usable(rect: screencapturekit::cg::CGRect) -> bool {
+fn window_frame_usable(rect: screencapturekit::cg::CGRect) -> bool {
     let w = rect.size.width;
     let h = rect.size.height;
-    w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
+    rect.origin.x.is_finite() && rect.origin.y.is_finite()
+        && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
 }
 
 /// Round a positive finite pixel extent into `1..=MAX_CAPTURE_DIM` as `u32`.
@@ -395,11 +396,19 @@ fn window_capture_configuration(
     width: u32,
     height: u32,
     includes_child_windows: bool,
+    frame: screencapturekit::cg::CGRect,
 ) -> screencapturekit::prelude::SCStreamConfiguration {
     screencapturekit::prelude::SCStreamConfiguration::new()
         .with_width(width)
         .with_height(height)
         .with_includes_child_windows(includes_child_windows)
+        // An unconstrained child composition fits the union of host, popup
+        // and shadows into the output, shifting every coordinate while the
+        // bitmap dimensions remain unchanged. SCK sourceRect uses DISPLAY
+        // logical points, not window-local points. Clip to the exact frame
+        // used by AX and input calibration, keeping child pixels inside it.
+        .with_source_rect(frame)
+        .with_ignores_shadows_single_window(true)
 }
 
 fn current_window_capture_identity(window_id: u32) -> anyhow::Result<WindowCaptureIdentity> {
@@ -562,22 +571,18 @@ fn build_window_capture_plan(
     // https://developer.apple.com/documentation/screencapturekit/sccontentfilter/init(desktopindependentwindow:)
     let filter = SCContentFilter::create().with_window(&window).build();
 
-    // Pixel output size = content_rect * point_pixel_scale (macOS 14+ filter info).
+    // Pixel output size and crop share the exact WindowServer frame. A popup
+    // extending below the host must not shrink the host into extra padding.
     // https://docs.rs/screencapturekit/6.0.1/screencapturekit/
     let scale = f64::from(filter.point_pixel_scale());
-    let (width_pts, height_pts) = {
-        let rect = filter.content_rect();
-        if content_rect_usable(rect) {
-            (rect.size.width, rect.size.height)
-        } else {
-            (frame.size.width, frame.size.height)
-        }
-    };
+    if !window_frame_usable(frame) {
+        anyhow::bail!("ScreenCaptureKit: invalid frame for window id {window_id}");
+    }
 
-    let out_w = rounded_pixel_dim(width_pts * scale, "width")?;
-    let out_h = rounded_pixel_dim(height_pts * scale, "height")?;
+    let out_w = rounded_pixel_dim(frame.size.width * scale, "width")?;
+    let out_h = rounded_pixel_dim(frame.size.height * scale, "height")?;
 
-    let config = window_capture_configuration(out_w, out_h, includes_child_windows);
+    let config = window_capture_configuration(out_w, out_h, includes_child_windows, frame);
 
     Ok(std::sync::Arc::new(WindowCapturePlan {
         filter,
@@ -943,11 +948,16 @@ mod tests {
 
     #[test]
     fn capture_configuration_keeps_exact_size_and_explicit_composition() {
+        // A nonzero/negative origin catches accidental window-local cropping,
+        // including windows on a display to the left of the primary display.
+        let frame = screencapturekit::cg::CGRect::new(-1280.0, 36.0, 370.0, 182.0);
         for include_children in [true, false] {
-            let config = window_capture_configuration(740, 364, include_children);
+            let config = window_capture_configuration(740, 364, include_children, frame);
             assert_eq!(config.width(), 740);
             assert_eq!(config.height(), 364);
             assert_eq!(config.includes_child_windows(), include_children);
+            assert_eq!(config.source_rect(), frame);
+            assert!(config.ignores_shadows_single_window());
         }
     }
 
