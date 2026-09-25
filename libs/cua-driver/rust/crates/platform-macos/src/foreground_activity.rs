@@ -9,9 +9,9 @@ use core_foundation::{
     base::TCFType,
     runloop::{kCFRunLoopDefaultMode, CFRunLoop},
 };
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, EventField};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, EventField};
 use cua_driver_core::foreground_activity::{
-    Activity, EpisodeLease, InputControl, PressedInputs, Snapshot, Source, State,
+    Activity, EpisodeLease, InputControl, OrderingSnapshot, PressedInputs, Snapshot, Source, State,
 };
 use cua_driver_core::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use foreign_types::ForeignType;
@@ -1269,6 +1269,7 @@ extern "C" {
         user_info: *mut std::ffi::c_void,
     ) -> core_foundation::mach_port::CFMachPortRef;
     fn CGEventGetIntegerValueField(event: *const std::ffi::c_void, field: u32) -> i64;
+    fn CGEventGetFlags(event: core_graphics::sys::CGEventRef) -> u64;
     fn CGEventTapEnable(port: core_foundation::mach_port::CFMachPortRef, enabled: bool);
     fn CGEventTapIsEnabled(port: core_foundation::mach_port::CFMachPortRef) -> bool;
     fn CGGetEventTapList(max: u32, taps: *mut TapInfo, count: *mut u32) -> i32;
@@ -1401,6 +1402,19 @@ fn environment_is_reliable() -> bool {
         && unsafe { CGPreflightListenEventAccess() && !IsSecureEventInputEnabled() }
 }
 
+fn record_native_activity(state: &mut Activity, now_ms: u64, kind: u32, flags: u64, source: Source) {
+    // NonCoalesced is a delivery property, not a held modifier. Any other flag
+    // or event kind keeps the conservative interaction veto. In particular,
+    // MouseDragged and a modified MouseMoved are never treated as plain motion.
+    let plain_motion = kind == CGEventType::MouseMoved as u32
+        && flags & !CGEventFlags::CGEventFlagNonCoalesced.bits() == 0;
+    if plain_motion {
+        state.pointer_motion_event(now_ms, source);
+    } else {
+        state.event(now_ms, source);
+    }
+}
+
 // Handle disabled/null control notifications before touching a CGEvent.
 // The callback owns no heap closure; all content-free state has process lifetime.
 unsafe extern "C" fn observe_event(
@@ -1427,8 +1441,11 @@ unsafe extern "C" fn observe_event(
             marker_matches,
         );
         let own = external.is_none();
-        state.event(
+        record_native_activity(
+            &mut state,
             now_ms,
+            kind,
+            CGEventGetFlags(event),
             if own {
                 Source::OwnGenerated
             } else {
@@ -1565,6 +1582,19 @@ pub(crate) fn snapshot() -> Snapshot {
     state.snapshot(clock_ms())
 }
 
+/// Capture both counters under the same monitor lock. Only background window
+/// ordering uses this narrower evidence; input and focus restoration continue
+/// to require the all-event generation returned by `snapshot`.
+pub(crate) fn ordering_snapshot() -> OrderingSnapshot {
+    start_monitor();
+    let environment_ready = environment_is_reliable();
+    let mut state = activity().lock().unwrap_or_else(|e| e.into_inner());
+    if !environment_ready {
+        state.invalidate();
+    }
+    state.ordering_snapshot(clock_ms())
+}
+
 pub(crate) fn require_idle() -> anyhow::Result<u64> {
     let current = snapshot();
     if current.state != State::Idle {
@@ -1619,6 +1649,56 @@ mod external_event_diagnostic_tests {
                 "driver_marker_matches": false,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod ordering_activity_tests {
+    use super::*;
+
+    fn covered() -> Activity {
+        let mut state = Activity::default();
+        for time in (0..=5_000).step_by(100) {
+            state.health(time, true);
+        }
+        state
+    }
+
+    #[test]
+    fn native_unmodified_moves_preserve_only_the_ordering_counter() {
+        for flags in [0, CGEventFlags::CGEventFlagNonCoalesced.bits()] {
+            let mut state = covered();
+            let before = state.ordering_snapshot(5_000);
+            record_native_activity(&mut state, 5_001, CGEventType::MouseMoved as u32, flags, Source::Unknown);
+            let after = state.ordering_snapshot(5_001);
+            assert_eq!(after.non_motion_generation, before.non_motion_generation);
+            assert_ne!(after.activity.generation, before.activity.generation);
+            assert_eq!(after.activity.state, State::Unknown);
+        }
+    }
+
+    #[test]
+    fn every_other_watched_event_or_modified_move_revokes_ordering() {
+        use CGEventType::*;
+        for kind in [LeftMouseDown, LeftMouseUp, RightMouseDown, RightMouseUp,
+            LeftMouseDragged, RightMouseDragged, KeyDown, KeyUp, FlagsChanged,
+            ScrollWheel, TabletPointer, TabletProximity, OtherMouseDown, OtherMouseUp,
+            OtherMouseDragged, Null] {
+            let mut state = covered();
+            let before = state.ordering_snapshot(5_000);
+            record_native_activity(&mut state, 5_001, kind as u32, 0, Source::Unknown);
+            record_native_activity(&mut state, 5_002, MouseMoved as u32, 0, Source::Unknown);
+            assert_ne!(state.ordering_snapshot(5_002).non_motion_generation, before.non_motion_generation,
+                "a later move must not mask {kind:?}");
+        }
+        for flags in [CGEventFlags::CGEventFlagShift.bits(), CGEventFlags::CGEventFlagCommand.bits(),
+            CGEventFlags::CGEventFlagControl.bits(), CGEventFlags::CGEventFlagAlternate.bits(),
+            CGEventFlags::CGEventFlagSecondaryFn.bits(), 1_u64 << 63] {
+            let mut state = covered();
+            let before = state.ordering_snapshot(5_000);
+            record_native_activity(&mut state, 5_001, MouseMoved as u32, flags, Source::Unknown);
+            assert_ne!(state.ordering_snapshot(5_001).non_motion_generation, before.non_motion_generation);
+        }
     }
 }
 

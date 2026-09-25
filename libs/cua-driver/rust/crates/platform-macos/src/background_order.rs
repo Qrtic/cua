@@ -5,11 +5,14 @@
 //! NSWorkspace an application activation. The focus-steal observer cannot see
 //! that event. This guard considers only pre-existing, overlapping target
 //! windows which crossed the still-focused original window during one action.
+//! Unmodified pointer motion does not prevent restoring that same window's
+//! order; every other external event and any monitoring gap still vetoes it.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use core_foundation::base::CFRelease;
+use cua_driver_core::foreground_activity::OrderingSnapshot;
 
 use crate::ax::bindings::{self as ax, AXUIElementRef};
 use crate::windows::{WindowBounds, WindowInfo};
@@ -62,10 +65,10 @@ fn crossed(windows: &[WindowInfo], front_pid: i32, front_id: u32,
         && w.z_index > front.z_index && overlaps(&w.bounds, &front.bounds))
 }
 
-fn unchanged_context(reliable: bool, generation: u64, original_generation: u64,
+fn unchanged_context(reliable: bool, non_motion_generation: u64, original_non_motion_generation: u64,
                      front_pid: Option<i32>, focused: Option<u32>,
                      original_pid: i32, original_window: u32, elapsed: Duration) -> bool {
-    reliable && generation == original_generation && front_pid == Some(original_pid)
+    reliable && non_motion_generation == original_non_motion_generation && front_pid == Some(original_pid)
         && focused == Some(original_window) && elapsed <= MAX_AGE
 }
 
@@ -75,6 +78,7 @@ pub(crate) struct BackgroundOrderGuard {
     target_pid: i32,
     candidates: HashSet<u32>,
     generation: u64,
+    non_motion_generation: u64,
     started: Instant,
     expires_at: Instant,
     attempted: bool,
@@ -84,8 +88,8 @@ pub(crate) struct BackgroundOrderGuard {
 
 impl BackgroundOrderGuard {
     pub(crate) fn capture(target_pid: i32, windows: &[WindowInfo]) -> Option<Self> {
-        let activity = crate::foreground_activity::snapshot();
-        if !activity.reliable { return None; }
+        let activity = crate::foreground_activity::ordering_snapshot();
+        if !activity.activity.reliable { return None; }
         let pid = crate::apps::frontmost_pid()?;
         if pid <= 0 || pid == target_pid { return None; }
         let window = focused_window(pid)?;
@@ -93,7 +97,8 @@ impl BackgroundOrderGuard {
         if candidates.is_empty() { return None; }
         let started = Instant::now();
         let result = Self { pid, window, target_pid, candidates,
-            generation: activity.generation, started, expires_at: started + MAX_AGE, attempted: false,
+            generation: activity.activity.generation, non_motion_generation: activity.non_motion_generation,
+            started, expires_at: started + MAX_AGE, attempted: false,
             #[cfg(test)]
             observed_checks: None,
         };
@@ -109,7 +114,7 @@ impl BackgroundOrderGuard {
         // No candidate can cross: lifecycle tests observe the real polling
         // path without authorizing any accessibility mutation on the desktop.
         Self { pid: -1, window: 0, target_pid: -2, candidates: HashSet::new(),
-            generation: 0, started, expires_at: started + MAX_AGE, attempted: false,
+            generation: 0, non_motion_generation: 0, started, expires_at: started + MAX_AGE, attempted: false,
             observed_checks: Some(checks) }
     }
 
@@ -126,30 +131,37 @@ impl BackgroundOrderGuard {
     }
 
     fn current(&self) -> bool {
-        let activity = crate::foreground_activity::snapshot();
+        self.current_evidence().is_some()
+    }
+
+    fn current_evidence(&self) -> Option<OrderingSnapshot> {
+        let activity = crate::foreground_activity::ordering_snapshot();
         if Instant::now() >= self.expires_at {
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
                 target_pid=self.target_pid, "Window ordering guard deadline expired");
-            return false;
+            return None;
         }
         let front_pid = crate::apps::frontmost_pid();
         let focused = focused_window(self.pid);
         let elapsed = self.started.elapsed();
-        let valid = unchanged_context(activity.reliable, activity.generation, self.generation,
+        let valid = unchanged_context(activity.activity.reliable, activity.non_motion_generation,
+            self.non_motion_generation,
             front_pid, focused, self.pid, self.window, elapsed);
         if !valid {
             // Log the same evidence that vetoed this check. An untagged event
             // is not proof of human input, and a second observation must not
             // replace the generation or window identity used for admission.
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
-                target_pid=self.target_pid, monitor_reliable=activity.reliable,
-                original_generation=self.generation, current_generation=activity.generation,
+                target_pid=self.target_pid, monitor_reliable=activity.activity.reliable,
+                original_generation=self.generation, current_generation=activity.activity.generation,
+                original_non_motion_generation=self.non_motion_generation,
+                current_non_motion_generation=activity.non_motion_generation,
                 current_front_pid=?front_pid, current_focused_window=?focused,
                 elapsed_ms=elapsed.as_millis(),
                 activity_diagnostic=?crate::foreground_activity::diagnostic_state(),
                 "Window ordering guard veto evidence");
         }
-        valid
+        valid.then_some(activity)
     }
 
     /// One cleanup attempt at most. Unlike focus restoration this must never
@@ -182,11 +194,16 @@ impl BackgroundOrderGuard {
         // Re-read ordering after the AX identity queries. A stale before/after
         // comparison never authorizes a raise after the target has moved away.
         let latest = crate::windows::visible_windows_with_space_snapshot();
-        if !latest.succeeded || !crossed(&latest.windows, self.pid, self.window, self.target_pid, &self.candidates)
-            || !self.current() { return; }
+        if !latest.succeeded || !crossed(&latest.windows, self.pid, self.window, self.target_pid, &self.candidates) {
+            return;
+        }
+        let Some(admission) = self.current_evidence() else { return; };
         let status = unsafe { ax::perform_action(window.0, "AXRaise") };
         tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
             target_pid=self.target_pid, ax_status=status,
+            original_generation=self.generation, current_generation=admission.activity.generation,
+            original_non_motion_generation=self.non_motion_generation,
+            current_non_motion_generation=admission.non_motion_generation,
             "Submitted ordering-only restore of the unchanged foreground window");
         // No second actuator or retry even if AX times out after an effect.
     }
@@ -245,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn any_human_activity_focus_change_monitor_gap_or_expired_lease_vetoes_restore() {
+    fn non_motion_activity_focus_change_monitor_gap_or_expired_lease_vetoes_restore() {
         let ok = |reliable, generation, pid, focused, age| unchanged_context(
             reliable, generation, 7, pid, focused, 1, 10, age);
         assert!(ok(true, 7, Some(1), Some(10), Duration::ZERO));
@@ -256,5 +273,27 @@ mod tests {
         assert!(!ok(true, 7, Some(1), None, Duration::ZERO));
         assert!(!ok(true, 7, None, Some(10), Duration::ZERO));
         assert!(!ok(true, 7, Some(1), Some(10), MAX_AGE + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn motion_allows_only_exact_window_order_restore_and_never_masks_a_click() {
+        use cua_driver_core::foreground_activity::{Activity, EpisodeLease, Source};
+        let mut activity = Activity::default();
+        for time in (0..=5_000).step_by(100) { activity.health(time, true); }
+        let before = activity.ordering_snapshot(5_000);
+        let input_lease = EpisodeLease::begin(5_000, before.activity).unwrap();
+        activity.pointer_motion_event(5_001, Source::Unknown);
+        let current = activity.ordering_snapshot(5_001);
+        let permits = |pid, focused, evidence: cua_driver_core::foreground_activity::OrderingSnapshot| {
+            unchanged_context(evidence.activity.reliable, evidence.non_motion_generation,
+                before.non_motion_generation, pid, focused, 1, 10, Duration::from_millis(1))
+        };
+        assert!(permits(Some(1), Some(10), current));
+        assert!(!input_lease.permits(5_001, current.activity));
+        assert!(!permits(Some(2), Some(10), current));
+        assert!(!permits(Some(1), Some(11), current));
+        activity.event(5_002, Source::Unknown);
+        activity.pointer_motion_event(5_003, Source::Unknown);
+        assert!(!permits(Some(1), Some(10), activity.ordering_snapshot(5_003)));
     }
 }

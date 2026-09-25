@@ -30,6 +30,16 @@ pub struct Snapshot {
     pub generation: u64,
 }
 
+/// Evidence for restoring the ordering of the exact, still-focused window.
+/// Plain pointer motion still revokes input/focus leases through `activity`.
+/// It is excluded only from this counter; every other external event and any
+/// coverage loss advances it, so a later move cannot hide an earlier click.
+#[derive(Clone, Copy, Debug)]
+pub struct OrderingSnapshot {
+    pub activity: Snapshot,
+    pub non_motion_generation: u64,
+}
+
 /// Immutable evidence for one synchronous foreground operation. Fresh idle
 /// evidence after an interruption cannot revive an earlier operation.
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +120,7 @@ impl<R> PressedInputs<R> {
 #[derive(Debug, Default)]
 pub struct Activity {
     generation: u64,
+    non_motion_generation: u64,
     coverage_since: Option<u64>,
     last_heartbeat: Option<u64>,
     last_external: Option<(u64, Source)>,
@@ -130,14 +141,29 @@ impl Activity {
     }
 
     pub fn event(&mut self, now_ms: u64, source: Source) {
+        self.record_event(now_ms, source, false);
+    }
+
+    /// The platform must prove an unmodified pointer move, not a drag, scroll,
+    /// button, key or unknown event kind. This does not make the input idle or
+    /// attributable to a human, and never preserves a foreground input lease.
+    pub fn pointer_motion_event(&mut self, now_ms: u64, source: Source) {
+        self.record_event(now_ms, source, true);
+    }
+
+    fn record_event(&mut self, now_ms: u64, source: Source, plain_motion: bool) {
         if source != Source::OwnGenerated {
             self.generation = self.generation.wrapping_add(1);
+            if !plain_motion {
+                self.non_motion_generation = self.non_motion_generation.wrapping_add(1);
+            }
             self.last_external = Some((now_ms, source));
         }
     }
 
     pub fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        self.non_motion_generation = self.non_motion_generation.wrapping_add(1);
         self.coverage_since = None;
         self.last_heartbeat = None;
     }
@@ -178,6 +204,13 @@ impl Activity {
     pub fn permits(&self, now_ms: u64, generation: u64) -> bool {
         let current = self.snapshot(now_ms);
         current.state == State::Idle && current.generation == generation
+    }
+
+    pub fn ordering_snapshot(&self, now_ms: u64) -> OrderingSnapshot {
+        OrderingSnapshot {
+            activity: self.snapshot(now_ms),
+            non_motion_generation: self.non_motion_generation,
+        }
     }
 }
 
@@ -227,6 +260,70 @@ mod tests {
         activity.event(5_000, Source::Unknown);
         assert_eq!(activity.snapshot(5_000).state, State::Unknown);
         assert!(!activity.permits(5_000, generation));
+    }
+
+    #[test]
+    fn plain_motion_revokes_input_but_preserves_ordering_evidence() {
+        let mut activity = Activity::default();
+        healthy_through(&mut activity, 0, 5_000);
+        let before = activity.ordering_snapshot(5_000);
+        let input = EpisodeLease::begin(5_000, before.activity).unwrap();
+        activity.pointer_motion_event(5_001, Source::Unknown);
+        let after = activity.ordering_snapshot(5_001);
+        assert!(after.activity.reliable);
+        assert_eq!(after.activity.state, State::Unknown);
+        assert_eq!(after.non_motion_generation, before.non_motion_generation);
+        assert_ne!(after.activity.generation, before.activity.generation);
+        assert!(!input.permits(5_001, after.activity));
+        healthy_through(&mut activity, 5_100, 10_100);
+        assert!(!input.permits(10_100, activity.snapshot(10_100)));
+    }
+
+    #[test]
+    fn later_motion_never_hides_an_intervening_interaction() {
+        for source in [Source::Human, Source::Unknown] {
+            let mut activity = Activity::default();
+            healthy_through(&mut activity, 0, 5_000);
+            let before = activity.ordering_snapshot(5_000);
+            activity.pointer_motion_event(5_001, Source::Unknown);
+            activity.event(5_002, source);
+            activity.pointer_motion_event(5_003, Source::Unknown);
+            let after = activity.ordering_snapshot(5_003);
+            assert!(after.activity.reliable);
+            assert_ne!(after.non_motion_generation, before.non_motion_generation);
+            assert_eq!(after.activity.state, State::Unknown);
+        }
+    }
+
+    #[test]
+    fn ordering_evidence_never_survives_monitor_loss_or_recovers_after_it() {
+        for explicitly_unreliable in [false, true] {
+            let mut activity = Activity::default();
+            healthy_through(&mut activity, 0, 5_000);
+            let before = activity.ordering_snapshot(5_000);
+            if explicitly_unreliable {
+                activity.health(5_001, false);
+            }
+            assert!(!activity.ordering_snapshot(5_251).activity.reliable);
+            activity.health(5_300, true);
+            activity.pointer_motion_event(5_301, Source::Unknown);
+            let after = activity.ordering_snapshot(5_301);
+            assert!(after.activity.reliable);
+            assert_ne!(after.non_motion_generation, before.non_motion_generation);
+        }
+    }
+
+    #[test]
+    fn own_generated_motion_or_interaction_does_not_change_either_counter() {
+        let mut activity = Activity::default();
+        healthy_through(&mut activity, 0, 5_000);
+        let before = activity.ordering_snapshot(5_000);
+        activity.event(5_001, Source::OwnGenerated);
+        activity.pointer_motion_event(5_002, Source::OwnGenerated);
+        let after = activity.ordering_snapshot(5_002);
+        assert_eq!(after.non_motion_generation, before.non_motion_generation);
+        assert_eq!(after.activity.generation, before.activity.generation);
+        assert_eq!(after.activity.state, State::Idle);
     }
 
     #[test]
