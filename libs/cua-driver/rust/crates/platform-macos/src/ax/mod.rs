@@ -27,6 +27,7 @@ mod element_ancestry;
 pub mod enablement;
 pub mod exact_target;
 pub(crate) mod menu_context;
+pub(crate) mod menu_selection;
 pub(crate) mod native_text_editor;
 pub mod tree;
 pub(crate) mod window_classification;

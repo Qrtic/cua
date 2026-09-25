@@ -6,7 +6,7 @@
 //!
 //! Rules (from cua-driver reference):
 //! - An element is addressable (gets an index) when it has ≥1 action name or
-//!   exposes a writable AXValue control surface.
+//!   exposes a supported writable AXValue or native menu-selection surface.
 //! - Non-actionable leaf nodes with a value are rendered as `AXRole = "value"`.
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
@@ -94,6 +94,9 @@ pub struct AXNode {
     /// This trust marker is independent of actionable ancestry because
     /// AXWebArea is commonly non-actionable and therefore has no element index.
     pub in_web_content: bool,
+    /// A live native popup option selectable through its parent's verified
+    /// AXSelectedChildren model. This is not an advertised AXPress action.
+    pub selectable_menu_item: bool,
 }
 
 #[derive(Default)]
@@ -588,7 +591,16 @@ unsafe fn walk_element(
     } else {
         None
     };
-    let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
+    let selectable_menu_item = role == "AXMenuItem"
+        && !in_web_content
+        && enabled == Some(true)
+        && actions.iter().all(|action| action.trim().is_empty())
+        && super::menu_selection::is_selectable(element);
+    let is_actionable = is_addressable(
+        !actions.is_empty(),
+        value_settable || selectable_menu_item,
+        enabled,
+    );
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         let children = copy_children(element);
@@ -665,6 +677,7 @@ unsafe fn walk_element(
             enabled: control_state.enabled,
             selected: control_state.selected,
             in_web_content,
+            selectable_menu_item,
         }
     } else {
         AXNode {
@@ -699,6 +712,7 @@ unsafe fn walk_element(
             enabled: control_state.enabled,
             selected: control_state.selected,
             in_web_content,
+            selectable_menu_item,
         }
     };
 
@@ -870,6 +884,9 @@ fn format_node_line(node: &AXNode) -> String {
                 .join(",");
             attrs.push(format!("actions=[{}]", action_str));
         }
+        if node.selectable_menu_item {
+            attrs.push("selection=parent_selected_children".to_owned());
+        }
         if !attrs.is_empty() {
             parts.push_str(" [");
             parts.push_str(&attrs.join(" "));
@@ -1038,11 +1055,17 @@ mod tests {
             enabled: Some(false),
             selected: None,
             in_web_content: false,
+            selectable_menu_item: false,
         };
         assert_eq!(format_node_line(&node), "- AXMenuItem [disabled] \"Open…\"");
         for enabled in [None, Some(true)] {
             node.enabled = enabled;
             assert_eq!(format_node_line(&node), "- AXMenuItem \"Open…\"");
         }
+        node.element_index = Some(5);
+        node.selectable_menu_item = true;
+        assert_eq!(format_node_line(&node),
+            "- [5] AXMenuItem \"Open…\" [selection=parent_selected_children]");
+        assert!(node.actions.is_empty(), "selection does not invent AXPress");
     }
 }

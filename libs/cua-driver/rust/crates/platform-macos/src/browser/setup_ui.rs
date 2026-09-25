@@ -1733,6 +1733,7 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            selectable_menu_item: false,
         }
     }
 

@@ -2267,6 +2267,15 @@ fn build_element_observation(
     if node.in_web_content {
         entry["in_web_content"] = serde_json::Value::Bool(true);
     }
+    if node.selectable_menu_item {
+        entry["selection_method"] = serde_json::json!("parent_selected_children");
+    }
+    // The finite action loop must distinguish a native popup's AXShowMenu
+    // from AXPress. Omitted actions remain unknown for older/control-specific
+    // representations; do not fabricate a press for a selection-only option.
+    if node.role == "AXPopUpButton" || node.selectable_menu_item {
+        entry["actions"] = serde_json::json!(node.actions);
+    }
     if let Some(frame) = frame {
         entry["frame"] = frame;
     }
@@ -2920,6 +2929,7 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+            selectable_menu_item: false,
         }
     }
 
@@ -2936,6 +2946,24 @@ mod tests {
             window_scope: None,
             application_menu: None,
         })
+    }
+
+    #[test]
+    fn popup_capabilities_distinguish_show_menu_from_parent_selection() {
+        let mut popup = node(Some(3), "AXPopUpButton", Some("Column"), 1, None, None);
+        popup.actions = vec!["AXShowMenu".into()];
+        let observed = build_element_observation(&popup, 3);
+        assert_eq!(observed["actions"], serde_json::json!(["AXShowMenu"]));
+        assert!(observed.get("selection_method").is_none());
+
+        let mut option = node(Some(5), "AXMenuItem", Some("Last Name"), 3, Some(3), None);
+        option.selectable_menu_item = true;
+        option.selected = Some(false);
+        let observed = build_element_observation(&option, 5);
+        assert_eq!(observed["selection_method"], "parent_selected_children");
+        assert_eq!(observed["actions"], serde_json::json!([]));
+        assert_eq!(observed["selected"], false);
+        assert_eq!(observed["parent_index"], 3);
     }
 
     #[test]

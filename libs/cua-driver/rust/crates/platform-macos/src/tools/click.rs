@@ -2319,6 +2319,22 @@ fn perform_ax_click(
     // or forcing the caller onto a less stable pixel coordinate.
     if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
         if modifiers.is_empty() {
+            if role == "AXMenuItem" && advertised.iter().all(|action| action.trim().is_empty()) {
+                let committed = unsafe {
+                    crate::ax::menu_selection::select(element, pid, window_id)?
+                };
+                return Ok((
+                    if committed {
+                        format!("Selected native popup option [{idx}] through AXSelectedChildren; dismissed its menu and confirmed the control value.")
+                    } else {
+                        format!("Native popup selection dispatched for [{idx}]; the committed control value is unverified. Inspect a fresh observation before continuing.")
+                    },
+                    false,
+                    false,
+                    committed,
+                    false,
+                ));
+            }
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr)
             {
