@@ -311,6 +311,13 @@ impl NativeSegment {
                 true,
             ));
         }
+        if tool == "prepare_observation" && self.dialog_host.is_some() {
+            return Err(failure(
+                "rendering_target_unavailable",
+                "Rendering recovery cannot replace or activate a held dialog",
+                true,
+            ));
+        }
         if self.dialog_host.is_some() {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner
@@ -847,6 +854,7 @@ fn supported_tool(name: &str) -> bool {
             | "perform_secondary_action"
             | "get_window_state"
             | "prepare_dialog"
+            | "prepare_observation"
     )
 }
 
@@ -968,7 +976,7 @@ pub(super) fn admit_call(args: &Value, tool: &str) -> Result<Option<Arc<Call>>, 
             &segment.binding,
             clock_ms(),
             snapshot(),
-            if tool == "prepare_dialog" {
+            if matches!(tool, "prepare_dialog" | "prepare_observation") {
                 CallKind::Activation
             } else if tool == "get_window_state" {
                 CallKind::Observation
@@ -1257,6 +1265,97 @@ pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
                 "foreground_segment_id":call.segment.binding.id})),
         _ => ToolResult::error("Dialog preparation did not establish exact foreground readiness; finish or abort the segment without replaying input.")
             .with_structured(json!({"code":"foreground_dialog_preparation_failed", "effect":"unverifiable", "retryable":false})),
+    }
+}
+
+fn rendering_window_attributes(
+    role: Option<&str>, subrole: Option<&str>, modal: Option<bool>,
+    minimized: Option<bool>, sheets_absent: bool,
+) -> bool {
+    role == Some("AXWindow") && subrole == Some("AXStandardWindow")
+        && modal != Some(true) && minimized == Some(false) && sheets_absent
+}
+
+fn rendering_target_available(target: ExactWindowTarget) -> bool {
+    use crate::ax::bindings as ax;
+    use core_foundation::{array::CFArray, base::{CFRelease, CFTypeRef, TCFType}, string::CFString};
+    let Some(info) = crate::windows::window_info_by_id(target.window_id) else { return false };
+    if info.pid != target.pid || !info.is_on_screen || info.layer != 0
+        || info.on_current_space != Some(true) { return false; }
+    struct Owned(ax::AXUIElementRef);
+    impl Drop for Owned {
+        fn drop(&mut self) { unsafe { CFRelease(self.0 as _) }; }
+    }
+    unsafe {
+        let raw = ax::AXUIElementCreateApplication(target.pid);
+        if raw.is_null() { return false; }
+        let app = Owned(raw);
+        if ax::AXUIElementSetMessagingTimeout(app.0, 0.1) != ax::kAXErrorSuccess { return false; }
+        let Ok(snapshot) = ax::try_copy_ax_windows(app.0) else { return false };
+        // Own every returned element before an early return; no retained AX leak.
+        let windows: Vec<Owned> = snapshot.windows.into_iter().map(Owned).collect();
+        if windows.len() > 64 { return false; }
+        let deadline = std::time::Instant::now() + Duration::from_millis(600);
+        for window in windows {
+            if std::time::Instant::now() >= deadline || check_request().is_err() { return false; }
+            if ax::AXUIElementSetMessagingTimeout(window.0, 0.1) != ax::kAXErrorSuccess { continue; }
+            if ax::ax_get_window_id(window.0) != Some(target.window_id) { continue; }
+            let mut pid = 0;
+            if ax::AXUIElementGetPid(window.0, &mut pid) != ax::kAXErrorSuccess || pid != target.pid { return false; }
+            let role = ax::copy_string_attr(window.0, "AXRole");
+            let subrole = ax::copy_string_attr(window.0, "AXSubrole");
+            let modal = ax::copy_bool_attr(window.0, "AXModal");
+            let minimized = ax::copy_bool_attr(window.0, "AXMinimized");
+            let attribute = CFString::new("AXSheets");
+            let mut value: CFTypeRef = std::ptr::null();
+            let status = ax::AXUIElementCopyAttributeValue(window.0, attribute.as_concrete_TypeRef(), &mut value);
+            let sheets_absent = match status {
+                ax::kAXErrorAttributeUnsupported | ax::kAXErrorNoValue => true,
+                ax::kAXErrorSuccess if !value.is_null()
+                    && core_foundation::base::CFGetTypeID(value) == CFArray::<CFTypeRef>::type_id() =>
+                    CFArray::<CFTypeRef>::wrap_under_get_rule(value as _).len() == 0,
+                _ => false,
+            };
+            if !value.is_null() { CFRelease(value); }
+            return check_request().is_ok() && rendering_window_attributes(
+                role.as_deref(), subrole.as_deref(), modal, minimized, sheets_absent);
+        }
+    }
+    false
+}
+
+/// No click/key is used as a rendering probe. The wrapper keeps this original
+/// segment through one observation, then explicitly settles it before returning.
+pub(crate) async fn prepare_observation(args: Value) -> ToolResult {
+    let target = match target_from_args(&args) { Ok(target) => target, Err(result) => return result };
+    let Some(call) = current_invocation().and_then(|context| context.segment_call.clone()) else {
+        return failure("foreground_segment_required", "Rendering recovery requires a live exact-window segment", true);
+    };
+    if call.segment.dialog_host.is_some() || call.target() != target
+        || args.get("delivery_mode").and_then(Value::as_str) != Some("foreground") {
+        return failure("rendering_target_unavailable", "Rendering recovery requires an exact ordinary document target", true);
+    }
+    let prepared = spawn_blocking(move || {
+        check_request()?;
+        if !rendering_target_available(target) {
+            return Ok(false);
+        }
+        crate::input::skylight::with_foreground_hid_activation(target.pid, target.window_id, || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(600) {
+                check_request()?;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            check_request()
+        })?;
+        Ok::<_, anyhow::Error>(true)
+    }).await;
+    match prepared {
+        Ok(Ok(true)) => ToolResult::text("Exact document exposure completed; observe its actual state once and finish the segment. No click or key was sent.")
+            .with_structured(json!({"phase":"prepared", "pid":target.pid, "window_id":target.window_id,
+                "foreground_segment_id":call.segment.binding.id})),
+        Ok(Ok(false)) => failure("rendering_target_unavailable", "The exact visible standard document is not proven or has an attached sheet; no activation was requested", true),
+        _ => failure("rendering_recovery_failed", "Exact document exposure did not complete; settle the segment without repeating activation", false),
     }
 }
 
@@ -1640,6 +1739,22 @@ mod tests {
             state: State::Idle,
             idle_ms: 5_000,
             generation: 7,
+        }
+    }
+
+    #[test]
+    fn rendering_recovery_refuses_non_documents_minimized_windows_and_sheets() {
+        assert!(rendering_window_attributes(Some("AXWindow"), Some("AXStandardWindow"), Some(false), Some(false), true));
+        for (role, subrole, modal, minimized, no_sheets) in [
+            (Some("AXSheet"), Some("AXStandardWindow"), Some(false), Some(false), true),
+            (Some("AXWindow"), Some("AXDialog"), Some(false), Some(false), true),
+            (Some("AXWindow"), Some("AXStandardWindow"), Some(true), Some(false), true),
+            (Some("AXWindow"), Some("AXStandardWindow"), Some(false), Some(true), true),
+            (Some("AXWindow"), Some("AXStandardWindow"), Some(false), None, true),
+            (Some("AXWindow"), Some("AXStandardWindow"), Some(false), Some(false), false),
+            (None, Some("AXStandardWindow"), Some(false), Some(false), true),
+        ] {
+            assert!(!rendering_window_attributes(role, subrole, modal, minimized, no_sheets));
         }
     }
 

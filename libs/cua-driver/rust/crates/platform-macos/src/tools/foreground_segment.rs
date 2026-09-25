@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 pub struct BeginForegroundSegmentTool;
 pub struct EndForegroundSegmentTool;
 pub struct PrepareDialogTool;
+pub struct PrepareObservationTool;
 
 fn definition(end: bool) -> &'static ToolDef {
     static BEGIN: OnceLock<ToolDef> = OnceLock::new();
@@ -100,6 +101,30 @@ impl Tool for PrepareDialogTool {
     }
 }
 
+#[async_trait]
+impl Tool for PrepareObservationTool {
+    fn def(&self) -> &ToolDef {
+        static DEF: OnceLock<ToolDef> = OnceLock::new();
+        DEF.get_or_init(|| ToolDef {
+            name: "prepare_observation".into(),
+            description: "Briefly expose the exact ordinary document window to let an occluded renderer progress. Sends no click or key. Requires a live same-owner batch foreground segment, fresh standard-window proof, current Space and activity lease. Observe once, then finish the segment immediately.".into(),
+            input_schema: json!({
+                "type":"object", "properties": {
+                    "pid":{"type":"integer", "minimum":1, "maximum":i32::MAX},
+                    "window_id":{"type":"integer", "minimum":1, "maximum":u32::MAX},
+                    "foreground_segment_id":{"type":"string", "minLength":1, "maxLength":128},
+                    "delivery_mode":{"type":"string", "enum":["foreground"]}
+                }, "required":["pid", "window_id", "foreground_segment_id", "delivery_mode"], "additionalProperties":false
+            }),
+            read_only:false, destructive:false, idempotent:false, open_world:false,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        crate::foreground_activity::prepare_observation(args).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +174,19 @@ mod tests {
             "y",
             "session_id",
         ] {
+            assert!(def.input_schema["properties"].get(forbidden).is_none());
+        }
+    }
+
+    #[test]
+    fn rendering_preparation_has_no_input_duration_or_target_override() {
+        let tool = PrepareObservationTool;
+        let def = tool.def();
+        assert!(!def.read_only && !def.idempotent && !def.open_world);
+        assert_eq!(def.input_schema["required"],
+            json!(["pid", "window_id", "foreground_segment_id", "delivery_mode"]));
+        assert_eq!(def.input_schema["additionalProperties"], false);
+        for forbidden in ["host_pid", "host_window_id", "text", "key", "x", "y", "duration", "session_id"] {
             assert!(def.input_schema["properties"].get(forbidden).is_none());
         }
     }

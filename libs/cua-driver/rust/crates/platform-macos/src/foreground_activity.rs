@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 
 mod segment;
 pub(crate) use segment::{
-    begin_segment, end_segment, prepare_dialog, stop_runtime_segments, stop_session_segments,
+    begin_segment, end_segment, prepare_dialog, prepare_observation, stop_runtime_segments, stop_session_segments,
 };
 
 fn foreground_writer() -> Arc<tokio::sync::Mutex<()>> {
@@ -50,6 +50,7 @@ pub(crate) fn guard_tool(inner: Box<dyn Tool>) -> Box<dyn Tool> {
             | "set_window_frame"
             | "get_window_state"
             | "prepare_dialog"
+            | "prepare_observation"
     ) {
         let mut def = inner.def().clone();
         def.input_schema["properties"]["foreground_segment_id"] = serde_json::json!({
@@ -1719,6 +1720,7 @@ fn diagnostic_state_from_snapshot(current: Snapshot) -> serde_json::Value {
         "exact_window_restore": true,
         "batch_foreground_segments": true,
         "dialog_foreground_segments": true,
+        "rendering_recovery": true,
     })
 }
 
