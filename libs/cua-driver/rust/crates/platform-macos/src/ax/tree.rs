@@ -789,6 +789,25 @@ mod web_content_role_tests {
     }
 }
 
+fn display_action_name(action: &str) -> String {
+    // AppKit custom actions stringify as a human name followed by an object
+    // address and selector. These implementation details are repeated on every
+    // cell in Numbers/Notes and are not callable public tool arguments. Retain
+    // the observed name while leaving the raw native action list untouched.
+    let mut lines = action.lines();
+    if let (Some(name), Some(target), Some(selector), None) =
+        (lines.next(), lines.next(), lines.next(), lines.next())
+    {
+        if name.to_ascii_lowercase().starts_with("name:")
+            && target.to_ascii_lowercase().starts_with("target:")
+            && selector.to_ascii_lowercase().starts_with("selector:")
+        {
+            return name.to_lowercase();
+        }
+    }
+    action.strip_prefix("AX").unwrap_or(action).to_lowercase()
+}
+
 fn format_node_line(node: &AXNode) -> String {
     let mut parts = String::new();
 
@@ -829,7 +848,7 @@ fn format_node_line(node: &AXNode) -> String {
             let action_str = node
                 .actions
                 .iter()
-                .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
+                .map(|a| display_action_name(a))
                 .collect::<Vec<_>>()
                 .join(",");
             attrs.push(format!("actions=[{}]", action_str));
@@ -918,6 +937,16 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn custom_action_display_keeps_name_without_native_object_metadata() {
+        let action = "Name:Remove unused rows\ntarget:0xa22f78900\nselector:tsaxtrimemptyrows";
+        assert_eq!(display_action_name(action), "name:remove unused rows");
+        assert_eq!(display_action_name("AXPress"), "press");
+        assert_eq!(display_action_name("Name:Something\nUser text"), "name:something\nuser text");
+        // Rendering must not rewrite the action string kept for native dispatch.
+        assert!(action.contains("target:0xa22f78900"));
+    }
 
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {
