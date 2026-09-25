@@ -605,6 +605,17 @@ fn build_window_capture_plan(
 fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
     use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
 
+    let source = plan.config.source_rect();
+    let content = plan.filter.content_rect();
+    tracing::debug!(target: "cua_capture_geometry", window_id,
+        planned_children = plan.includes_child_windows,
+        configured_children = plan.config.includes_child_windows(),
+        source_x = source.origin.x, source_y = source.origin.y,
+        source_width = source.size.width, source_height = source.size.height,
+        content_x = content.origin.x, content_y = content.origin.y,
+        content_width = content.size.width, content_height = content.size.height,
+        output_width = plan.config.width(), output_height = plan.config.height(),
+        "Capturing exact window with ScreenCaptureKit configuration");
     let image = SCScreenshotManager::capture_image(&plan.filter, &plan.config).map_err(|e| {
         anyhow::anyhow!("SCScreenshotManager::capture_image failed for window {window_id}: {e}")
     })?;
