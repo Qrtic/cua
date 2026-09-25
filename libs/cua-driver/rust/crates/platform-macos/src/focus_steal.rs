@@ -67,7 +67,7 @@ use uuid::Uuid;
 /// Per-entry deadline. After this much wall-clock time the dispatcher's
 /// observer (and the janitor) treats the entry as leaked and prunes it
 /// without firing. Mirrors Swift PR #1521.
-const ENTRY_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const ENTRY_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Janitor tick interval. The task wakes up this often while the
 /// dispatcher is non-empty and prunes expired entries.

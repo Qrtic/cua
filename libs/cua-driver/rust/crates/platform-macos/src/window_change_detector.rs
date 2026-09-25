@@ -336,9 +336,12 @@ impl Snapshot {
             if timeout == DEFAULT_TIMEOUT {
                 return self.detect();
             }
-            // Match the old protection deadline: it begins AFTER dispatch,
-            // not when the snapshot was created before a potentially long type.
-            let protection_deadline = Instant::now() + DEFAULT_TIMEOUT;
+            // A new document can reactivate its app after the one-second
+            // reporting window (observed when Obsidian creates a vault).
+            // Retain the original target-only lease without extending its
+            // five-second cap. mark_deferred clamps to the existing deadline;
+            // user activity and intentional foreground actions still cancel it.
+            let protection_deadline = Instant::now() + focus_steal::ENTRY_DEADLINE;
             let mut snapshot = self;
             let lease = snapshot._lease.take();
             let ordering = snapshot.ordering.take();
