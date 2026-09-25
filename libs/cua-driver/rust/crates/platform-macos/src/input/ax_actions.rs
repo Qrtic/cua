@@ -146,6 +146,24 @@ impl Drop for SelectionReadback {
     }
 }
 
+/// Capture only this cell, never a parent row or a nested ancestor cell. Plain
+/// cell clicks do not carry selection modifiers, so no peer mutation is needed.
+pub fn capture_exact_cell_selection(element_ptr: usize) -> Option<SelectionReadback> {
+    let target = element_ptr as AXUIElementRef;
+    if unsafe { copy_string_attr(target, "AXRole") }.as_deref() != Some("AXCell")
+        || unsafe { copy_bool_attr(target, "AXSelected") }.is_none()
+    {
+        return None;
+    }
+    unsafe { CFRetain(target as CFTypeRef) };
+    Some(SelectionReadback {
+        role: "AXCell".to_owned(),
+        target,
+        peer_model_observed: false,
+        previously_selected_peers: Vec::new(),
+    })
+}
+
 /// Capture the nearest selectable container and its currently-selected peers.
 /// Returns `None` when the platform does not expose a readable selection model;
 /// callers must then leave the action unverifiable instead of inventing proof.

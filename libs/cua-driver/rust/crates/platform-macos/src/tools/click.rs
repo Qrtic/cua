@@ -77,11 +77,15 @@ enum ElementClickRoute {
     AxSemantic,
     TextInputPointer,
     QtCheckablePointer,
+    CellSelectionPointer,
 }
 
 impl ElementClickRoute {
     fn uses_pointer(self) -> bool {
-        matches!(self, Self::TextInputPointer | Self::QtCheckablePointer)
+        matches!(
+            self,
+            Self::TextInputPointer | Self::QtCheckablePointer | Self::CellSelectionPointer
+        )
     }
 }
 
@@ -144,9 +148,16 @@ fn element_click_route(
     selectable_ancestry: bool,
     auxiliary_surface: bool,
 ) -> ElementClickRoute {
-    if (action.eq_ignore_ascii_case("press") || action.eq_ignore_ascii_case("click"))
+    let primary = (action.eq_ignore_ascii_case("press") || action.eq_ignore_ascii_case("click"))
         && button == "left"
-        && !has_modifiers
+        && !has_modifiers;
+    // iWork cells advertise AXPress but accept it without selecting anything.
+    // A plain click on a cell with its own readable selection bit uses one
+    // exact-window pointer gesture, chosen before AXPress can run. The caller
+    // supplies cell-local selection evidence, never an ancestor's selection.
+    if primary && role == "AXCell" && selectable_ancestry && !auxiliary_surface {
+        ElementClickRoute::CellSelectionPointer
+    } else if primary
         && matches!(role, "AXTextField" | "AXTextArea")
         && !advertised_actions.iter().any(|action| action == "AXPress")
         && !selectable_ancestry
@@ -706,7 +717,8 @@ impl Tool for ClickTool {
                         && !menu
                         && crate::ax::attached_popover::has_displaced_popover_window(element, wid);
                     let pointer_candidate = primary_press
-                        && matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXCheckBox")
+                        && matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXCheckBox" | "AXCell")
+                        && (role != "AXCell" || count == 1)
                         && !menu
                         && !popover;
                     // Preserve the old collection-selection lookup condition.
@@ -715,7 +727,7 @@ impl Tool for ClickTool {
                     let selectable = ((selection_action && !menu && !popover) || pointer_candidate)
                         && crate::input::ax_actions::nearest_container_selection_state(element_ptr)
                             .is_some();
-                    let route = if pointer_candidate && !selectable {
+                    let route = if pointer_candidate && (!selectable || role == "AXCell") {
                         let actions = copy_action_names(element);
                         let identifier = if role == "AXCheckBox" {
                             copy_string_attr(element, "AXIdentifier").unwrap_or_default()
@@ -727,7 +739,9 @@ impl Tool for ClickTool {
                                 && crate::ax::attached_popover::has_displaced_popover_window(
                                     element, wid,
                                 ));
-                        primary_element_click_route(&role, &identifier, &actions, false, auxiliary)
+                        let route_selection = role == "AXCell"
+                            && copy_bool_attr(element, "AXSelected").is_some();
+                        primary_element_click_route(&role, &identifier, &actions, route_selection, auxiliary)
                     } else {
                         ElementClickRoute::AxSemantic
                     };
@@ -1706,8 +1720,11 @@ fn live_element_pointer_target(
     } else {
         String::new()
     };
-    let selectable =
-        crate::input::ax_actions::nearest_container_selection_state(element_ptr).is_some();
+    let selectable = if role == "AXCell" {
+        unsafe { copy_bool_attr(element, "AXSelected") }.is_some()
+    } else {
+        crate::input::ax_actions::nearest_container_selection_state(element_ptr).is_some()
+    };
     if !expected_route.uses_pointer()
         || primary_element_click_route(
             &role,
@@ -1776,6 +1793,9 @@ fn perform_element_pointer_click(
     delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     selected_route: ElementClickRoute,
 ) -> anyhow::Result<((String, bool, bool, bool, bool), bool)> {
+    if selected_route == ElementClickRoute::CellSelectionPointer && count != 1 {
+        anyhow::bail!("cell selection pointer delivery requires one plain primary click");
+    }
     let frame = super::px_frame::resolve_window_px_frame(window_id)
         .map_err(ElementPointerRefusal::Frame)?;
     // Refuse invalid/disabled targets before even preparing synthetic focus or
@@ -1789,6 +1809,13 @@ fn perform_element_pointer_click(
         delegation.as_ref(),
         selected_route,
     )?;
+    let selection = if selected_route == ElementClickRoute::CellSelectionPointer {
+        let selection = crate::input::ax_actions::capture_exact_cell_selection(element_ptr)
+            .ok_or_else(|| anyhow::anyhow!("the exact cell selection evidence became unavailable before input"))?;
+        Some(selection)
+    } else {
+        None
+    };
     if foreground {
         crate::input::skylight::with_foreground_hid_activation_delegated(
             pid as libc::pid_t,
@@ -1838,6 +1865,26 @@ fn perform_element_pointer_click(
             crate::input::mouse::WindowClickDelivery::Background,
             focus_context,
         )?;
+    }
+    if let Some(selection) = selection {
+        let deadline = std::time::Instant::now() + SELECTION_READBACK_TIMEOUT;
+        loop {
+            crate::foreground_activity::check_request()?;
+            if matches!(selection.observe(), Some((true, _))) {
+                std::thread::sleep(SELECTION_READBACK_STABILITY);
+                crate::foreground_activity::check_request()?;
+                if matches!(selection.observe(), Some((true, _))) {
+                    return Ok(((
+                        format!("Selected exact cell [{idx}] with one pointer click; stable AXSelected=true confirmed."),
+                        false, false, true, true,
+                    ), foreground));
+                }
+            }
+            if std::time::Instant::now() >= deadline { break; }
+            std::thread::sleep(SELECTION_READBACK_POLL);
+        }
+        // The gesture already ran. Preserve an unverified receipt; never
+        // follow it with AXPress or a second pointer actuator.
     }
     Ok((
         (
@@ -2352,6 +2399,46 @@ fn map_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selectable_cell_uses_one_pointer_route_despite_advertised_press() {
+        let actions = ["AXPress".to_owned(), "AXShowMenu".to_owned()];
+        assert_eq!(
+            primary_element_click_route("AXCell", "", &actions, true, false),
+            ElementClickRoute::CellSelectionPointer,
+        );
+        assert!(pointer_control_enabled(ElementClickRoute::CellSelectionPointer, Ok(true), false));
+    }
+
+    #[test]
+    fn cell_selection_does_not_change_secondary_or_modified_actions() {
+        let actions = ["AXPress".to_owned()];
+        for (action, button, modified, selected, auxiliary) in [
+            ("show_menu", "left", false, true, false),
+            ("confirm", "left", false, true, false),
+            ("open", "left", false, true, false),
+            ("press", "right", false, true, false),
+            ("press", "left", true, true, false),
+            ("press", "left", false, false, false),
+            ("press", "left", false, true, true),
+        ] {
+            assert_eq!(
+                element_click_route(action, button, modified, "AXCell", &actions, selected, auxiliary),
+                ElementClickRoute::AxSemantic,
+            );
+        }
+        for role in ["AXRow", "AXButton", "AXTextArea"] {
+            assert_eq!(primary_element_click_route(role, "", &actions, true, false), ElementClickRoute::AxSemantic);
+        }
+    }
+
+    #[test]
+    fn cell_pointer_requires_positive_enabled_state() {
+        for enabled in [Ok(false), Err(crate::ax::bindings::kAXErrorAttributeUnsupported),
+            Err(crate::ax::bindings::kAXErrorCannotComplete), Err(crate::ax::bindings::kAXErrorFailure)] {
+            assert!(!pointer_control_enabled(ElementClickRoute::CellSelectionPointer, enabled, true));
+        }
+    }
 
     #[test]
     fn writable_appkit_text_input_can_omit_enabled_attribute() {
