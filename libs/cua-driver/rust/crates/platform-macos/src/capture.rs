@@ -398,16 +398,23 @@ fn window_capture_configuration(
     includes_child_windows: bool,
     frame: screencapturekit::cg::CGRect,
 ) -> screencapturekit::prelude::SCStreamConfiguration {
+    // Child composition crops in display points; a standalone window crops
+    // relative to its own origin. Using the display origin for both modes
+    // cuts off the top/left of standalone captures and adds empty margins.
+    let source_rect = if includes_child_windows {
+        frame
+    } else {
+        screencapturekit::cg::CGRect::new(0.0, 0.0, frame.size.width, frame.size.height)
+    };
     screencapturekit::prelude::SCStreamConfiguration::new()
         .with_width(width)
         .with_height(height)
         .with_includes_child_windows(includes_child_windows)
         // An unconstrained child composition fits the union of host, popup
         // and shadows into the output, shifting every coordinate while the
-        // bitmap dimensions remain unchanged. SCK sourceRect uses DISPLAY
-        // logical points, not window-local points. Clip to the exact frame
+        // bitmap dimensions remain unchanged. Clip to the exact window extent
         // used by AX and input calibration, keeping child pixels inside it.
-        .with_source_rect(frame)
+        .with_source_rect(source_rect)
         .with_ignores_shadows_single_window(true)
 }
 
@@ -948,15 +955,20 @@ mod tests {
 
     #[test]
     fn capture_configuration_keeps_exact_size_and_explicit_composition() {
-        // A nonzero/negative origin catches accidental window-local cropping,
-        // including windows on a display to the left of the primary display.
+        // A nonzero/negative origin distinguishes the two crop coordinate
+        // spaces, including displays to the left of the primary display.
         let frame = screencapturekit::cg::CGRect::new(-1280.0, 36.0, 370.0, 182.0);
         for include_children in [true, false] {
             let config = window_capture_configuration(740, 364, include_children, frame);
             assert_eq!(config.width(), 740);
             assert_eq!(config.height(), 364);
             assert_eq!(config.includes_child_windows(), include_children);
-            assert_eq!(config.source_rect(), frame);
+            let expected = if include_children {
+                frame
+            } else {
+                screencapturekit::cg::CGRect::new(0.0, 0.0, 370.0, 182.0)
+            };
+            assert_eq!(config.source_rect(), expected);
             assert!(config.ignores_shadows_single_window());
         }
     }
