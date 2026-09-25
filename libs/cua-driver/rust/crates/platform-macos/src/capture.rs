@@ -558,9 +558,13 @@ fn window_frame_status(
         }
         let attachments = CFArray::<CFType>::wrap_under_get_rule(raw);
         let first = attachments.get(0)?;
-        let dictionary = first.downcast::<CFDictionary<CFString, CFType>>()?;
+        let dictionary = first.downcast::<CFDictionary>()?;
         let key = CFString::wrap_under_get_rule(SCStreamFrameInfoStatus);
-        let value = dictionary.find(&key)?;
+        let value = dictionary.find(key.as_CFTypeRef())?;
+        if value.is_null() {
+            return None;
+        }
+        let value = CFType::wrap_under_get_rule(*value);
         frame_status_from_attachment(&value)
     }
 }
