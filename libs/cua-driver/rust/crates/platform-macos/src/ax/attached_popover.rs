@@ -3,7 +3,10 @@
 //! A control can name either the AXPopover (Calendar/Pages) or the host (Keynote)
 //! as AXWindow. Its physical window ID must match the actual AXPopover, which
 //! must remain in its reciprocal AXParent chain and name the exact host.
-//! Keep that physical window identity intact for pointer and keyboard routing.
+//! Native popup-button menus may omit AXWindow and report the popover's ID,
+//! while WindowServer displays a separate menu surface. Prove their reciprocal
+//! control ancestry and visible menu geometry; this only authorizes AX actions.
+//! Keep physical window identities intact for pointer and keyboard routing.
 
 use super::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess,
@@ -38,6 +41,10 @@ pub(crate) fn native_text_role(role: Option<&str>) -> bool {
     matches!(role, Some("AXTextField" | "AXTextArea"))
 }
 
+fn native_menu_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXMenu" | "AXMenuItem"))
+}
+
 fn container_role(role: &str) -> bool {
     matches!(
         role,
@@ -55,6 +62,73 @@ trait PopoverTree {
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn within_budget(&self) -> bool;
+    fn visible_menu_window(&self, node: &Self::Node, pid: i32) -> Option<u32>;
+}
+
+struct MenuPath<N> {
+    control: N,
+    nodes: Vec<N>,
+    windows: Vec<(N, u32)>,
+}
+
+/// Only a live menu/submenu chain ending at one native popup button. Neither
+/// menu-bar items nor an application root are a substitute for that control.
+fn menu_control<T: PopoverTree>(
+    tree: &T,
+    pid: i32,
+    element: &T::Node,
+) -> Result<MenuPath<T::Node>, &'static str> {
+    let mut current = element.clone();
+    let mut nodes = Vec::new();
+    let mut windows = Vec::new();
+    for _ in 0..MAX_DEPTH {
+        if !tree.within_budget() || tree.owner(&current) != Some(pid) {
+            return Err("menu_owner_or_deadline");
+        }
+        if nodes.iter().any(|node| tree.same(node, &current)) {
+            return Err("menu_cycle");
+        }
+        let role = tree.role(&current).ok_or("menu_role_missing")?;
+        if !native_menu_role(Some(&role)) {
+            return Err("menu_role_unexpected");
+        }
+        if role == "AXMenu" {
+            let window = tree
+                .visible_menu_window(&current, pid)
+                .ok_or("menu_not_visible")?;
+            windows.push((current.clone(), window));
+        }
+        let parent = tree.parent(&current).ok_or("menu_parent_missing")?;
+        if !tree.contains_child(&parent, &current) {
+            return Err("menu_child_relation_missing");
+        }
+        nodes.push(current);
+        match (role.as_str(), tree.role(&parent).as_deref()) {
+            ("AXMenu", Some("AXPopUpButton")) if tree.owner(&parent) == Some(pid) => {
+                return Ok(MenuPath {
+                    control: parent,
+                    nodes,
+                    windows,
+                });
+            }
+            ("AXMenu", Some("AXMenuItem")) | ("AXMenuItem", Some("AXMenu")) => {
+                current = parent;
+            }
+            _ => return Err("menu_control_boundary"),
+        }
+    }
+    Err("menu_depth_limit")
+}
+
+fn same_menu_path<T: PopoverTree>(tree: &T, a: &MenuPath<T::Node>, b: &MenuPath<T::Node>) -> bool {
+    tree.same(&a.control, &b.control)
+        && a.nodes.len() == b.nodes.len()
+        && a.nodes.iter().zip(&b.nodes).all(|(a, b)| tree.same(a, b))
+        && a.windows.len() == b.windows.len()
+        && a.windows
+            .iter()
+            .zip(&b.windows)
+            .all(|((a, aw), (b, bw))| aw == bw && tree.same(a, b))
 }
 
 fn prove<T: PopoverTree>(tree: &T, pid: i32, host_id: u32, element: &T::Node) -> bool {
@@ -113,14 +187,20 @@ fn prove_checked<T: PopoverTree>(
     // button's AXWindow can name the popover or the document host. That logical
     // attribute does not replace the button's independently read physical ID.
     let is_popover_root = tree.role(element).as_deref() == Some("AXPopover");
+    let menu_path = if native_menu_role(tree.role(element).as_deref()) {
+        Some(menu_control(tree, pid, element)?)
+    } else {
+        None
+    };
+    let control = menu_path.as_ref().map_or(element, |menu| &menu.control);
     let mut control_window = None;
     let popover = if is_popover_root {
         element.clone()
-    } else if native_control_role(tree.role(element).as_deref()) {
-        let window = tree.window(element).ok_or("element_window_missing")?;
+    } else if native_control_role(tree.role(control).as_deref()) {
+        let window = tree.window(control).ok_or("element_window_missing")?;
         let popover = match tree.role(&window).as_deref() {
             Some("AXPopover") => window.clone(),
-            Some("AXWindow") => containing_popover(tree, pid, element)?,
+            Some("AXWindow") => containing_popover(tree, pid, control)?,
             _ => return Err("element_window_not_popover"),
         };
         control_window = Some(window);
@@ -146,6 +226,7 @@ fn prove_checked<T: PopoverTree>(
     if let Some(window) = &control_window {
         if tree.owner(window) != Some(pid)
             || tree.window_id(element) != Some(popover_id)
+            || tree.window_id(control) != Some(popover_id)
             || !(tree.same(window, &popover) || tree.same(window, &host))
         {
             return Err("control_window_does_not_match_popover_or_host");
@@ -159,6 +240,13 @@ fn prove_checked<T: PopoverTree>(
     }
     if tree.window_id(&host) != Some(host_id) {
         return Err("host_window_id_mismatch");
+    }
+    if menu_path.as_ref().is_some_and(|path| {
+        path.nodes
+            .iter()
+            .any(|node| tree.window_id(node) != Some(popover_id))
+    }) {
+        return Err("menu_surface_mismatch");
     }
 
     let mut current = element.clone();
@@ -185,10 +273,11 @@ fn prove_checked<T: PopoverTree>(
                         && tree.role(element).as_deref() == Some("AXPopover")
                 } else {
                     control_window.as_ref().is_some_and(|window| {
-                        tree.window(element)
+                        tree.window(control)
                             .is_some_and(|node| tree.same(&node, window))
                             && tree.owner(window) == Some(pid)
                             && tree.window_id(element) == Some(popover_id)
+                            && tree.window_id(control) == Some(popover_id)
                             && (tree.same(window, &popover) || tree.same(window, &host))
                             && matches!(
                                 tree.role(window).as_deref(),
@@ -196,6 +285,15 @@ fn prove_checked<T: PopoverTree>(
                             )
                     })
                 }
+                && menu_path.as_ref().is_none_or(|path| {
+                    menu_control(tree, pid, element).is_ok_and(|current| {
+                        same_menu_path(tree, path, &current)
+                            && current
+                                .nodes
+                                .iter()
+                                .all(|node| tree.window_id(node) == Some(popover_id))
+                    })
+                })
                 && tree.role(&popover).as_deref() == Some("AXPopover")
                 && tree
                     .window(&popover)
@@ -208,6 +306,8 @@ fn prove_checked<T: PopoverTree>(
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
             }
+            Some(role)
+                if menu_path.is_some() && native_menu_role(Some(role)) && !crossed_popover => {}
             Some(role) if native_control_role(Some(role)) || container_role(role) => {}
             // A different top-level window, nested popover, web subtree or
             // application root cannot be treated as an attachment to this host.
@@ -239,6 +339,9 @@ pub(crate) fn advertised_action(
 ) -> Option<&'static str> {
     let native = match (role, action) {
         (Some("AXPopover"), "cancel") => "AXCancel",
+        (Some("AXMenu" | "AXMenuItem"), "cancel") => "AXCancel",
+        (Some("AXMenuItem"), "press" | "click") => "AXPress",
+        (Some("AXMenuItem"), "pick") => "AXPick",
         (
             Some("AXButton" | "AXPopUpButton" | "AXCheckBox" | "AXRadioButton"),
             "press" | "click",
@@ -334,6 +437,44 @@ impl PopoverTree for NativeTree {
     fn within_budget(&self) -> bool {
         Instant::now() < self.deadline
     }
+    fn visible_menu_window(&self, node: &AxNode, pid: i32) -> Option<u32> {
+        if !self.within_budget() {
+            return None;
+        }
+        let frame = unsafe { super::bindings::element_screen_rect(node.0) }?;
+        let window = match_menu_window(
+            pid,
+            &frame,
+            &crate::windows::all_windows_including_accessory_layers(),
+        )?;
+        self.within_budget().then_some(window)
+    }
+}
+
+/// A menu's inherited AX window ID is not its rendered surface. Require a
+/// unique current popup-level WindowServer frame owned by this process.
+fn match_menu_window(
+    pid: i32,
+    frame: &[f64; 4],
+    windows: &[crate::windows::WindowInfo],
+) -> Option<u32> {
+    if frame.iter().any(|v| !v.is_finite()) || frame[2] <= 0.0 || frame[3] <= 0.0 {
+        return None;
+    }
+    let mut matching = windows.iter().filter(|window| {
+        let b = &window.bounds;
+        window.pid == pid
+            && window.window_id != 0
+            && window.layer == 101
+            && window.is_on_screen
+            && window.on_current_space != Some(false)
+            && frame
+                .iter()
+                .zip([b.x, b.y, b.width, b.height])
+                .all(|(a, b)| b.is_finite() && (a - b).abs() <= 0.5)
+    });
+    let window = matching.next()?.window_id;
+    matching.next().is_none().then_some(window)
 }
 
 fn requires_host_attachment(
@@ -342,7 +483,7 @@ fn requires_host_attachment(
     host_id: u32,
     parent_window: impl FnOnce() -> Option<u32>,
 ) -> bool {
-    (role == Some("AXPopover") || native_control_role(role))
+    (role == Some("AXPopover") || native_control_role(role) || native_menu_role(role))
         && physical_window.is_some_and(|id| id != host_id)
         && parent_window() != Some(host_id)
 }
@@ -409,6 +550,9 @@ mod tests {
         budget: Cell<usize>,
         reattach: bool,
         popup_window_reads: Cell<usize>,
+        menu_windows: HashMap<u32, u32>,
+        menu_window_reads: Cell<usize>,
+        replace_menu_window: bool,
     }
     impl PopoverTree for Tree {
         type Node = u32;
@@ -449,6 +593,13 @@ mod tests {
             let remaining = self.budget.get();
             self.budget.set(remaining.saturating_sub(1));
             remaining > 0
+        }
+        fn visible_menu_window(&self, node: &u32, _pid: i32) -> Option<u32> {
+            let reads = self.menu_window_reads.get();
+            self.menu_window_reads.set(reads + 1);
+            self.menu_windows
+                .get(node)
+                .map(|window| window + u32::from(self.replace_menu_window && reads > 0))
         }
     }
     fn pages() -> Tree {
@@ -491,11 +642,226 @@ mod tests {
             budget: Cell::new(100),
             reattach: false,
             popup_window_reads: Cell::new(0),
+            menu_windows: HashMap::new(),
+            menu_window_reads: Cell::new(0),
+            replace_menu_window: false,
         }
     }
     #[test]
     fn pages_swatch_crosses_its_attached_popover_to_exact_host() {
         assert!(prove(&pages(), 42, 700, &0));
+    }
+
+    fn calendar_menu() -> Tree {
+        // Native T022 evidence: the menu and its item omit AXWindow and report
+        // the popover's physical ID; AXParent reciprocally reaches the popup
+        // button, then AXPopover, then the exact document host.
+        let mut tree = pages();
+        let button = tree.nodes.get_mut(&0).unwrap();
+        button.role = "AXPopUpButton";
+        button.window = Some(6);
+        button.parent = Some(2);
+        button.children = vec![7];
+        tree.nodes.get_mut(&2).unwrap().children = vec![0];
+        tree.menu_windows.insert(7, 1700);
+        for (identity, role, parent, children) in
+            [(7, "AXMenu", 0, vec![8]), (8, "AXMenuItem", 7, vec![])]
+        {
+            tree.nodes.insert(
+                identity,
+                Node {
+                    identity,
+                    role,
+                    owner: 42,
+                    window: None,
+                    id: Some(900),
+                    parent: Some(parent),
+                    children,
+                },
+            );
+        }
+        tree
+    }
+
+    #[test]
+    fn calendar_live_menu_item_and_cancel_root_prove_their_exact_attached_popover() {
+        for element in [7, 8] {
+            assert!(
+                prove(&calendar_menu(), 42, 700, &element),
+                "element {element}"
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_menu_classification_never_treats_it_as_a_host_pointer() {
+        for role in ["AXMenu", "AXMenuItem"] {
+            assert!(requires_host_attachment(Some(role), Some(900), 700, || {
+                Some(900)
+            }));
+            assert!(!requires_host_attachment(
+                Some(role),
+                Some(700),
+                700,
+                || Some(700)
+            ));
+        }
+    }
+
+    #[test]
+    fn calendar_menu_actions_are_only_the_requested_advertised_semantics() {
+        assert_eq!(
+            advertised_action(Some("AXMenuItem"), "pick", &["AXPick".into()]),
+            Some("AXPick")
+        );
+        assert_eq!(
+            advertised_action(Some("AXMenuItem"), "press", &["AXPress".into()]),
+            Some("AXPress")
+        );
+        assert_eq!(
+            advertised_action(Some("AXMenu"), "cancel", &["AXCancel".into()]),
+            Some("AXCancel")
+        );
+        assert_eq!(
+            advertised_action(Some("AXMenu"), "press", &["AXPress".into()]),
+            None
+        );
+        assert_eq!(
+            advertised_action(Some("AXMenuItem"), "press", &["AXPick".into()]),
+            None
+        );
+        assert_eq!(
+            advertised_action(Some("AXMenuItem"), "unknown", &["AXPress".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn calendar_menu_refuses_a_closed_foreign_or_reparented_item() {
+        for broken_parent in [0, 2, 7] {
+            let mut tree = calendar_menu();
+            tree.nodes.get_mut(&broken_parent).unwrap().children.clear();
+            assert!(
+                !prove(&tree, 42, 700, &8),
+                "missing reciprocal edge {broken_parent}"
+            );
+        }
+        for foreign in [0, 2, 7, 8] {
+            let mut tree = calendar_menu();
+            tree.nodes.get_mut(&foreign).unwrap().owner = 99;
+            assert!(!prove(&tree, 42, 700, &8), "foreign node {foreign}");
+        }
+        for mismatched in [0, 7, 8] {
+            let mut tree = calendar_menu();
+            tree.nodes.get_mut(&mismatched).unwrap().id = Some(901);
+            assert!(!prove(&tree, 42, 700, &8), "different surface {mismatched}");
+        }
+        let mut tree = calendar_menu();
+        tree.nodes.get_mut(&0).unwrap().role = "AXWebArea";
+        assert!(!prove(&tree, 42, 700, &8));
+        let mut tree = calendar_menu();
+        tree.reattach = true;
+        assert!(!prove(&tree, 42, 700, &8));
+        let tree = calendar_menu();
+        tree.budget.set(0);
+        assert!(!prove(&tree, 42, 700, &8));
+    }
+
+    #[test]
+    fn calendar_menu_requires_a_current_stable_visible_surface() {
+        let mut tree = calendar_menu();
+        tree.menu_windows.clear();
+        assert!(
+            !prove(&tree, 42, 700, &8),
+            "a retained AX menu alone is not an open menu"
+        );
+        let mut tree = calendar_menu();
+        tree.replace_menu_window = true;
+        assert!(
+            !prove(&tree, 42, 700, &8),
+            "replacement menu surface must be re-observed"
+        );
+    }
+
+    #[test]
+    fn calendar_submenu_keeps_the_same_control_and_checks_each_visible_menu() {
+        let mut tree = calendar_menu();
+        tree.nodes.get_mut(&8).unwrap().children = vec![9];
+        for (identity, role, parent, children) in
+            [(9, "AXMenu", 8, vec![10]), (10, "AXMenuItem", 9, vec![])]
+        {
+            tree.nodes.insert(
+                identity,
+                Node {
+                    identity,
+                    role,
+                    owner: 42,
+                    window: None,
+                    id: Some(900),
+                    parent: Some(parent),
+                    children,
+                },
+            );
+        }
+        tree.menu_windows.insert(9, 1701);
+        assert!(prove(&tree, 42, 700, &10));
+        tree.menu_windows.remove(&7);
+        assert!(
+            !prove(&tree, 42, 700, &10),
+            "closed parent menu invalidates the submenu"
+        );
+    }
+
+    #[test]
+    fn visible_menu_frame_excludes_stale_foreign_hidden_and_ambiguous_windows() {
+        use crate::windows::{WindowBounds, WindowInfo};
+        let frame = [1035.0, 699.0, 116.0, 153.0];
+        let candidate = WindowInfo {
+            window_id: 104749,
+            pid: 42,
+            app_name: String::new(),
+            title: String::new(),
+            bounds: WindowBounds {
+                x: frame[0],
+                y: frame[1],
+                width: frame[2],
+                height: frame[3],
+            },
+            layer: 101,
+            z_index: 0,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: Some(true),
+            space_ids: None,
+        };
+        assert_eq!(
+            match_menu_window(42, &frame, &[candidate.clone()]),
+            Some(104749)
+        );
+        assert_eq!(match_menu_window(42, &frame, &[]), None);
+        assert_eq!(
+            match_menu_window(42, &frame, &[candidate.clone(), candidate.clone()]),
+            None
+        );
+        for mutation in 0..6 {
+            let mut invalid = candidate.clone();
+            match mutation {
+                0 => invalid.pid = 99,
+                1 => invalid.layer = 0,
+                2 => invalid.is_on_screen = false,
+                3 => invalid.on_current_space = Some(false),
+                4 => invalid.bounds.x += 1.0,
+                _ => invalid.window_id = 0,
+            }
+            assert_eq!(
+                match_menu_window(42, &frame, &[invalid]),
+                None,
+                "mutation {mutation}"
+            );
+        }
+        for invalid in [[f64::NAN, 699.0, 116.0, 153.0], [1035.0, 699.0, 0.0, 153.0]] {
+            assert_eq!(match_menu_window(42, &invalid, &[candidate.clone()]), None);
+        }
     }
     #[test]
     fn calendar_fields_and_choices_keep_their_attached_popover_identity() {
