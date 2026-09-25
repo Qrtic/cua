@@ -110,12 +110,35 @@ impl BackgroundOrderGuard {
     pub(crate) fn capture_before_reopen(target_pid: i32, windows: &[WindowInfo],
                                         target_was_hidden: bool) -> Option<Self> {
         let activity = crate::foreground_activity::ordering_snapshot();
-        if !activity.activity.reliable { return None; }
-        let pid = crate::apps::frontmost_pid()?;
-        if pid <= 0 || pid == target_pid { return None; }
-        let window = focused_window(pid)?;
+        if !activity.activity.reliable {
+            tracing::debug!(target: "cua_window_order", target_pid, target_was_hidden,
+                reason="monitor_unreliable", "Window ordering capture unavailable");
+            return None;
+        }
+        let Some(pid) = crate::apps::frontmost_pid() else {
+            tracing::debug!(target: "cua_window_order", target_pid, target_was_hidden,
+                reason="foreground_pid_unavailable", "Window ordering capture unavailable");
+            return None;
+        };
+        if pid <= 0 || pid == target_pid {
+            tracing::debug!(target: "cua_window_order", pid, target_pid, target_was_hidden,
+                reason="target_already_foreground_or_invalid", "Window ordering capture unavailable");
+            return None;
+        }
+        let Some(window) = focused_window(pid) else {
+            tracing::debug!(target: "cua_window_order", pid, target_pid, target_was_hidden,
+                reason="foreground_ax_window_unavailable", "Window ordering capture unavailable");
+            return None;
+        };
         let candidates = eligible_before_reopen(windows, pid, window, target_pid, target_was_hidden);
-        if candidates.is_empty() { return None; }
+        if candidates.is_empty() {
+            let target_windows: Vec<_> = windows.iter().filter(|w| w.pid == target_pid)
+                .map(|w| (w.window_id, w.is_on_screen, w.on_current_space, w.z_index, w.bounds.clone())).collect();
+            tracing::debug!(target: "cua_window_order", pid, window, target_pid, target_was_hidden,
+                foreground_window_present=exact_visible(windows, pid, window).is_some(),
+                ?target_windows, reason="no_eligible_preexisting_window", "Window ordering capture unavailable");
+            return None;
+        }
         let started = Instant::now();
         let result = Self { pid, window, target_pid, candidates,
             generation: activity.activity.generation, non_motion_generation: activity.non_motion_generation,

@@ -436,6 +436,9 @@ fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
     -> Option<(i32, crate::background_order::BackgroundOrderGuard)>
 {
     use objc2_app_kit::NSRunningApplication;
+    tracing::debug!(target: "cua_window_order", ?pids, creates_new_instance,
+        bundle_identity_available=expected_bundle_id.is_some(),
+        "Checking pre-reopen window-order admission");
     let pid = existing_reopen_pid(pids, creates_new_instance)?;
     let expected = expected_bundle_id?;
     let hidden = unsafe {
@@ -446,7 +449,11 @@ fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
         app.isHidden()
     };
     let before = crate::windows::all_windows_with_space_snapshot();
-    if !before.succeeded { return None; }
+    if !before.succeeded {
+        tracing::debug!(target: "cua_window_order", pid, hidden,
+            reason="window_enumeration_unavailable", "Reopen ordering capture unavailable");
+        return None;
+    }
     let ordering = crate::background_order::BackgroundOrderGuard::capture_before_reopen(
         pid, &before.windows, hidden,
     )?;
