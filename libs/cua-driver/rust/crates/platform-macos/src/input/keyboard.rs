@@ -951,11 +951,13 @@ fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
     flags
 }
 
-pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
+// Action tools also use this pure lookup before resolving or activating a
+// target. Unsupported keys must not change focus before being rejected.
+pub(crate) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
     let code = match key.to_lowercase().as_str() {
         "return" | "enter" => 36,
         "tab" => 48,
-        "space" => 49,
+        "space" | " " => 49,
         "delete" | "backspace" => 51,
         "escape" | "esc" => 53,
         "command" | "cmd" => 55,
@@ -1039,6 +1041,16 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn key_name_validation_maps_literal_space_to_the_space_key() {
+        assert_eq!(
+            super::key_name_to_code(" ").unwrap(),
+            super::key_name_to_code("Space").unwrap()
+        );
+        assert!(super::key_name_to_code("  ").is_err());
+        assert!(super::key_name_to_code("not-a-key").is_err());
+    }
+
     #[test]
     fn window_return_refusal_posts_neither_transition() {
         let events = std::cell::RefCell::new(Vec::new());

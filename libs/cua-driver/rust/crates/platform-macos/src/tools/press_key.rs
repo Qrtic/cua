@@ -81,6 +81,16 @@ fn display_key_chord(key: &str, modifiers: &[String]) -> String {
     }
 }
 
+fn invalid_key_name(error: anyhow::Error) -> ToolResult {
+    ToolResult::error(format!("press_key.key is not supported: {error}")).with_structured(
+        serde_json::json!({
+            "code": "invalid_arguments",
+            "effect": "refused",
+            "retryable": false
+        }),
+    )
+}
+
 fn validate_post_target(pid: i32) -> anyhow::Result<()> {
     if pid <= 0 {
         anyhow::bail!("target pid {pid} is invalid");
@@ -268,6 +278,9 @@ impl Tool for PressKeyTool {
                 Err(result) => return result,
             };
             let key = input.key;
+            if let Err(error) = crate::input::keyboard::key_name_to_code(&key) {
+                return invalid_key_name(error);
+            }
             let modifiers = input.modifiers.unwrap_or_default();
             let key_for_input = key.clone();
             let result = crate::foreground_activity::spawn_blocking(move || {
@@ -295,6 +308,16 @@ impl Tool for PressKeyTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        // Keep the existing app-targeted plus/Shift remapping, but validate
+        // before any target lookup, AX focus write, or foreground activation.
+        let validation_key = if key_raw == "+" || key_raw == "plus" {
+            "="
+        } else {
+            key_raw.as_str()
+        };
+        if let Err(error) = crate::input::keyboard::key_name_to_code(validation_key) {
+            return invalid_key_name(error);
+        }
         let mut modifiers: Vec<String> = args.str_array("modifiers");
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
@@ -907,6 +930,23 @@ impl Tool for PressKeyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn key_name_validation_rejects_unknown_before_target_resolution() {
+        let tool = PressKeyTool::new(Arc::new(ToolState::default()));
+        for args in [
+            serde_json::json!({"scope": "desktop", "key": "not-a-key"}),
+            serde_json::json!({"pid": -1, "window_id": 0, "key": "not-a-key"}),
+            serde_json::json!({"pid": -1, "window_id": 0, "delivery_mode": "foreground", "key": "not-a-key"}),
+        ] {
+            let result = tool.invoke(args).await;
+            assert_eq!(result.is_error, Some(true));
+            let detail = result.structured_content.expect("typed argument refusal");
+            assert_eq!(detail["code"], "invalid_arguments");
+            assert_eq!(detail["effect"], "refused");
+            assert_eq!(detail["retryable"], false);
+        }
+    }
 
     #[test]
     fn delivery_outcome_mapper_distinguishes_confirmed_unverifiable_and_failed() {
