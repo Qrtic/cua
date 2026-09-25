@@ -377,6 +377,10 @@ pub fn background_input_capability_report(
             "pid": target.pid,
             "window_id": target.window_id,
         },
+        "visibility": {
+            "app_hidden": facts.app_hidden,
+            "window_minimized": facts.target_minimized,
+        },
         "routes": [
             route_entry("accessibility", BackgroundAction::AxSemantic),
             route_entry("window_pointer", BackgroundAction::WindowPointer),
@@ -850,5 +854,28 @@ mod tests {
             refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY
         );
         assert_eq!(report["observation"]["one_shot_capture"], "unknown");
+    }
+
+    #[test]
+    fn visibility_report_distinguishes_hidden_minimized_and_unknown_without_unlocking_input() {
+        for (hidden, minimized) in [
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+            (None, Some(false)),
+            (Some(false), None),
+        ] {
+            let facts = BackgroundTargetFacts {
+                app_hidden: hidden,
+                target_minimized: minimized,
+                ..matched_facts()
+            };
+            let report = background_input_capability_report(TARGET, &facts, None);
+            assert_eq!(report["visibility"]["app_hidden"], json!(hidden));
+            assert_eq!(report["visibility"]["window_minimized"], json!(minimized));
+            for route in &report["routes"].as_array().unwrap()[1..] {
+                assert_eq!(route["status"], "refused");
+                assert_eq!(route["reason"], refusal_codes::MINIMIZED_OR_HIDDEN);
+            }
+        }
     }
 }
