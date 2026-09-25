@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use super::bindings::{
     ax_get_window_id, copy_children, copy_string_attr, kAXErrorAttributeUnsupported,
-    kAXErrorFailure, kAXErrorNoValue, try_copy_ax_windows, try_copy_element_attr,
+    kAXErrorCannotComplete, kAXErrorFailure, kAXErrorNoValue, try_copy_ax_windows, try_copy_element_attr,
     AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
 };
 
@@ -558,22 +558,68 @@ pub(crate) fn resolve_app_context(
     pid: i32,
     expected: &ExpectedAppIdentity,
 ) -> Result<ResolvedAppContext, AppContextResolveError> {
-    let identity = running_app_identity(pid).ok_or(AppContextResolveError::ProcessNotFound)?;
-    if !process_identity_matches(expected, &identity) {
-        return Err(AppContextResolveError::ProcessIdentityMismatch {
-            actual: Some(identity),
-        });
+    resolve_app_context_with_read_policy(pid, expected, false)
+}
+
+/// Initial, unpinned observations may absorb one wholly busy AX response.
+/// Action revalidation and subsequent observation consistency checks retain
+/// the single-attempt resolver above. No input is sent or replayed here.
+pub(crate) fn resolve_app_context_for_observation(
+    pid: i32,
+    expected: &ExpectedAppIdentity,
+) -> Result<ResolvedAppContext, AppContextResolveError> {
+    resolve_app_context_with_read_policy(pid, expected, true)
+}
+
+fn select_context_with_busy_recovery(
+    pid: i32,
+    expected: &ExpectedAppIdentity,
+    allow_busy_retry: bool,
+    mut read_identity: impl FnMut() -> Option<RunningAppIdentity>,
+    mut read_snapshot: impl FnMut() -> AppContextSnapshot,
+) -> Result<(RunningAppIdentity, AppContextSnapshot, AppContextSelection), AppContextResolveError> {
+    // Each AX attribute already has a 200 ms messaging timeout. Retry at
+    // most one collection, only when all three selection sources explicitly
+    // returned CannotComplete (e.g. Calc completing an import). Empty windows,
+    // unsupported attributes, incomplete trees and other errors are not busy
+    // evidence. There is no fixed sleep and no healthy-path extra read.
+    for attempt in 0..=usize::from(allow_busy_retry) {
+        let identity = read_identity().ok_or(AppContextResolveError::ProcessNotFound)?;
+        if !process_identity_matches(expected, &identity) {
+            return Err(AppContextResolveError::ProcessIdentityMismatch {
+                actual: Some(identity),
+            });
+        }
+        let snapshot = read_snapshot();
+        match select_app_context_window(&snapshot) {
+            Ok(selection) => return Ok((identity, snapshot, selection)),
+            Err(error) => {
+                let retry = allow_busy_retry
+                    && attempt == 0
+                    && snapshot.focused == AxWindowEvidence::Failed(kAXErrorCannotComplete)
+                    && snapshot.main == AxWindowEvidence::Failed(kAXErrorCannotComplete)
+                    && snapshot.windows == AxWindowsEvidence::Failed(kAXErrorCannotComplete);
+                tracing::debug!(target: "cua_app_context", pid, attempt, retry,
+                    reason = error.as_str(), ?snapshot, "AX app-context selection unavailable");
+                if !retry {
+                    return Err(AppContextResolveError::Selection(error));
+                }
+            }
+        }
     }
-    let snapshot = collect_app_context_snapshot(pid);
-    let selection = select_app_context_window(&snapshot).map_err(|error| {
-        // Preserve native attribute error codes for transient AX failures.
-        // The snapshot contains status/window IDs, never document text. This
-        // is diagnostic evidence only; selection and input authority do not
-        // change, and no failed action is replayed.
-        tracing::debug!(target: "cua_app_context", pid,
-            reason = error.as_str(), ?snapshot, "AX app-context selection unavailable");
-        AppContextResolveError::Selection(error)
-    })?;
+    unreachable!("the final collection cannot request another retry")
+}
+
+fn resolve_app_context_with_read_policy(
+    pid: i32,
+    expected: &ExpectedAppIdentity,
+    allow_busy_retry: bool,
+) -> Result<ResolvedAppContext, AppContextResolveError> {
+    let (identity, snapshot, selection) = select_context_with_busy_recovery(
+        pid, expected, allow_busy_retry,
+        || running_app_identity(pid),
+        || collect_app_context_snapshot(pid),
+    )?;
     let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
     if !enumeration.succeeded {
         return Err(AppContextResolveError::WindowServerUnavailable);
@@ -1283,6 +1329,184 @@ impl ResolvedAppContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn busy_identity() -> RunningAppIdentity {
+        RunningAppIdentity {
+            bundle_id: Some("com.example.editor".into()),
+            app_name: Some("Editor".into()),
+        }
+    }
+
+    fn busy_expected_identity() -> ExpectedAppIdentity {
+        ExpectedAppIdentity {
+            bundle_id: Some("com.example.editor".into()),
+            app_name: None,
+        }
+    }
+
+    fn wholly_busy_context() -> AppContextSnapshot {
+        AppContextSnapshot {
+            focused: AxWindowEvidence::Failed(kAXErrorCannotComplete),
+            main: AxWindowEvidence::Failed(kAXErrorCannotComplete),
+            windows: AxWindowsEvidence::Failed(kAXErrorCannotComplete),
+        }
+    }
+
+    fn settled_context(window_id: u32) -> AppContextSnapshot {
+        AppContextSnapshot {
+            focused: AxWindowEvidence::Resolved(window_id),
+            main: AxWindowEvidence::NotQueried,
+            windows: AxWindowsEvidence::NotQueried,
+        }
+    }
+
+    #[test]
+    fn initial_observation_absorbs_one_busy_collection_without_reusing_old_evidence() {
+        let mut snapshots = [wholly_busy_context(), settled_context(77)].into_iter();
+        let mut identity_reads = 0;
+        let mut snapshot_reads = 0;
+        let (_, snapshot, selection) = select_context_with_busy_recovery(
+            42,
+            &busy_expected_identity(),
+            true,
+            || {
+                identity_reads += 1;
+                Some(busy_identity())
+            },
+            || {
+                snapshot_reads += 1;
+                snapshots.next().unwrap()
+            },
+        )
+        .unwrap();
+        assert_eq!((identity_reads, snapshot_reads), (2, 2));
+        assert_eq!(snapshot, settled_context(77));
+        assert_eq!(selection.window_id, 77);
+    }
+
+    #[test]
+    fn busy_observation_recovery_stops_after_one_retry() {
+        let mut snapshot_reads = 0;
+        let result = select_context_with_busy_recovery(
+            42,
+            &busy_expected_identity(),
+            true,
+            || Some(busy_identity()),
+            || {
+                snapshot_reads += 1;
+                wholly_busy_context()
+            },
+        );
+        assert_eq!(snapshot_reads, 2);
+        assert_eq!(
+            result.unwrap_err(),
+            AppContextResolveError::Selection(AppContextSelectionError::AxWindowsUnavailable)
+        );
+    }
+
+    #[test]
+    fn healthy_context_and_action_revalidation_do_not_add_retry_reads() {
+        for (allow_retry, snapshot) in [(true, settled_context(77)), (false, wholly_busy_context())] {
+            let mut snapshot_reads = 0;
+            let result = select_context_with_busy_recovery(
+                42,
+                &busy_expected_identity(),
+                allow_retry,
+                || Some(busy_identity()),
+                || {
+                    snapshot_reads += 1;
+                    snapshot.clone()
+                },
+            );
+            assert_eq!(snapshot_reads, 1);
+            assert_eq!(result.is_ok(), allow_retry);
+        }
+    }
+
+    #[test]
+    fn empty_incomplete_and_other_failed_contexts_do_not_trigger_busy_recovery() {
+        for snapshot in [
+            AppContextSnapshot {
+                focused: AxWindowEvidence::NoValue,
+                main: AxWindowEvidence::NoValue,
+                windows: available(&[]),
+            },
+            AppContextSnapshot {
+                focused: AxWindowEvidence::Unsupported,
+                main: AxWindowEvidence::Unsupported,
+                windows: AxWindowsEvidence::Unsupported,
+            },
+            AppContextSnapshot {
+                focused: AxWindowEvidence::Failed(kAXErrorFailure),
+                main: AxWindowEvidence::Failed(kAXErrorFailure),
+                windows: AxWindowsEvidence::Failed(kAXErrorFailure),
+            },
+            AppContextSnapshot {
+                focused: AxWindowEvidence::NoValue,
+                main: AxWindowEvidence::NoValue,
+                windows: AxWindowsEvidence::Available {
+                    window_ids: vec![Some(77)],
+                    complete: false,
+                },
+            },
+            AppContextSnapshot {
+                focused: AxWindowEvidence::NoValue,
+                main: AxWindowEvidence::NoValue,
+                windows: available(&[None]),
+            },
+            AppContextSnapshot {
+                focused: AxWindowEvidence::NoValue,
+                main: AxWindowEvidence::Failed(kAXErrorCannotComplete),
+                windows: AxWindowsEvidence::Failed(kAXErrorCannotComplete),
+            },
+        ] {
+            let mut snapshot_reads = 0;
+            let result = select_context_with_busy_recovery(
+                42,
+                &busy_expected_identity(),
+                true,
+                || Some(busy_identity()),
+                || {
+                    snapshot_reads += 1;
+                    snapshot.clone()
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(snapshot_reads, 1);
+        }
+    }
+
+    #[test]
+    fn process_identity_change_or_exit_prevents_the_retry_read() {
+        for replacement in [
+            None,
+            Some(RunningAppIdentity {
+                bundle_id: Some("com.example.other".into()),
+                app_name: Some("Other".into()),
+            }),
+        ] {
+            let mut identities = [Some(busy_identity()), replacement.clone()].into_iter();
+            let mut snapshot_reads = 0;
+            let result = select_context_with_busy_recovery(
+                42,
+                &busy_expected_identity(),
+                true,
+                || identities.next().unwrap(),
+                || {
+                    snapshot_reads += 1;
+                    wholly_busy_context()
+                },
+            );
+            assert_eq!(snapshot_reads, 1);
+            assert_eq!(
+                result.unwrap_err(),
+                match replacement {
+                    None => AppContextResolveError::ProcessNotFound,
+                    actual => AppContextResolveError::ProcessIdentityMismatch { actual },
+                }
+            );
+        }
+    }
 
     fn available(ids: &[Option<u32>]) -> AxWindowsEvidence {
         AxWindowsEvidence::Available {

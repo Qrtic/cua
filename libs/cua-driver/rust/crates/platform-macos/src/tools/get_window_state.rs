@@ -794,7 +794,7 @@ impl Tool for GetWindowStateTool {
                 };
                 let expected_for_resolution = expected.clone();
                 let resolution = crate::foreground_activity::spawn_blocking(move || {
-                    crate::ax::app_context::resolve_app_context(
+                    crate::ax::app_context::resolve_app_context_for_observation(
                         requested_pid,
                         &expected_for_resolution,
                     )
