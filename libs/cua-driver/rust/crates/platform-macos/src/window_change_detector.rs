@@ -370,11 +370,21 @@ impl Snapshot {
     }
 
     fn detect_report(&mut self, timeout: Duration, poll_interval: Duration) -> Changes {
+        self.detect_report_with_wait(timeout, poll_interval, std::thread::sleep)
+    }
+
+    fn detect_report_with_wait(
+        &mut self,
+        timeout: Duration,
+        poll_interval: Duration,
+        mut wait: impl FnMut(Duration),
+    ) -> Changes {
         let deadline = Instant::now() + timeout;
         let mut first_change = None;
         loop {
-            std::thread::sleep(poll_interval);
-
+            // The action has completed before entering this loop. Inspect and
+            // restore an already-raised background window immediately; wait
+            // only between later samples for an asynchronous AppKit change.
             let current: Vec<WindowInfo> = windows::visible_windows()
                 .into_iter()
                 .filter(|w| w.layer == 0)
@@ -432,6 +442,7 @@ impl Snapshot {
             if Instant::now() >= deadline {
                 return first_change.unwrap_or_else(Changes::no_change);
             }
+            wait(poll_interval);
         }
     }
 
@@ -524,6 +535,30 @@ mod tests {
         snapshot.detect_input_async().await;
         assert!(checks.load(Ordering::Relaxed) > 0,
             "the response poll must retain ordering protection until its deferred handoff");
+    }
+
+    #[test]
+    fn completed_action_checks_order_before_its_first_wait() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let mut snapshot = Snapshot {
+            window_ids: HashSet::new(),
+            front_pid: None,
+            _lease: None,
+            hold_targeted_lease_until_deadline: false,
+            suppression_scope: SuppressionScope::Target(-2),
+            ordering: Some(crate::background_order::BackgroundOrderGuard::observing_checks(
+                Arc::clone(&checks),
+            )),
+        };
+        // The action has already completed. Even a zero-length reporting
+        // window must inspect its effects once before any polling delay. The
+        // production wait is injected so this assertion needs no timing race.
+        snapshot.detect_report_with_wait(Duration::ZERO, DEFAULT_POLL_INTERVAL, |_| {
+            panic!("do not delay the first ordering check after a completed action")
+        });
+        assert!(checks.load(Ordering::Relaxed) > 0);
     }
 
     fn win(id: u32, pid: i32, app: &str, title: &str) -> WindowInfo {
