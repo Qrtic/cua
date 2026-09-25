@@ -118,11 +118,15 @@ impl BackgroundOrderGuard {
             observed_checks: Some(checks) }
     }
 
-    /// The action may have returned before AppKit attaches and raises its
-    /// sheet. Keep checking only within the owning suppression lease; neither
+    pub(crate) fn limit_deadline(&mut self, deadline: Instant) {
+        self.expires_at = self.expires_at.min(deadline);
+    }
+
+    /// AppKit may raise its document during a blocking AX call or after the
+    /// action returns. Check only within the owning suppression lease; neither
     /// this guard nor its polling callback creates or extends that lease.
     pub(crate) fn poll(&mut self, deadline: Instant) -> bool {
-        self.expires_at = self.expires_at.min(deadline);
+        self.limit_deadline(deadline);
         if self.attempted || Instant::now() >= self.expires_at { return false; }
         let latest = crate::windows::visible_windows_with_space_snapshot();
         if !latest.succeeded { return false; }
@@ -224,6 +228,21 @@ mod tests {
             bounds: WindowBounds { x: 0.0, y: 0.0, width: 600.0, height: 400.0 },
             layer: 0, is_on_screen: true, current_space_id: Some(1),
             on_current_space: Some(true), space_ids: Some(vec![1]) }
+    }
+
+    #[test]
+    fn capture_deadline_is_clamped_before_any_report_or_async_poll() {
+        let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut guard = BackgroundOrderGuard::observing_checks(checks);
+        let original = guard.expires_at;
+        guard.limit_deadline(original + Duration::from_secs(30));
+        assert_eq!(guard.expires_at, original);
+        let expired = Instant::now();
+        guard.limit_deadline(expired);
+        guard.limit_deadline(original);
+        assert_eq!(guard.expires_at, expired);
+        assert!(!guard.current());
+        assert!(!guard.poll(original));
     }
 
     #[test]

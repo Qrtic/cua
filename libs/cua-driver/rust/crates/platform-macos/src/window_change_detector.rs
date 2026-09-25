@@ -37,6 +37,7 @@
 //! suppression lease and window-order guard for the original bounded protection window.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::apps;
@@ -82,7 +83,7 @@ pub struct Snapshot {
     _lease: Option<SuppressionLease>,
     hold_targeted_lease_until_deadline: bool,
     suppression_scope: SuppressionScope,
-    ordering: Option<crate::background_order::BackgroundOrderGuard>,
+    ordering: Option<Arc<Mutex<crate::background_order::BackgroundOrderGuard>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +249,7 @@ impl WindowChangeDetector {
         // Arm the requested suppression scope for the snapshot → detect
         // window. If there's no frontmost (rare — screensaver/login window),
         // skip the lease; foreground-change tracking still runs.
-        let lease = effective_front.and_then(|restore_to| match suppression_scope {
+        let mut lease = effective_front.and_then(|restore_to| match suppression_scope {
             SuppressionScope::None => None,
             SuppressionScope::Target(target_pid) => Some(focus_steal::begin_suppression(
                 Some(target_pid),
@@ -274,10 +275,23 @@ impl WindowChangeDetector {
         // the user changes foreground and the later target activation restores
         // a stale app.
         let visible = windows::visible_windows();
-        let ordering = match suppression_scope {
-            SuppressionScope::Target(pid) => crate::background_order::BackgroundOrderGuard::capture(pid, &visible),
+        let ordering = match (suppression_scope, lease.as_ref().and_then(SuppressionLease::targeted_deadline)) {
+            (SuppressionScope::Target(pid), Some(deadline)) =>
+                crate::background_order::BackgroundOrderGuard::capture(pid, &visible).map(|mut guard| {
+                    guard.limit_deadline(deadline);
+                    Arc::new(Mutex::new(guard))
+                }),
             _ => None,
         };
+        // An AX call may raise the host before returning. Cover that interval
+        // with the same guard used by reporting and the returned-action tail.
+        // The lease owns cancellation, deadline and one polling task throughout.
+        if let (Some(lease), Some(ordering)) = (lease.as_mut(), ordering.as_ref()) {
+            let ordering = Arc::clone(ordering);
+            lease.start_polling(move |deadline| {
+                ordering.lock().map(|mut guard| guard.poll(deadline)).unwrap_or(false)
+            });
+        }
         let window_ids: HashSet<u32> = visible
             .into_iter()
             .filter(|w| w.layer == 0)
@@ -351,8 +365,10 @@ impl Snapshot {
             let changes = snapshot.detect_report(timeout, DEFAULT_POLL_INTERVAL);
             let ordering = snapshot.ordering.take();
             if let Some(lease) = lease {
-                if let Some(mut ordering) = ordering {
-                    lease.defer_release_with_poll(protection_deadline, move |deadline| ordering.poll(deadline));
+                if let Some(ordering) = ordering {
+                    lease.defer_release_with_poll(protection_deadline, move |deadline| {
+                        ordering.lock().map(|mut guard| guard.poll(deadline)).unwrap_or(false)
+                    });
                 } else {
                     lease.defer_release(protection_deadline);
                 }
@@ -390,8 +406,10 @@ impl Snapshot {
                 .filter(|w| w.layer == 0)
                 .collect();
             let current_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
-            if let Some(ordering) = self.ordering.as_mut() {
-                ordering.restore_if_crossed(&current);
+            if let Some(ordering) = self.ordering.as_ref() {
+                if let Ok(mut guard) = ordering.lock() {
+                    guard.restore_if_crossed(&current);
+                }
             }
 
             let new_windows: Vec<WindowEvent> = current
@@ -528,9 +546,9 @@ mod tests {
             _lease: None,
             hold_targeted_lease_until_deadline: false,
             suppression_scope: SuppressionScope::Target(-2),
-            ordering: Some(crate::background_order::BackgroundOrderGuard::observing_checks(
+            ordering: Some(Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(
                 Arc::clone(&checks),
-            )),
+            )))),
         };
         snapshot.detect_input_async().await;
         assert!(checks.load(Ordering::Relaxed) > 0,
@@ -548,9 +566,9 @@ mod tests {
             _lease: None,
             hold_targeted_lease_until_deadline: false,
             suppression_scope: SuppressionScope::Target(-2),
-            ordering: Some(crate::background_order::BackgroundOrderGuard::observing_checks(
+            ordering: Some(Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(
                 Arc::clone(&checks),
-            )),
+            )))),
         };
         // The action has already completed. Even a zero-length reporting
         // window must inspect its effects once before any polling delay. The

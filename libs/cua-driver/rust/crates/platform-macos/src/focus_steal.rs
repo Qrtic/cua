@@ -159,6 +159,7 @@ impl FocusStealPreventer {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
             released: false,
+            poll_task: None,
         }
     }
 
@@ -183,6 +184,7 @@ impl FocusStealPreventer {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
             released: false,
+            poll_task: None,
         }
     }
 
@@ -236,6 +238,8 @@ pub struct SuppressionLease {
     handle: SuppressionHandle,
     dispatcher: Arc<Dispatcher>,
     released: bool,
+    // This task borrows the entry's authority; it must never own or extend it.
+    poll_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SuppressionLease {
@@ -256,6 +260,10 @@ impl SuppressionLease {
         self.released = true;
     }
 
+    pub(crate) fn targeted_deadline(&self) -> Option<Instant> {
+        self.dispatcher.with_current_targeted(self.handle, |deadline| deadline)
+    }
+
     /// Keep a returned action's target-only protection off its response path.
     /// The original five-second cap still applies. No runtime, a non-targeted
     /// entry, or an already elapsed deadline falls back to normal immediate
@@ -273,43 +281,59 @@ impl SuppressionLease {
         });
     }
 
-    /// Retain a bounded background cleanup alongside the same cancellable
-    /// lease. Polling must not hold the tool response open. The callback runs
-    /// off the async executor and under the entry lock, so an intentional
-    /// foreground action cannot cancel this tail and then receive stale work.
-    /// Returning false stops polling while retaining ordinary focus protection
-    /// for the remainder of its original deadline.
-    pub(crate) fn defer_release_with_poll(
-        self,
-        deadline: Instant,
+    /// Cover the action itself, including an AX call that blocks while AppKit
+    /// raises its document. The same single callback survives the response
+    /// handoff; it never recaptures the foreground or renews the entry deadline.
+    /// Entry removal serializes with each callback. Aborting a task alone would
+    /// not stop a spawn_blocking callback which had already begun.
+    pub(crate) fn start_polling(
+        &mut self,
         mut poll: impl FnMut(Instant) -> bool + Send + 'static,
-    ) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
-        let Some(deadline) = self.dispatcher.mark_deferred(self.handle, deadline) else { return };
-        runtime.spawn(async move {
-            let mut lease = self;
+    ) -> bool {
+        if self.poll_task.is_some() { return false; }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return false };
+        let Some(mut deadline) = self.targeted_deadline() else {
+            return false;
+        };
+        let mut dispatcher = Arc::clone(&self.dispatcher);
+        let handle = self.handle;
+        tracing::debug!(target: "cua_window_order", lease=%handle.0,
+            remaining_ms=deadline.saturating_duration_since(Instant::now()).as_millis() as u64,
+            "Started ordering protection during the active action");
+        self.poll_task = Some(runtime.spawn(async move {
             loop {
                 let next = (Instant::now() + Duration::from_millis(100)).min(deadline);
                 tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
                 if Instant::now() >= deadline { break; }
                 let result = tokio::task::spawn_blocking(move || {
-                    let keep_polling = lease.dispatcher.with_current_deferred(lease.handle, &mut poll);
-                    (lease, poll, keep_polling)
+                    let keep_polling = dispatcher.with_current_targeted(handle, |current_deadline| {
+                        (poll(current_deadline), current_deadline)
+                    });
+                    (dispatcher, poll, keep_polling)
                 }).await;
-                let Ok((returned_lease, returned_poll, keep_polling)) = result else { return };
-                lease = returned_lease;
+                let Ok((returned_dispatcher, returned_poll, keep_polling)) = result else { return };
+                dispatcher = returned_dispatcher;
                 poll = returned_poll;
                 match keep_polling {
-                    Some(true) => {},
-                    Some(false) => {
-                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-                        break;
-                    },
-                    None => return,
+                    Some((true, current_deadline)) => deadline = deadline.min(current_deadline),
+                    Some((false, _)) | None => return,
                 }
             }
-            drop(lease);
-        });
+        }));
+        true
+    }
+
+    /// Retain the same polling task and focus lease off the response path.
+    /// If capture ran without an async runtime, this starts its only poll here.
+    /// Returning false from the callback leaves ordinary focus protection alive
+    /// until the original deadline; a second callback is never substituted.
+    pub(crate) fn defer_release_with_poll(
+        mut self,
+        deadline: Instant,
+        poll: impl FnMut(Instant) -> bool + Send + 'static,
+    ) {
+        self.start_polling(poll);
+        self.defer_release(deadline);
     }
 }
 
@@ -317,6 +341,9 @@ impl Drop for SuppressionLease {
     fn drop(&mut self) {
         if !self.released {
             self.dispatcher.remove(self.handle);
+        }
+        if let Some(task) = self.poll_task.take() {
+            task.abort();
         }
     }
 }
@@ -338,10 +365,10 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
-    fn with_current_deferred<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant) -> T) -> Option<T> {
+    fn with_current_targeted<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant) -> T) -> Option<T> {
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(&handle.0)?;
-        if !entry.returned_tail || entry.target_pid.is_none() || entry.deadline <= Instant::now() {
+        if entry.target_pid.is_none() || entry.deadline <= Instant::now() {
             return None;
         }
         Some(poll(entry.deadline))
@@ -905,6 +932,7 @@ mod tests {
             handle,
             dispatcher: Arc::clone(&d),
             released: false,
+            poll_task: None,
         };
         let lease = lease.narrow_to(42, "test.launch_post").unwrap();
         assert_eq!(lease.handle, handle);
@@ -972,6 +1000,7 @@ mod tests {
             handle: h,
             dispatcher: Arc::clone(&d),
             released: false,
+            poll_task: None,
         };
         assert_eq!(d.len(), 1);
         drop(lease);
@@ -987,6 +1016,7 @@ mod tests {
             handle: h,
             dispatcher: Arc::clone(&d),
             released: false,
+            poll_task: None,
         };
         lease.release();
         assert_eq!(d.len(), 0);
@@ -1113,6 +1143,7 @@ mod tests {
             handle,
             dispatcher: Arc::clone(d),
             released: false,
+            poll_task: None,
         }
     }
 
@@ -1289,19 +1320,139 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_poll_rejects_active_cancelled_and_expired_entries() {
+    fn active_action_ordering_poll_is_eligible_before_return() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.active_ordering");
+        let original = d.entries.lock().unwrap()[&h.0].deadline;
+        assert_eq!(d.with_current_targeted(h, |deadline| deadline), Some(original),
+            "an in-flight background action needs ordering protection before its response");
+    }
+
+    #[tokio::test]
+    async fn active_poll_runs_before_handoff_and_keeps_the_original_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.active_handoff");
+        let deadline = d.entries.lock().unwrap()[&h.0].deadline;
+        let mut lease = private_lease(&d, h);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&calls);
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (third_tx, third_rx) = tokio::sync::oneshot::channel();
+        let mut first_tx = Some(first_tx);
+        let mut third_tx = Some(third_tx);
+        assert!(lease.start_polling(move |observed_deadline| {
+            assert_eq!(observed_deadline, deadline);
+            match submitted.fetch_add(1, Ordering::SeqCst) + 1 {
+                1 => { first_tx.take().unwrap().send(()).unwrap(); },
+                3 => { third_tx.take().unwrap().send(()).unwrap(); return false; },
+                _ => {},
+            }
+            true
+        }));
+        tokio::time::timeout(Duration::from_secs(2), first_rx).await.unwrap().unwrap();
+        assert!(!d.entries.lock().unwrap()[&h.0].returned_tail,
+            "the first ordering check must precede the response handoff");
+        lease.defer_release_with_poll(deadline + Duration::from_secs(30), |_| {
+            panic!("handoff must not replace or duplicate the existing guard")
+        });
+        tokio::time::timeout(Duration::from_secs(2), third_rx).await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(d.entries.lock().unwrap()[&h.0].deadline, deadline);
+        assert!(d.entries.lock().unwrap()[&h.0].returned_tail);
+        d.cancel_deferred(42);
+    }
+
+    #[tokio::test]
+    async fn dropping_active_lease_prevents_its_first_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.active_drop");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&calls);
+        let mut lease = private_lease(&d, h);
+        assert!(lease.start_polling(move |_| {
+            submitted.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn active_lease_drop_serializes_with_an_inflight_blocking_poll() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.active_drop_serialization");
+        let mut lease = private_lease(&d, h);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut entered_tx = Some(entered_tx);
+        let dispatcher = Arc::clone(&d);
+        assert!(lease.start_polling(move |_| {
+            assert!(dispatcher.entries.try_lock().is_err());
+            entered_tx.take().unwrap().send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            false
+        }));
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        let (dropping_tx, dropping_rx) = tokio::sync::oneshot::channel();
+        let mut dropping = tokio::task::spawn_blocking(move || {
+            dropping_tx.send(()).unwrap();
+            drop(lease);
+        });
+        dropping_rx.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut dropping).await.is_err(),
+            "Drop must not return while an authorized callback can still act");
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dropping).await.unwrap().unwrap();
+        assert_eq!(d.len(), 0);
+        assert_eq!(d.with_current_targeted(h, |_| panic!("removed lease")), None::<()>);
+    }
+
+    #[tokio::test]
+    async fn active_poll_does_not_outlive_its_original_deadline() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.active_expiry");
+        d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline =
+            Instant::now() + Duration::from_millis(20);
+        let mut lease = private_lease(&d, h);
+        assert!(lease.start_polling(|_| panic!("first poll would exceed original deadline")));
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        assert!(lease.poll_task.as_ref().unwrap().is_finished());
+        assert!(lease.targeted_deadline().is_none());
+        drop(lease);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn active_poll_without_runtime_does_not_drop_its_lease() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.active_no_runtime");
+        let mut lease = private_lease(&d, h);
+        assert!(!lease.start_polling(|_| panic!("no runtime")));
+        assert_eq!(d.len(), 1);
+        assert!(!d.entries.lock().unwrap()[&h.0].returned_tail);
+        drop(lease);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn cleanup_poll_requires_a_live_targeted_entry() {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.poll_lifecycle");
-        assert_eq!(d.with_current_deferred(h, |_| panic!("not a returned tail")), None::<()>);
+        let wildcard = d.add(None, 7, "test.wildcard_poll");
+        assert_eq!(d.with_current_targeted(wildcard, |_| panic!("wildcard has no ordering authority")), None::<()>);
         d.mark_deferred(h, Instant::now() + Duration::from_secs(1));
-        assert_eq!(d.with_current_deferred(h, |deadline| {
+        assert_eq!(d.with_current_targeted(h, |deadline| {
             assert!(deadline > Instant::now());
             9
         }), Some(9));
         d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline = Instant::now();
-        assert_eq!(d.with_current_deferred(h, |_| panic!("expired tail")), None::<()>);
+        assert_eq!(d.with_current_targeted(h, |_| panic!("expired tail")), None::<()>);
         d.cancel_deferred(42);
-        assert_eq!(d.with_current_deferred(h, |_| panic!("cancelled tail")), None::<()>);
+        assert_eq!(d.with_current_targeted(h, |_| panic!("cancelled tail")), None::<()>);
     }
 
     #[test]
