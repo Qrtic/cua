@@ -15,6 +15,8 @@ pub mod ax;
 #[cfg(target_os = "macos")]
 mod background_mutation;
 #[cfg(target_os = "macos")]
+mod background_order;
+#[cfg(target_os = "macos")]
 pub mod browser;
 #[cfg(target_os = "macos")]
 pub mod capture;

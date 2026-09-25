@@ -82,6 +82,7 @@ pub struct Snapshot {
     _lease: Option<SuppressionLease>,
     hold_targeted_lease_until_deadline: bool,
     suppression_scope: SuppressionScope,
+    ordering: Option<crate::background_order::BackgroundOrderGuard>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,7 +273,12 @@ impl WindowChangeDetector {
         // can be comparatively slow; arming first avoids a large gap in which
         // the user changes foreground and the later target activation restores
         // a stale app.
-        let window_ids: HashSet<u32> = windows::visible_windows()
+        let visible = windows::visible_windows();
+        let ordering = match suppression_scope {
+            SuppressionScope::Target(pid) => crate::background_order::BackgroundOrderGuard::capture(pid, &visible),
+            _ => None,
+        };
+        let window_ids: HashSet<u32> = visible
             .into_iter()
             .filter(|w| w.layer == 0)
             .map(|w| w.window_id)
@@ -286,6 +292,7 @@ impl WindowChangeDetector {
             _lease: lease,
             hold_targeted_lease_until_deadline,
             suppression_scope,
+            ordering,
         }
     }
 }
@@ -347,7 +354,7 @@ impl Snapshot {
 
     /// Same as `detect()` but with configurable timing — exposed for
     /// tests / callers that want a tighter or looser poll window.
-    pub fn detect_with(self, timeout: Duration, poll_interval: Duration) -> Changes {
+    pub fn detect_with(mut self, timeout: Duration, poll_interval: Duration) -> Changes {
         let deadline = Instant::now() + timeout;
         loop {
             std::thread::sleep(poll_interval);
@@ -357,6 +364,9 @@ impl Snapshot {
                 .filter(|w| w.layer == 0)
                 .collect();
             let current_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
+            if let Some(ordering) = self.ordering.as_mut() {
+                ordering.restore_if_crossed(&current);
+            }
 
             let new_windows: Vec<WindowEvent> = current
                 .iter()
