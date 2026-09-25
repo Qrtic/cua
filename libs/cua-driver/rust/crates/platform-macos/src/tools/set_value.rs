@@ -335,6 +335,9 @@ impl Tool for SetValueTool {
                 if let Some(response) = outcome.native_response {
                     structured["native_ax_response"] = response.json();
                 }
+                if outcome.editor_rebound {
+                    structured["native_text_editor_rebound"] = serde_json::json!(true);
+                }
                 if ax_echo_surface {
                     structured["escalation"] = serde_json::json!({
                         "recommended": "px",
@@ -372,6 +375,7 @@ struct SetValueOutcome {
     /// write was a no-op. Lets callers distinguish "idempotent" from "applied".
     changed: Option<bool>,
     native_response: Option<NativeValueResponse>,
+    editor_rebound: bool,
 }
 
 /// A native response is separate from the value read back on the same control.
@@ -421,10 +425,13 @@ trait NativeValueField {
     fn focus(&self) -> i32;
     fn value(&self) -> Option<String>;
     fn set_value(&self, value: &str) -> i32;
+    fn editor_rebound(&self) -> bool {
+        false
+    }
 }
 
 struct LiveNativeTextField {
-    element_ptr: usize,
+    editor: crate::ax::native_text_editor::NativeTextEditor,
     pid: i32,
     window_id: u32,
     attached: bool,
@@ -439,11 +446,11 @@ impl NativeValueField for LiveNativeTextField {
         use cua_driver_core::background_input::{
             decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
         };
-        let element = self.element_ptr as AXUIElementRef;
+        let element = self.editor.ptr() as AXUIElementRef;
         let facts = crate::ax::exact_target::gather_background_facts(
             self.pid,
             self.window_id,
-            Some(self.element_ptr),
+            Some(self.editor.ptr()),
         );
         let action = if self.attached {
             BackgroundAction::AttachedPopoverSemantic
@@ -477,32 +484,32 @@ impl NativeValueField for LiveNativeTextField {
     }
 
     fn focused(&self) -> Option<bool> {
-        unsafe {
-            crate::ax::bindings::copy_bool_attr(self.element_ptr as AXUIElementRef, "AXFocused")
-        }
+        self.editor.focused()
+    }
+
+    fn editor_rebound(&self) -> bool {
+        self.editor.rebound()
     }
 
     fn focus_settable(&self) -> bool {
         unsafe {
             crate::ax::bindings::is_attribute_settable(
-                self.element_ptr as AXUIElementRef,
+                self.editor.ptr() as AXUIElementRef,
                 "AXFocused",
             )
         }
     }
 
     fn focus(&self) -> i32 {
-        unsafe {
-            crate::ax::bindings::set_bool_attr_true(self.element_ptr as AXUIElementRef, "AXFocused")
-        }
+        self.editor.focus()
     }
 
     fn value(&self) -> Option<String> {
-        unsafe { copy_string_attr(self.element_ptr as AXUIElementRef, "AXValue") }
+        unsafe { copy_string_attr(self.editor.ptr() as AXUIElementRef, "AXValue") }
     }
 
     fn set_value(&self, value: &str) -> i32 {
-        unsafe { set_string_attr(self.element_ptr as AXUIElementRef, "AXValue", value) }
+        unsafe { set_string_attr(self.editor.ptr() as AXUIElementRef, "AXValue", value) }
     }
 }
 
@@ -520,11 +527,11 @@ impl NativeValueField for LiveNativeDateField {
         use cua_driver_core::background_input::{
             decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
         };
-        let element = self.base.element_ptr as AXUIElementRef;
+        let element = self.base.editor.ptr() as AXUIElementRef;
         let facts = crate::ax::exact_target::gather_background_facts(
             self.base.pid,
             self.base.window_id,
-            Some(self.base.element_ptr),
+            Some(self.base.editor.ptr()),
         );
         let action = if self.base.attached {
             BackgroundAction::AttachedPopoverSemantic
@@ -565,14 +572,14 @@ impl NativeValueField for LiveNativeDateField {
         self.base.focus()
     }
     fn value(&self) -> Option<String> {
-        unsafe { crate::ax::date_value::copy(self.base.element_ptr as AXUIElementRef) }
+        unsafe { crate::ax::date_value::copy(self.base.editor.ptr() as AXUIElementRef) }
             .and_then(crate::ax::date_value::format)
     }
     fn set_value(&self, _value: &str) -> i32 {
         // Parsed before focus or mutation; never coerce an arbitrary string.
         unsafe {
             crate::ax::date_value::set(
-                self.base.element_ptr as AXUIElementRef,
+                self.base.editor.ptr() as AXUIElementRef,
                 self.requested_absolute_time,
             )
         }
@@ -595,7 +602,11 @@ fn set_native_date_value(
     write_native_value(
         &LiveNativeDateField {
             base: LiveNativeTextField {
-                element_ptr,
+                editor: unsafe {
+                    crate::ax::native_text_editor::NativeTextEditor::new(
+                        element_ptr, pid, window_id, false,
+                    )
+                },
                 pid,
                 window_id,
                 attached,
@@ -638,7 +649,11 @@ fn set_native_text_value(
 ) -> anyhow::Result<SetValueOutcome> {
     write_native_value(
         &LiveNativeTextField {
-            element_ptr,
+            editor: unsafe {
+                crate::ax::native_text_editor::NativeTextEditor::new(
+                    element_ptr, pid, window_id, !attached,
+                )
+            },
             pid,
             window_id,
             attached,
@@ -705,6 +720,7 @@ fn write_native_value(
         verified,
         changed,
         native_response,
+        editor_rebound: field.editor_rebound(),
     })
 }
 
@@ -748,6 +764,7 @@ fn set_value_blocking(
                 verified: None,
                 changed: None,
                 native_response: None,
+                editor_rebound: false,
             }
         })
     } else {
@@ -795,6 +812,7 @@ fn set_value_blocking(
                 verified,
                 changed,
                 native_response: None,
+                editor_rebound: false,
             })
         } else if let Some(target) = numeric_target {
             // Both direct writes failed for a numeric target — fall back to
@@ -810,6 +828,7 @@ fn set_value_blocking(
                     verified,
                     changed,
                     native_response: None,
+                    editor_rebound: false,
                 })
             } else {
                 anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
@@ -1604,6 +1623,7 @@ mod tests {
             verified: Some(true),
             changed: Some(true),
             native_response: None,
+            editor_rebound: false,
         };
         apply_surface_trust(&mut outcome, true);
         assert_eq!(outcome.verified, Some(false));
@@ -1618,6 +1638,7 @@ mod tests {
             verified: Some(true),
             changed: Some(true),
             native_response: None,
+            editor_rebound: false,
         };
         apply_surface_trust(&mut outcome, false);
         assert_eq!(outcome.verified, Some(true));
@@ -1632,6 +1653,7 @@ mod tests {
             verified: Some(false),
             changed: Some(false),
             native_response: None,
+            editor_rebound: false,
         };
         apply_verification_label(&mut outcome);
         assert_eq!(
