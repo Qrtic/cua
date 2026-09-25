@@ -654,7 +654,7 @@ fn write_native_value(
             anyhow::bail!("Native value editor is not focusable; no value write was sent");
         }
         let error = field.focus();
-        if error != kAXErrorSuccess || field.focused() != Some(true) {
+        if error != kAXErrorSuccess || !wait_for_native_editor(field)? {
             return Err(NativeValueResponse {
                 phase: "editor_focus",
                 native_error: (error != kAXErrorSuccess).then_some(error),
@@ -697,6 +697,25 @@ fn write_native_value(
         changed,
         native_response,
     })
+}
+
+/// AXFocused can return before AppKit installs the next field editor. Wait
+/// briefly for that one requested transition; never send the focus write a
+/// second time. Each read re-proves the target and observes cancellation.
+fn wait_for_native_editor(field: &impl NativeValueField) -> anyhow::Result<bool> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        field.validate()?;
+        if field.focused() == Some(true) {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
 }
 
 fn set_value_blocking(
@@ -1166,8 +1185,11 @@ mod tests {
 
     struct EditorField {
         focused: Cell<bool>,
+        delayed_focus_reads: Cell<usize>,
         focus_settable: bool,
         focus_sticks: bool,
+        focus_error: i32,
+        revoke_on_validation: Option<usize>,
         revoke_after_focus: bool,
         revoke_after_write: bool,
         write_error: i32,
@@ -1181,8 +1203,11 @@ mod tests {
         fn new() -> Self {
             Self {
                 focused: Cell::new(false),
+                delayed_focus_reads: Cell::new(0),
                 focus_settable: true,
                 focus_sticks: true,
+                focus_error: kAXErrorSuccess,
+                revoke_on_validation: None,
                 revoke_after_focus: false,
                 revoke_after_write: false,
                 write_error: kAXErrorSuccess,
@@ -1197,6 +1222,11 @@ mod tests {
     impl NativeValueField for EditorField {
         fn validate(&self) -> anyhow::Result<()> {
             self.calls.borrow_mut().push("validate");
+            if self.revoke_on_validation.is_some_and(|limit| {
+                self.calls.borrow().iter().filter(|call| **call == "validate").count() >= limit
+            }) {
+                anyhow::bail!("target revoked while waiting for its editor");
+            }
             if self.revoke_after_focus && self.focused.get() {
                 anyhow::bail!("popover detached after focus");
             }
@@ -1206,6 +1236,10 @@ mod tests {
             Ok(())
         }
         fn focused(&self) -> Option<bool> {
+            if self.focused.get() && self.delayed_focus_reads.get() > 0 {
+                self.delayed_focus_reads.set(self.delayed_focus_reads.get() - 1);
+                return Some(false);
+            }
             Some(self.focused.get())
         }
         fn focus_settable(&self) -> bool {
@@ -1214,7 +1248,7 @@ mod tests {
         fn focus(&self) -> i32 {
             self.calls.borrow_mut().push("focus");
             self.focused.set(self.focus_sticks);
-            kAXErrorSuccess
+            self.focus_error
         }
         fn value(&self) -> Option<String> {
             self.calls.borrow_mut().push("read");
@@ -1309,6 +1343,45 @@ mod tests {
         assert_eq!(response.phase, "editor_focus");
         assert!(!response.value_write_attempted);
         assert!(!field.calls.borrow().contains(&"write"));
+        assert_eq!(field.calls.borrow().iter().filter(|call| **call == "focus").count(), 1);
+    }
+
+    #[test]
+    fn native_value_waits_for_delayed_editor_without_replaying_input() {
+        let field = EditorField::new();
+        field.delayed_focus_reads.set(3);
+        let outcome = write_native_value(&field, 81, "new").unwrap();
+        assert_eq!(field.delayed_focus_reads.get(), 0);
+        assert_eq!(field.stored.borrow().as_str(), "new");
+        assert_eq!(outcome.verified, Some(true));
+        let calls = field.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);
+        assert_eq!(calls.iter().filter(|call| **call == "write").count(), 1);
+    }
+
+    #[test]
+    fn native_value_revocation_during_editor_wait_prevents_value_write() {
+        let mut field = EditorField::new();
+        field.delayed_focus_reads.set(10);
+        field.revoke_on_validation = Some(3);
+        assert!(write_native_value(&field, 81, "new").is_err());
+        let calls = field.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);
+        assert!(!calls.contains(&"write"));
+    }
+
+    #[test]
+    fn native_value_failed_focus_response_never_continues_to_value_write() {
+        let mut field = EditorField::new();
+        field.focus_error = crate::ax::bindings::kAXErrorCannotComplete;
+        let error = write_native_value(&field, 81, "new").err().unwrap();
+        let response = error.downcast_ref::<NativeValueResponse>().unwrap();
+        assert_eq!(response.phase, "editor_focus");
+        assert_eq!(response.native_error, Some(crate::ax::bindings::kAXErrorCannotComplete));
+        assert!(!response.value_write_attempted);
+        let calls = field.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);
+        assert!(!calls.contains(&"write"));
     }
 
     #[test]
