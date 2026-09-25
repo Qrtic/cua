@@ -127,9 +127,29 @@ impl BackgroundOrderGuard {
 
     fn current(&self) -> bool {
         let activity = crate::foreground_activity::snapshot();
-        Instant::now() < self.expires_at && unchanged_context(activity.reliable, activity.generation, self.generation,
-            crate::apps::frontmost_pid(), focused_window(self.pid),
-            self.pid, self.window, self.started.elapsed())
+        if Instant::now() >= self.expires_at {
+            tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
+                target_pid=self.target_pid, "Window ordering guard deadline expired");
+            return false;
+        }
+        let front_pid = crate::apps::frontmost_pid();
+        let focused = focused_window(self.pid);
+        let elapsed = self.started.elapsed();
+        let valid = unchanged_context(activity.reliable, activity.generation, self.generation,
+            front_pid, focused, self.pid, self.window, elapsed);
+        if !valid {
+            // Log the same evidence that vetoed this check. An untagged event
+            // is not proof of human input, and a second observation must not
+            // replace the generation or window identity used for admission.
+            tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
+                target_pid=self.target_pid, monitor_reliable=activity.reliable,
+                original_generation=self.generation, current_generation=activity.generation,
+                current_front_pid=?front_pid, current_focused_window=?focused,
+                elapsed_ms=elapsed.as_millis(),
+                activity_diagnostic=?crate::foreground_activity::diagnostic_state(),
+                "Window ordering guard veto evidence");
+        }
+        valid
     }
 
     /// One cleanup attempt at most. Unlike focus restoration this must never
