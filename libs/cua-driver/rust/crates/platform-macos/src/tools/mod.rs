@@ -1593,6 +1593,7 @@ pub struct ToolState {
     /// the stable host pid/window while explicit foreground keyboard actions
     /// reach the transient that was actually shown to the model.
     pub(crate) transient_ui_registry: Arc<crate::transient_ui::TransientUiRegistry>,
+    pub(crate) menu_context_registry: Arc<crate::ax::menu_context::MenuContextRegistry>,
     /// A successful host-app observation may prove that AppKit delegated its
     /// current Open/Save panel to Apple's XPC service. The registry keeps that
     /// exact session-scoped host→panel relationship so actions can address the
@@ -1639,6 +1640,7 @@ impl ToolState {
             zoom_registry: Arc::new(ZoomRegistry::new()),
             resize_registry: Arc::new(ResizeRegistry::new()),
             transient_ui_registry: Arc::new(crate::transient_ui::TransientUiRegistry::new()),
+            menu_context_registry: crate::ax::menu_context::MenuContextRegistry::new(),
             app_context_delegation_registry: Arc::new(
                 crate::ax::app_context::AppContextDelegationRegistry::new(),
             ),
@@ -2175,6 +2177,10 @@ pub fn register_all(
             crate::foreground_activity::stop_runtime_segments(&runtime_scope);
         });
     }
+    {
+        let menu_context_registry = state.menu_context_registry.clone();
+        registry.retain_runtime_cleanup(move || menu_context_registry.clear_all());
+    }
     registry.register(Box::new(foreground_segment::BeginForegroundSegmentTool));
     registry.register(Box::new(foreground_segment::EndForegroundSegmentTool));
     registry.register(crate::foreground_activity::guard_tool(Box::new(
@@ -2241,11 +2247,13 @@ pub fn register_all(
         let session_config = state.session_config.clone();
         let cursor_registry = state.cursor_registry.clone();
         let transient_ui_registry = state.transient_ui_registry.clone();
+        let menu_context_registry = state.menu_context_registry.clone();
         let app_context_delegation_registry = state.app_context_delegation_registry.clone();
         let registration =
             cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
                 session_config.clear(session_id);
                 transient_ui_registry.clear_session(session_id);
+                menu_context_registry.clear_session(session_id);
                 app_context_delegation_registry.clear_session(session_id);
                 // Per-session agent cursor: the session_id is the cursor key when
                 // the caller gave no explicit cursor_id, so dropping it here both

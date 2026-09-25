@@ -18,6 +18,7 @@
 
 pub(crate) mod app_context;
 pub(crate) mod application_menu;
+pub(crate) mod menu_context;
 pub(crate) mod attached_popover;
 pub(crate) mod attached_sheet;
 pub mod bindings;

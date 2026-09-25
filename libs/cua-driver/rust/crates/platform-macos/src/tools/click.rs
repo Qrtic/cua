@@ -968,6 +968,11 @@ impl Tool for ClickTool {
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
             let ax_app_context_route = app_context_route.clone();
+            let menu_context_registry = self.state.menu_context_registry.clone();
+            let menu_context_owner = match &transient_session {
+                crate::transient_ui::TransientSessionKey::Session(owner) => Some(owner.clone()),
+                crate::transient_ui::TransientSessionKey::Anonymous => None,
+            };
             let result = focus_guard::with_focus_suppressed(
                 // The observation snapshot owns the canonical target-only
                 // lease; foreground delivery owns its activation.
@@ -1043,6 +1048,8 @@ impl Tool for ClickTool {
                                 wid,
                                 &action_clone,
                                 menu_requires_context,
+                                &menu_context_registry,
+                                menu_context_owner.as_deref(),
                             )
                             .map(|outcome| (outcome, false))
                         } else if background_popover {
@@ -1883,12 +1890,17 @@ fn perform_application_menu_click(
     window_id: u32,
     action: &str,
     prepare_context: bool,
+    registry: &std::sync::Arc<crate::ax::menu_context::MenuContextRegistry>,
+    owner: Option<&str>,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
     let element = element_ptr as AXUIElementRef;
-    let context = if prepare_context {
+    let existing = registry.take(owner, pid, window_id)?;
+    let context = if existing.is_some() {
+        existing
+    } else if prepare_context {
         if !unsafe { crate::ax::application_menu::menu_context_preparation_is_owned(pid, element, action) } {
             anyhow::bail!("application-menu preparation ancestry changed; no input was sent");
         }
@@ -1901,7 +1913,9 @@ fn perform_application_menu_click(
         crate::foreground_activity::check_request()?;
         let context = crate::input::skylight::begin_synthetic_target_focus(pid, window_id)?;
         context.make_window_key()?;
-        Some(context)
+        Some(crate::ax::menu_context::MenuContextLease::new(
+            context, owner.unwrap_or_default().to_owned(), pid, window_id,
+        ))
     } else {
         None
     };
@@ -1934,11 +1948,29 @@ fn perform_application_menu_click(
         Ok((format!("Performed {native} on observed application-menu element [{idx}]; verify the visible effect."),
             false, false, false, false))
     })();
-    // Restore only the synthetic belief inside this target, including error
-    // paths. Never send a resign/key event to the user's foreground process.
-    let cleanup = context.map(crate::input::skylight::end_synthetic_target_focus).transpose();
     let result = outcome?;
-    cleanup?;
+    // Menu-bar and submenu gestures start an interaction, not its completion.
+    // Keep only a freshly proven visible menu alive under the exact session,
+    // window and original two-minute deadline. Leaf commands and Cancel end it.
+    if let Some(context) = context {
+        let opens_menu = owner.is_some()
+            && !action.eq_ignore_ascii_case("cancel")
+            && unsafe { crate::ax::application_menu::menu_element_opens_submenu(pid, element) };
+        let mut visible = false;
+        if opens_menu {
+            for _ in 0..3 {
+                crate::foreground_activity::check_request()?;
+                visible = crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
+                if visible { break; }
+                std::thread::sleep(std::time::Duration::from_millis(35));
+            }
+        }
+        if visible {
+            registry.park(context)?;
+        } else {
+            crate::input::skylight::end_synthetic_target_focus(context.context)?;
+        }
+    }
     Ok(result)
 }
 

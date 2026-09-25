@@ -295,6 +295,30 @@ pub(crate) unsafe fn menu_context_preparation_is_owned(
         && proves_menu_ancestry(&tree, pid, &element)
 }
 
+/// Lifecycle classification only, not permission to dispatch. Leaf commands
+/// and cancellation end the retained menu context even if AX updates lag.
+pub(crate) unsafe fn menu_element_opens_submenu(pid: i32, element: AXUIElementRef) -> bool {
+    if element.is_null() { return false; }
+    let role = super::bindings::copy_string_attr(element, "AXRole").unwrap_or_default();
+    if role == "AXMenuBarItem" {
+        return true;
+    }
+    if role != "AXMenuItem" {
+        return false;
+    }
+    let Some(app) = AxNode::owned(AXUIElementCreateApplication(pid)) else {
+        return false;
+    };
+    let tree = NativeMenuTree {
+        app,
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(200)),
+    };
+    CFRetain(element as CFTypeRef);
+    let Some(node) = AxNode::owned(element) else { return false };
+    tree.children(&node).is_some_and(|children|
+        children.iter().any(|child| tree.role(child).as_deref() == Some("AXMenu")))
+}
+
 struct AxNode(AXUIElementRef);
 impl AxNode {
     unsafe fn owned(ptr: AXUIElementRef) -> Option<Self> {
