@@ -520,11 +520,56 @@ fn validate_window_capture_geometry(
     Ok(())
 }
 
+fn frame_status_from_attachment(
+    value: &core_foundation::base::CFType,
+) -> Option<screencapturekit::cm::SCFrameStatus> {
+    use core_foundation::number::CFNumber;
+    let raw = value.downcast::<CFNumber>()?.to_i64()?;
+    screencapturekit::cm::SCFrameStatus::from_raw(i32::try_from(raw).ok()?)
+}
+
+fn window_frame_status(
+    sample: &screencapturekit::cm::CMSampleBuffer,
+) -> Option<screencapturekit::cm::SCFrameStatus> {
+    use core_foundation::array::{CFArray, CFArrayRef};
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    #[link(name = "CoreMedia", kind = "framework")]
+    extern "C" {
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sample: *const std::ffi::c_void,
+            create_if_necessary: bool,
+        ) -> CFArrayRef;
+    }
+    #[link(name = "ScreenCaptureKit", kind = "framework")]
+    extern "C" {
+        static SCStreamFrameInfoStatus: CFStringRef;
+    }
+    // Apple's attachment is an NSNumber containing SCFrameStatus.rawValue.
+    // screencapturekit 6.0.1 casts the value to the Swift enum itself, which
+    // fails on actual macOS frames and silently drops the complete status.
+    // Read the typed number through the exported SDK key; never default an
+    // absent or malformed status to Complete.
+    unsafe {
+        let raw = CMSampleBufferGetSampleAttachmentsArray(sample.as_ptr(), false);
+        if raw.is_null() {
+            return None;
+        }
+        let attachments = CFArray::<CFType>::wrap_under_get_rule(raw);
+        let first = attachments.get(0)?;
+        let dictionary = first.downcast::<CFDictionary<CFString, CFType>>()?;
+        let key = CFString::wrap_under_get_rule(SCStreamFrameInfoStatus);
+        let value = dictionary.find(&key)?;
+        frame_status_from_attachment(&value)
+    }
+}
+
 fn capture_complete_window_frame(
     filter: &screencapturekit::prelude::SCContentFilter,
     config: &screencapturekit::prelude::SCStreamConfiguration,
 ) -> anyhow::Result<screencapturekit::cm::CMSampleBuffer> {
-    use screencapturekit::cm::{CMSampleBufferSCExt, SCFrameStatus};
+    use screencapturekit::cm::SCFrameStatus;
     use screencapturekit::prelude::{SCStream, SCStreamOutputType};
     let (sender, receiver) = mpsc::sync_channel(1);
     let first_frame = AtomicBool::new(false);
@@ -533,7 +578,7 @@ fn capture_complete_window_frame(
         .add_output_handler(
             move |sample: screencapturekit::cm::CMSampleBuffer, output_type| {
                 if output_type == SCStreamOutputType::Screen
-                    && sample.frame_status() == Some(SCFrameStatus::Complete)
+                    && window_frame_status(&sample) == Some(SCFrameStatus::Complete)
                     && !first_frame.swap(true, Ordering::AcqRel)
                 {
                     let _ = sender.try_send(sample);
@@ -755,9 +800,10 @@ fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow:
         output_width = plan.config.width(), output_height = plan.config.height(),
         "Capturing exact window with ScreenCaptureKit configuration");
     let sample = capture_complete_window_frame(&plan.filter, &plan.config)?;
-    let info = sample.frame_info().ok_or_else(|| {
+    let mut info = sample.frame_info().ok_or_else(|| {
         anyhow::anyhow!("ScreenCaptureKit omitted frame geometry for window {window_id}")
     })?;
+    info.frame_status = window_frame_status(&sample);
     let image = sample.cg_image().map_err(|error| {
         anyhow::anyhow!("ScreenCaptureKit frame image failed for window {window_id}: {error}")
     })?;
@@ -1077,6 +1123,47 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn frame_status_decodes_actual_numeric_attachment_values() {
+        use core_foundation::base::TCFType;
+        use core_foundation::number::CFNumber;
+        use screencapturekit::cm::SCFrameStatus;
+
+        for (raw, status) in [
+            (0_i64, SCFrameStatus::Complete),
+            (1, SCFrameStatus::Idle),
+            (2, SCFrameStatus::Blank),
+            (3, SCFrameStatus::Suspended),
+            (4, SCFrameStatus::Started),
+            (5, SCFrameStatus::Stopped),
+        ] {
+            let attachment = CFNumber::from(raw).as_CFType();
+            assert_eq!(frame_status_from_attachment(&attachment), Some(status));
+        }
+    }
+
+    #[test]
+    fn malformed_frame_status_cannot_be_treated_as_complete() {
+        use core_foundation::base::TCFType;
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::number::CFNumber;
+        use core_foundation::string::CFString;
+
+        for raw in [-1_i64, 6, i64::MIN, i64::MAX] {
+            assert_eq!(
+                frame_status_from_attachment(&CFNumber::from(raw).as_CFType()),
+                None
+            );
+        }
+        for attachment in [
+            CFString::new("0").as_CFType(),
+            CFBoolean::false_value().as_CFType(),
+            CFNumber::from(0.5_f64).as_CFType(),
+        ] {
+            assert_eq!(frame_status_from_attachment(&attachment), None);
+        }
+    }
 
     #[test]
     fn only_exact_standard_host_includes_child_composition() {
