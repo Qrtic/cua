@@ -178,6 +178,7 @@ fn is_scoped_action(tool_name: &str) -> bool {
             | "begin_foreground_segment"
             | "end_foreground_segment"
             | "prepare_dialog"
+            | "prepare_observation"
     )
 }
 
@@ -524,6 +525,43 @@ mod tests {
         assert_eq!(
             enforce_tool(
                 "prepare_dialog",
+                &json!({
+                    "session":window, "scope":"desktop", "foreground_segment_id":"fgs_test"
+                })
+            )
+            .unwrap_err()
+            .code,
+            "desktop_scope_disabled"
+        );
+    }
+
+    #[test]
+    fn rendering_preparation_cannot_escape_the_session_capture_scope() {
+        let window = fresh("rendering-window");
+        let desktop = fresh("rendering-desktop");
+        bind_session(&window, Some(CaptureScopePolicy::Window)).unwrap();
+        bind_session(&desktop, Some(CaptureScopePolicy::Desktop)).unwrap();
+        assert!(enforce_tool(
+            "prepare_observation",
+            &json!({
+                "session":window, "pid":42, "window_id":7, "foreground_segment_id":"fgs_test"
+            })
+        )
+        .is_ok());
+        assert_eq!(
+            enforce_tool(
+                "prepare_observation",
+                &json!({
+                    "session":desktop, "pid":42, "window_id":7, "foreground_segment_id":"fgs_test"
+                })
+            )
+            .unwrap_err()
+            .code,
+            "window_scope_disabled"
+        );
+        assert_eq!(
+            enforce_tool(
+                "prepare_observation",
                 &json!({
                     "session":window, "scope":"desktop", "foreground_segment_id":"fgs_test"
                 })

@@ -287,6 +287,7 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "begin_foreground_segment",
     "end_foreground_segment",
     "prepare_dialog",
+    "prepare_observation",
 ];
 const DESKTOP_INPUT_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -899,6 +900,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "begin_foreground_segment"
         | "end_foreground_segment"
         | "prepare_dialog"
+        | "prepare_observation"
         | "start_session"
         | "end_session"
         | "set_agent_cursor_enabled"
@@ -1198,6 +1200,7 @@ fn enforce_hard_invariants(
             | "begin_foreground_segment"
             | "end_foreground_segment"
             | "prepare_dialog"
+            | "prepare_observation"
             | "get_accessibility_tree"
             | "get_window_state"
             | "verify_state"
@@ -1914,6 +1917,7 @@ mod tests {
             "begin_foreground_segment",
             "end_foreground_segment",
             "prepare_dialog",
+            "prepare_observation",
         ] {
             assert_eq!(ids(tool, serde_json::json!({})), vec!["desktop_input"]);
             assert_eq!(advertised_risk_for(tool).class, RiskClass::R1);
