@@ -415,6 +415,7 @@ impl NativeValueResponse {
 
 trait NativeValueField {
     fn validate(&self) -> anyhow::Result<()>;
+    fn check_request(&self) -> anyhow::Result<()>;
     fn focused(&self) -> Option<bool>;
     fn focus_settable(&self) -> bool;
     fn focus(&self) -> i32;
@@ -430,6 +431,10 @@ struct LiveNativeTextField {
 }
 
 impl NativeValueField for LiveNativeTextField {
+    fn check_request(&self) -> anyhow::Result<()> {
+        crate::foreground_activity::check_request()
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         use cua_driver_core::background_input::{
             decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
@@ -507,6 +512,10 @@ struct LiveNativeDateField {
 }
 
 impl NativeValueField for LiveNativeDateField {
+    fn check_request(&self) -> anyhow::Result<()> {
+        self.base.check_request()
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         use cua_driver_core::background_input::{
             decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
@@ -701,12 +710,14 @@ fn write_native_value(
 
 /// AXFocused can return before AppKit installs the next field editor. Wait
 /// briefly for that one requested transition; never send the focus write a
-/// second time. Each read re-proves the target and observes cancellation.
+/// second time. Reading the retained field is safe while its window ancestry
+/// is in transition. Poll cancellation here; the complete target proof must
+/// still succeed after readiness and before any value mutation.
 fn wait_for_native_editor(field: &impl NativeValueField) -> anyhow::Result<bool> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
-        field.validate()?;
+        field.check_request()?;
         if field.focused() == Some(true) {
             return Ok(true);
         }
@@ -1190,6 +1201,8 @@ mod tests {
         focus_sticks: bool,
         focus_error: i32,
         revoke_on_validation: Option<usize>,
+        cancel_on_focus_poll: Option<usize>,
+        windowless_until_focus_ready: bool,
         revoke_after_focus: bool,
         revoke_after_write: bool,
         write_error: i32,
@@ -1208,6 +1221,8 @@ mod tests {
                 focus_sticks: true,
                 focus_error: kAXErrorSuccess,
                 revoke_on_validation: None,
+                cancel_on_focus_poll: None,
+                windowless_until_focus_ready: false,
                 revoke_after_focus: false,
                 revoke_after_write: false,
                 write_error: kAXErrorSuccess,
@@ -1220,8 +1235,21 @@ mod tests {
     }
 
     impl NativeValueField for EditorField {
+        fn check_request(&self) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push("poll");
+            if self.cancel_on_focus_poll.is_some_and(|limit| {
+                self.calls.borrow().iter().filter(|call| **call == "poll").count() >= limit
+            }) {
+                anyhow::bail!("request cancelled during editor preparation");
+            }
+            Ok(())
+        }
+
         fn validate(&self) -> anyhow::Result<()> {
             self.calls.borrow_mut().push("validate");
+            if self.windowless_until_focus_ready && self.focused.get() && self.delayed_focus_reads.get() > 0 {
+                anyhow::bail!("native window ancestry is unavailable during editor transition");
+            }
             if self.revoke_on_validation.is_some_and(|limit| {
                 self.calls.borrow().iter().filter(|call| **call == "validate").count() >= limit
             }) {
@@ -1360,13 +1388,41 @@ mod tests {
     }
 
     #[test]
-    fn native_value_revocation_during_editor_wait_prevents_value_write() {
+    fn native_value_revocation_after_editor_wait_prevents_value_write() {
         let mut field = EditorField::new();
         field.delayed_focus_reads.set(10);
-        field.revoke_on_validation = Some(3);
+        field.revoke_on_validation = Some(2);
         assert!(write_native_value(&field, 81, "new").is_err());
         let calls = field.calls.borrow();
         assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);
+        assert!(!calls.contains(&"write"));
+    }
+
+    #[test]
+    fn native_value_waits_out_editor_transition_then_reproves_ownership() {
+        let mut field = EditorField::new();
+        field.delayed_focus_reads.set(3);
+        field.windowless_until_focus_ready = true;
+        let outcome = write_native_value(&field, 81, "new").unwrap();
+        assert_eq!(outcome.verified, Some(true));
+        assert_eq!(field.stored.borrow().as_str(), "new");
+        let calls = field.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);
+        assert_eq!(calls.iter().filter(|call| **call == "write").count(), 1);
+        let last_poll = calls.iter().rposition(|call| *call == "poll").unwrap();
+        let write = calls.iter().position(|call| *call == "write").unwrap();
+        assert!(calls[last_poll + 1..write].contains(&"validate"));
+    }
+
+    #[test]
+    fn native_value_cancellation_during_readiness_polling_stops_without_write() {
+        let mut field = EditorField::new();
+        field.delayed_focus_reads.set(10);
+        field.cancel_on_focus_poll = Some(2);
+        assert!(write_native_value(&field, 81, "new").is_err());
+        let calls = field.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);
+        assert_eq!(calls.iter().filter(|call| **call == "poll").count(), 2);
         assert!(!calls.contains(&"write"));
     }
 
