@@ -5,12 +5,21 @@
 //! attached AXPopovers: their semantic route must prove attachment to the host,
 //! not silently inherit the host's identity. An unmappable surface is not
 //! permission to use its host.
+//!
+//! ExtensionKit may vend a control from a different process than its containing
+//! sheet. Such an embedding needs a live, reciprocal parent chain and a verified
+//! WindowServer owner; a foreign AXWindow attribute alone is never sufficient.
 
 use super::bindings::{
-    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess, AXUIElementGetPid,
-    AXUIElementRef, AXUIElementSetMessagingTimeout,
+    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess,
+    AXUIElementCopyAttributeValue, AXUIElementGetPid, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
-use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use core_foundation::{
+    array::CFArray,
+    base::{CFEqual, CFGetTypeID, CFRelease, CFRetain, CFTypeRef, TCFType},
+    string::CFString,
+};
 use std::time::{Duration, Instant};
 
 const MAX_DEPTH: usize = 40;
@@ -21,6 +30,8 @@ trait Ancestry {
     fn owner(&self, node: &Self::Node) -> Option<i32>;
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn relation(&self, node: &Self::Node, name: &str) -> Option<Self::Node>;
+    fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
+    fn owns_window(&self, pid: i32, window_id: u32) -> bool;
     fn same(&self, a: &Self::Node, b: &Self::Node) -> bool;
     fn within_budget(&self) -> bool;
 }
@@ -30,6 +41,15 @@ fn resolve<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
 }
 
 fn resolve_with_window_fallback<T: Ancestry>(
+    tree: &T,
+    start: &T::Node,
+    allow_window_attribute: bool,
+) -> Option<u32> {
+    resolve_same_process(tree, start, allow_window_attribute)
+        .or_else(|| resolve_embedded_control(tree, start))
+}
+
+fn resolve_same_process<T: Ancestry>(
     tree: &T,
     start: &T::Node,
     allow_window_attribute: bool,
@@ -68,6 +88,76 @@ fn resolve_with_window_fallback<T: Ancestry>(
     None
 }
 
+/// Prove one provider-to-host embedding without weakening the ordinary path.
+/// All parent links must be reciprocal, including links inside the provider.
+/// The first surface remains authoritative; neither its host nor a sibling can
+/// inherit the control. Re-read the complete chain before returning the ID.
+fn resolve_embedded_control<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
+    let provider = tree.owner(start)?;
+    if provider <= 0 {
+        return None;
+    }
+    let mut current = start.clone();
+    let mut nodes: Vec<(T::Node, i32, String)> = Vec::new();
+    let mut crossed_provider_boundary = false;
+    for _ in 0..MAX_DEPTH {
+        if !tree.within_budget() || nodes.iter().any(|(n, _, _)| tree.same(n, &current)) {
+            return None;
+        }
+        let owner = tree.owner(&current)?;
+        let role = tree.role(&current)?;
+        if owner <= 0 {
+            return None;
+        }
+        if let Some((_, previous_owner, _)) = nodes.last() {
+            if owner != *previous_owner {
+                if crossed_provider_boundary || *previous_owner != provider || owner == provider {
+                    return None;
+                }
+                crossed_provider_boundary = true;
+            }
+        }
+        nodes.push((current.clone(), owner, role.clone()));
+        match role.as_str() {
+            "AXWindow" | "AXSheet" | "AXPopover" => {
+                let id = tree.window_id(&current)?;
+                if !crossed_provider_boundary || id == 0 || !tree.owns_window(owner, id) {
+                    return None;
+                }
+                for (index, (node, observed_owner, observed_role)) in nodes.iter().enumerate() {
+                    if !tree.within_budget()
+                        || tree.owner(node) != Some(*observed_owner)
+                        || tree.role(node).as_deref() != Some(observed_role.as_str())
+                    {
+                        return None;
+                    }
+                    if let Some((parent, _, _)) = nodes.get(index + 1) {
+                        if !tree
+                            .relation(node, "AXParent")
+                            .is_some_and(|n| tree.same(&n, parent))
+                            || !tree.contains_child(parent, node)
+                        {
+                            return None;
+                        }
+                    }
+                }
+                return (tree.within_budget()
+                    && tree.window_id(&current) == Some(id)
+                    && tree.owns_window(owner, id))
+                .then_some(id);
+            }
+            "AXApplication" => return None,
+            _ => {}
+        }
+        let parent = tree.relation(&current, "AXParent")?;
+        if !tree.contains_child(&parent, &current) {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
 struct Node(AXUIElementRef);
 impl Clone for Node {
     fn clone(&self) -> Self {
@@ -98,6 +188,36 @@ impl Ancestry for Native {
             let related = Node(copy_element_attr(node.0, name)?);
             (AXUIElementSetMessagingTimeout(related.0, 0.1) == kAXErrorSuccess).then_some(related)
         }
+    }
+    fn contains_child(&self, parent: &Node, child: &Node) -> bool {
+        unsafe {
+            let attr = CFString::new("AXChildren");
+            let mut value: CFTypeRef = std::ptr::null();
+            if AXUIElementCopyAttributeValue(parent.0, attr.as_concrete_TypeRef(), &mut value)
+                != kAXErrorSuccess
+                || value.is_null()
+            {
+                return false;
+            }
+            if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
+                CFRelease(value);
+                return false;
+            }
+            let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+            children.len() <= 1024
+                && (0..children.len()).any(|index| {
+                    CFEqual(
+                        *children.get(index).expect("bounded index"),
+                        child.0 as CFTypeRef,
+                    ) != 0
+                })
+        }
+    }
+    fn owns_window(&self, pid: i32, window_id: u32) -> bool {
+        matches!(
+            crate::windows::resolve_window_owner(pid, window_id),
+            crate::windows::WindowOwner::SamePid
+        )
     }
     fn same(&self, a: &Node, b: &Node) -> bool {
         unsafe { CFEqual(a.0 as CFTypeRef, b.0 as CFTypeRef) != 0 }
@@ -142,11 +262,17 @@ unsafe fn native_window_id(element: AXUIElementRef, allow_window_attribute: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     struct Tree {
         // role, parent, AXWindow, native window ID, owning process
         nodes: HashMap<u8, (&'static str, Option<u8>, Option<u8>, Option<u32>, i32)>,
+        children: HashMap<u8, Vec<u8>>,
+        window_owners: HashMap<u32, i32>,
+        child_checks: Cell<usize>,
+        fail_child_check_after: Option<usize>,
+        expired: bool,
     }
     impl Ancestry for Tree {
         type Node = u8;
@@ -164,11 +290,24 @@ mod tests {
                 .get(n)
                 .and_then(|r| if name == "AXParent" { r.1 } else { r.2 })
         }
+        fn contains_child(&self, parent: &u8, child: &u8) -> bool {
+            self.child_checks.set(self.child_checks.get() + 1);
+            !self
+                .fail_child_check_after
+                .is_some_and(|limit| self.child_checks.get() > limit)
+                && self
+                    .children
+                    .get(parent)
+                    .is_some_and(|children| children.contains(child))
+        }
+        fn owns_window(&self, pid: i32, window_id: u32) -> bool {
+            self.window_owners.get(&window_id) == Some(&pid)
+        }
         fn same(&self, a: &u8, b: &u8) -> bool {
             a == b
         }
         fn within_budget(&self) -> bool {
-            true
+            !self.expired
         }
     }
     fn sheet() -> Tree {
@@ -179,6 +318,11 @@ mod tests {
                 (2, ("AXWindow", Some(3), None, Some(7), 42)),
                 (3, ("AXApplication", None, None, None, 42)),
             ]),
+            children: HashMap::from([(1, vec![0]), (2, vec![1]), (3, vec![2])]),
+            window_owners: HashMap::from([(8, 42), (7, 42)]),
+            child_checks: Cell::new(0),
+            fail_child_check_after: None,
+            expired: false,
         }
     }
     #[test]
@@ -258,6 +402,85 @@ mod tests {
         t.nodes.get_mut(&1).unwrap().4 = 99;
         assert_eq!(resolve(&t, &0), None);
         t.nodes.get_mut(&0).unwrap().1 = Some(3);
+        assert_eq!(resolve(&t, &0), None);
+    }
+
+    #[test]
+    fn remote_settings_controls_resolve_to_their_nearest_sheet() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().0 = "AXTextField";
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.nodes.get_mut(&0).unwrap().2 = None;
+        assert_eq!(resolve(&t, &0), Some(8));
+        assert_eq!(resolve_with_window_fallback(&t, &0, false), Some(8));
+        assert_ne!(resolve(&t, &0), Some(7));
+    }
+
+    #[test]
+    fn provider_subtree_requires_reciprocity_before_and_after_the_boundary() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.nodes.get_mut(&0).unwrap().1 = Some(4);
+        t.nodes.insert(4, ("AXGroup", Some(1), None, None, 99));
+        t.children.insert(4, vec![0]);
+        t.children.insert(1, vec![4]);
+        assert_eq!(resolve(&t, &0), Some(8));
+        t.children.insert(4, vec![]);
+        assert_eq!(resolve(&t, &0), None);
+        t.children.insert(4, vec![0]);
+        t.children.insert(1, vec![]);
+        assert_eq!(resolve(&t, &0), None);
+    }
+
+    #[test]
+    fn foreign_window_attribute_and_unmapped_sheet_do_not_prove_embedding() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.nodes.get_mut(&0).unwrap().1 = None;
+        assert_eq!(resolve(&t, &0), None);
+        t.nodes.get_mut(&0).unwrap().1 = Some(1);
+        t.nodes.get_mut(&1).unwrap().3 = None;
+        assert_eq!(resolve(&t, &0), None);
+    }
+
+    #[test]
+    fn embedded_surface_owner_must_match_live_window_server_ownership() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.window_owners.insert(8, 100);
+        assert_eq!(resolve(&t, &0), None);
+        t.window_owners.remove(&8);
+        assert_eq!(resolve(&t, &0), None);
+    }
+
+    #[test]
+    fn detached_provider_control_cannot_reuse_earlier_reciprocity() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.fail_child_check_after = Some(1);
+        assert_eq!(resolve(&t, &0), None);
+        assert_eq!(t.child_checks.get(), 2);
+    }
+
+    #[test]
+    fn multiple_provider_boundaries_and_cycles_are_not_an_embedding() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.nodes.get_mut(&0).unwrap().1 = Some(4);
+        t.nodes.insert(4, ("AXGroup", Some(1), None, None, 100));
+        t.children.insert(4, vec![0]);
+        t.children.insert(1, vec![4]);
+        assert_eq!(resolve(&t, &0), None);
+        t.nodes.get_mut(&4).unwrap().1 = Some(0);
+        t.children.insert(0, vec![4]);
+        assert_eq!(resolve(&t, &0), None);
+    }
+
+    #[test]
+    fn expired_embedding_proof_never_returns_a_window() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().4 = 99;
+        t.expired = true;
         assert_eq!(resolve(&t, &0), None);
     }
 }
