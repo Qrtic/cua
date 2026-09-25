@@ -1,12 +1,15 @@
 //! set_value tool — matches the Swift reference in SetValueTool.swift.
 //!
-//! Two modes, determined by the element's AXRole:
+//! Value handling is determined by the element's native role and value type:
 //!
 //! * **AXPopUpButton**: Find the child option whose AXTitle or AXValue matches
 //!   `value` (case-insensitive) and AXPress it directly.  The native macOS popup
 //!   menu is never opened, so focus is never stolen.  Falls back to Safari
 //!   `osascript do JavaScript` for WebKit `<select>` elements that expose no AX
 //!   children when the popup is closed.
+//!
+//! * **AXDateTimeArea**: Write a typed CFDate parsed from an explicit RFC 3339
+//!   timestamp. A locale-dependent date or a time without a zone is rejected.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
@@ -46,7 +49,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_value".into(),
         description:
-            "Set a value on a UI element. Two modes depending on element role:\n\
+            "Set a value on a UI element, according to its native role:\n\
              \n\
              - **AXPopUpButton / select dropdown**: finds the child option whose \
              title or value matches `value` (case-insensitive) and AXPresses it \
@@ -54,8 +57,12 @@ fn def() -> &'static ToolDef {
              is never stolen. Use this for HTML <select> elements in Safari or \
              any native NSPopUpButton.\n\
              \n\
+             - **AXDateTimeArea**: writes a native CFDate from an RFC 3339 timestamp \
+             with an explicit timezone offset. Preserve components the user did not \
+             ask to change; do not send a plain time or locale-dependent date.\n\
+             \n\
              - **All other elements**: writes AXValue directly (sliders, steppers, \
-             date pickers, native text fields that expose settable AXValue).\n\
+             native text fields that expose settable AXValue).\n\
              \n\
              For free-form text entry into web inputs, prefer `type_text_chars` \
              which synthesises key events — AXValue writes are ignored by WebKit."
@@ -75,7 +82,7 @@ fn def() -> &'static ToolDef {
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "value": {
                     "type": "string",
-                    "description": "New value. AX will coerce to the element's native type."
+                    "description": "New value. Native date/time editors require an RFC 3339 timestamp with an explicit timezone; other supported controls receive their native value type."
                 }
             },
             "additionalProperties": false
@@ -185,23 +192,27 @@ impl Tool for SetValueTool {
         // window immediately before any cursor or AX work; a cache hit alone
         // is not delivery proof after a window lifecycle or Space change.
         let route_element = element_guard.clone();
-        let attached_popover_text =
+        let (native_date, attached_popover_value) =
             match crate::foreground_activity::spawn_blocking(move || unsafe {
                 let element = route_element.as_ptr() as AXUIElementRef;
-                crate::ax::attached_popover::native_text_role(
-                    copy_string_attr(element, "AXRole").as_deref(),
-                ) && crate::ax::attached_popover::has_displaced_popover_window(element, window_id)
+                let role = copy_string_attr(element, "AXRole");
+                let native_date = crate::ax::attached_popover::native_date_role(role.as_deref());
+                let attached = crate::ax::attached_popover::native_value_role(role.as_deref())
+                    && crate::ax::attached_popover::has_displaced_popover_window(
+                        element, window_id,
+                    );
+                (native_date, attached)
             })
             .await
             {
                 Ok(attached) => attached,
                 Err(error) => {
                     return ToolResult::error(format!(
-                        "Native text surface lookup failed: {error}; no input was sent."
+                        "Native value surface lookup failed: {error}; no input was sent."
                     ))
                 }
             };
-        let gate_action = if attached_popover_text {
+        let gate_action = if attached_popover_value {
             cua_driver_core::background_input::BackgroundAction::AttachedPopoverSemantic
         } else {
             cua_driver_core::background_input::BackgroundAction::AxSemantic
@@ -272,7 +283,16 @@ impl Tool for SetValueTool {
                             element_ptr as AXUIElementRef,
                         )?;
                     }
-                    if attached_popover_text {
+                    if native_date {
+                        set_native_date_value(
+                            element_ptr,
+                            element_index,
+                            pid,
+                            window_id,
+                            attached_popover_value,
+                            &value,
+                        )
+                    } else if attached_popover_value {
                         set_attached_popover_text_value(
                             element_ptr,
                             element_index,
@@ -316,7 +336,7 @@ impl Tool for SetValueTool {
                 }
                 ToolResult::text(msg).with_structured(structured)
             }
-            Ok(Err(e)) => match e.downcast_ref::<NativeTextResponse>() {
+            Ok(Err(e)) => match e.downcast_ref::<NativeValueResponse>() {
                 Some(response) => response.result(),
                 None => ToolResult::error(format!("set_value failed: {e}")),
             },
@@ -342,31 +362,31 @@ struct SetValueOutcome {
     /// `Some(false)` when the element already held the requested value, so the
     /// write was a no-op. Lets callers distinguish "idempotent" from "applied".
     changed: Option<bool>,
-    native_response: Option<NativeTextResponse>,
+    native_response: Option<NativeValueResponse>,
 }
 
 /// A native response is separate from the value read back on the same control.
 /// No text, identifiers or paths are included in this bounded diagnostic.
 #[derive(Debug)]
-struct NativeTextResponse {
+struct NativeValueResponse {
     phase: &'static str,
     native_error: Option<i32>,
     value_write_attempted: bool,
     value_readback_matches: Option<bool>,
 }
 
-impl std::fmt::Display for NativeTextResponse {
+impl std::fmt::Display for NativeValueResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Native text {} response is unconfirmed ({:?}); do not replay",
+            "Native value {} response is unconfirmed ({:?}); do not replay",
             self.phase, self.native_error
         )
     }
 }
-impl std::error::Error for NativeTextResponse {}
+impl std::error::Error for NativeValueResponse {}
 
-impl NativeTextResponse {
+impl NativeValueResponse {
     fn json(&self) -> Value {
         serde_json::json!({
             "phase": self.phase,
@@ -384,7 +404,7 @@ impl NativeTextResponse {
     }
 }
 
-trait NativePopoverTextField {
+trait NativeValueField {
     fn validate(&self) -> anyhow::Result<()>;
     fn focused(&self) -> Option<bool>;
     fn focus_settable(&self) -> bool;
@@ -399,7 +419,7 @@ struct LiveNativePopoverTextField {
     window_id: u32,
 }
 
-impl NativePopoverTextField for LiveNativePopoverTextField {
+impl NativeValueField for LiveNativePopoverTextField {
     fn validate(&self) -> anyhow::Result<()> {
         use cua_driver_core::background_input::{
             decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
@@ -463,6 +483,104 @@ impl NativePopoverTextField for LiveNativePopoverTextField {
     }
 }
 
+struct LiveNativeDateField {
+    base: LiveNativePopoverTextField,
+    attached: bool,
+    requested_absolute_time: f64,
+}
+
+impl NativeValueField for LiveNativeDateField {
+    fn validate(&self) -> anyhow::Result<()> {
+        use cua_driver_core::background_input::{
+            decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
+        };
+        let element = self.base.element_ptr as AXUIElementRef;
+        let facts = crate::ax::exact_target::gather_background_facts(
+            self.base.pid,
+            self.base.window_id,
+            Some(self.base.element_ptr),
+        );
+        let action = if self.attached {
+            BackgroundAction::AttachedPopoverSemantic
+        } else {
+            BackgroundAction::AxSemantic
+        };
+        if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
+            ExactWindowTarget {
+                pid: self.base.pid,
+                window_id: self.base.window_id,
+            },
+            &facts,
+            action,
+        ) {
+            anyhow::bail!(
+                "Native date write refused before dispatch: {}",
+                refusal.reason
+            );
+        }
+        let role = unsafe { copy_string_attr(element, "AXRole") };
+        if !crate::ax::attached_popover::native_date_role(role.as_deref())
+            || unsafe { crate::ax::bindings::copy_bool_attr(element, "AXEnabled") } == Some(false)
+            || !unsafe { crate::ax::bindings::is_attribute_settable(element, "AXValue") }
+            || unsafe { crate::ax::date_value::copy(element) }.is_none()
+        {
+            anyhow::bail!("Native date target is not an enabled, settable CFDate control; no value write was sent");
+        }
+        crate::foreground_activity::check_request()
+    }
+
+    fn focused(&self) -> Option<bool> {
+        self.base.focused()
+    }
+    fn focus_settable(&self) -> bool {
+        self.base.focus_settable()
+    }
+    fn focus(&self) -> i32 {
+        self.base.focus()
+    }
+    fn value(&self) -> Option<String> {
+        unsafe { crate::ax::date_value::copy(self.base.element_ptr as AXUIElementRef) }
+            .and_then(crate::ax::date_value::format)
+    }
+    fn set_value(&self, _value: &str) -> i32 {
+        // Parsed before focus or mutation; never coerce an arbitrary string.
+        unsafe {
+            crate::ax::date_value::set(
+                self.base.element_ptr as AXUIElementRef,
+                self.requested_absolute_time,
+            )
+        }
+    }
+}
+
+fn set_native_date_value(
+    element_ptr: usize,
+    element_index: usize,
+    pid: i32,
+    window_id: u32,
+    attached: bool,
+    value: &str,
+) -> anyhow::Result<SetValueOutcome> {
+    let requested_absolute_time =
+        crate::ax::date_value::parse(value).map_err(anyhow::Error::msg)?;
+    let normalized = crate::ax::date_value::format(requested_absolute_time).ok_or_else(|| {
+        anyhow::anyhow!("Native date is outside the supported timestamp range; no input was sent")
+    })?;
+    write_native_value(
+        &LiveNativeDateField {
+            base: LiveNativePopoverTextField {
+                element_ptr,
+                pid,
+                window_id,
+            },
+            attached,
+            requested_absolute_time,
+        },
+        element_index,
+        &normalized,
+    )
+}
+
 fn apply_surface_trust(outcome: &mut SetValueOutcome, ax_echo_surface: bool) {
     if ax_echo_surface && outcome.verified == Some(true) {
         outcome.verified = Some(false);
@@ -491,7 +609,7 @@ fn set_attached_popover_text_value(
     window_id: u32,
     value: &str,
 ) -> anyhow::Result<SetValueOutcome> {
-    write_native_popover_text(
+    write_native_value(
         &LiveNativePopoverTextField {
             element_ptr,
             pid,
@@ -502,8 +620,8 @@ fn set_attached_popover_text_value(
     )
 }
 
-fn write_native_popover_text(
-    field: &impl NativePopoverTextField,
+fn write_native_value(
+    field: &impl NativeValueField,
     element_index: usize,
     value: &str,
 ) -> anyhow::Result<SetValueOutcome> {
@@ -514,11 +632,11 @@ fn write_native_popover_text(
     // or substitute pointer/keyboard input here.
     if field.focused() != Some(true) {
         if !field.focus_settable() {
-            anyhow::bail!("Native popover text editor is not focusable; no value write was sent");
+            anyhow::bail!("Native value editor is not focusable; no value write was sent");
         }
         let error = field.focus();
         if error != kAXErrorSuccess || field.focused() != Some(true) {
-            return Err(NativeTextResponse {
+            return Err(NativeValueResponse {
                 phase: "editor_focus",
                 native_error: (error != kAXErrorSuccess).then_some(error),
                 value_write_attempted: false,
@@ -538,7 +656,7 @@ fn write_native_popover_text(
     let after = field.validate().ok().and_then(|_| field.value());
     let (verified, changed) = classify_write(before.as_deref(), after.as_deref(), value, false);
     let native_response = if error != kAXErrorSuccess {
-        let response = NativeTextResponse {
+        let response = NativeValueResponse {
             phase: "value_write",
             native_error: Some(error),
             value_write_attempted: true,
@@ -555,7 +673,7 @@ fn write_native_popover_text(
         None
     };
     Ok(SetValueOutcome {
-        detail: format!("Set AXValue on host-attached native text field [{element_index}]."),
+        detail: format!("Set AXValue on native control [{element_index}]."),
         verified,
         changed,
         native_response,
@@ -1023,7 +1141,7 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, kAXErrorSuccess,
-        write_native_popover_text, NativePopoverTextField, NativeTextResponse, SetValueOutcome,
+        write_native_value, NativeValueField, NativeValueResponse, SetValueOutcome,
     };
     use std::cell::{Cell, RefCell};
 
@@ -1057,7 +1175,7 @@ mod tests {
         }
     }
 
-    impl NativePopoverTextField for EditorField {
+    impl NativeValueField for EditorField {
         fn validate(&self) -> anyhow::Result<()> {
             self.calls.borrow_mut().push("validate");
             if self.revoke_after_focus && self.focused.get() {
@@ -1100,7 +1218,7 @@ mod tests {
     #[test]
     fn native_popover_value_enters_editor_before_writing() {
         let field = EditorField::new();
-        let outcome = write_native_popover_text(&field, 81, "new").unwrap();
+        let outcome = write_native_value(&field, 81, "new").unwrap();
         assert_eq!(field.stored.borrow().as_str(), "new");
         assert_eq!(outcome.verified, Some(true));
         let calls = field.calls.borrow();
@@ -1116,7 +1234,7 @@ mod tests {
         let mut field = EditorField::new();
         field.focused.set(true);
         field.write_error = crate::ax::bindings::kAXErrorCannotComplete;
-        let outcome = write_native_popover_text(&field, 81, "new").unwrap();
+        let outcome = write_native_value(&field, 81, "new").unwrap();
         assert_eq!(field.stored.borrow().as_str(), "new");
         assert_eq!(outcome.verified, Some(true));
         let response = outcome.native_response.unwrap();
@@ -1137,11 +1255,11 @@ mod tests {
         field.focused.set(true);
         field.write_error = crate::ax::bindings::kAXErrorCannotComplete;
         field.write_applies = false;
-        let error = write_native_popover_text(&field, 81, "new")
+        let error = write_native_value(&field, 81, "new")
             .err()
             .expect("unconfirmed write must not succeed");
         let response = error
-            .downcast_ref::<NativeTextResponse>()
+            .downcast_ref::<NativeValueResponse>()
             .expect("retain native effect phase");
         assert_eq!(response.phase, "value_write");
         assert_eq!(response.value_readback_matches, Some(false));
@@ -1165,10 +1283,10 @@ mod tests {
     fn native_popover_value_does_not_write_when_editor_focus_does_not_stick() {
         let mut field = EditorField::new();
         field.focus_sticks = false;
-        let error = write_native_popover_text(&field, 81, "new")
+        let error = write_native_value(&field, 81, "new")
             .err()
             .expect("focus must be read back before value input");
-        let response = error.downcast_ref::<NativeTextResponse>().unwrap();
+        let response = error.downcast_ref::<NativeValueResponse>().unwrap();
         assert_eq!(response.phase, "editor_focus");
         assert!(!response.value_write_attempted);
         assert!(!field.calls.borrow().contains(&"write"));
@@ -1178,7 +1296,7 @@ mod tests {
     fn native_popover_value_rechecks_attachment_after_editor_focus() {
         let mut field = EditorField::new();
         field.revoke_after_focus = true;
-        assert!(write_native_popover_text(&field, 81, "new").is_err());
+        assert!(write_native_value(&field, 81, "new").is_err());
         assert!(!field.calls.borrow().contains(&"write"));
     }
 
@@ -1186,7 +1304,7 @@ mod tests {
     fn native_popover_value_does_not_write_without_a_supported_editor() {
         let mut field = EditorField::new();
         field.focus_settable = false;
-        assert!(write_native_popover_text(&field, 81, "new").is_err());
+        assert!(write_native_value(&field, 81, "new").is_err());
         assert!(!field.calls.borrow().contains(&"focus"));
         assert!(!field.calls.borrow().contains(&"write"));
     }
@@ -1197,8 +1315,8 @@ mod tests {
         field.focused.set(true);
         field.revoke_after_write = true;
         field.write_error = crate::ax::bindings::kAXErrorCannotComplete;
-        let error = write_native_popover_text(&field, 81, "new").err().unwrap();
-        let response = error.downcast_ref::<NativeTextResponse>().unwrap();
+        let error = write_native_value(&field, 81, "new").err().unwrap();
+        let response = error.downcast_ref::<NativeValueResponse>().unwrap();
         assert_eq!(response.value_readback_matches, None);
         assert_eq!(
             field

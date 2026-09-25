@@ -2245,13 +2245,13 @@ fn perform_attached_popover_action(
     }
     let advertised = unsafe { copy_action_names(element) };
     let role = unsafe { copy_string_attr(element, "AXRole") };
-    if crate::ax::attached_popover::native_text_role(role.as_deref())
+    if crate::ax::attached_popover::native_value_role(role.as_deref())
         && matches!(action, "press" | "click" | "focus")
     {
         if unsafe { copy_bool_attr(element, "AXEnabled") } == Some(false)
             || !unsafe { crate::ax::bindings::is_attribute_settable(element, "AXFocused") }
         {
-            anyhow::bail!("Native popover text focus is not settable; use its exposed set_value operation. No input was sent");
+            anyhow::bail!("Native popover control focus is not settable; use its exposed set_value operation. No input was sent");
         }
         crate::foreground_activity::check_request()?;
         let error = unsafe { crate::ax::bindings::set_bool_attr_true(element, "AXFocused") };

@@ -257,9 +257,9 @@ pub(crate) unsafe fn try_copy_bool_attr(
 /// and the wider structured control-state response.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StringishAttrValue {
-    /// Present only when the source value was a CFString.
+    /// Display text for a CFString or an unambiguous native CFDate timestamp.
     pub string_value: Option<String>,
-    /// CFString as-is, CFNumber as text, or CFBoolean as `"1"` / `"0"`.
+    /// CFString/CFDate display text, CFNumber as text, or CFBoolean as `"1"` / `"0"`.
     pub state_value: String,
 }
 
@@ -273,6 +273,14 @@ unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue>
         return Some(StringishAttrValue {
             string_value: Some(string.clone()),
             state_value: string,
+        });
+    }
+    if let Some(value) =
+        super::date_value::borrowed_absolute_time(value).and_then(super::date_value::format)
+    {
+        return Some(StringishAttrValue {
+            string_value: Some(value.clone()),
+            state_value: value,
         });
     }
     if type_id == CFNumber::type_id() {
@@ -302,10 +310,10 @@ unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue>
     None
 }
 
-/// Copy an attribute that may be a `CFString`, `CFNumber`, or `CFBoolean`.
+/// Copy a `CFString`, `CFDate`, `CFNumber`, or `CFBoolean` attribute.
 ///
-/// The returned pair lets the tree walker preserve its historical CFString-only
-/// markdown while using the same single AX read for structured control state.
+/// The returned pair uses the same single AX read for display and structured
+/// state. Dates are RFC 3339 timestamps in UTC, not locale-dependent strings.
 /// Numbers render without a trailing `.0` when integral (`8`, not `8.0`), and
 /// booleans render as `1`/`0` to match AppKit's two-state controls.
 ///
@@ -924,5 +932,14 @@ mod tests {
         let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    #[test]
+    fn h080_cfdate_value_is_visible_as_an_unambiguous_timestamp() {
+        let date = core_foundation::date::CFDate::new(812_595_600.0);
+        let result = unsafe { coerce_stringish_value(date.as_CFTypeRef()) }
+            .expect("Native date values must not disappear from the observation");
+        assert_eq!(result.string_value.as_deref(), Some("2026-10-02T01:00:00Z"));
+        assert_eq!(result.state_value, "2026-10-02T01:00:00Z");
     }
 }

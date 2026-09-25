@@ -135,6 +135,7 @@ fn role_supports_value_addressing(role: &str) -> bool {
             | "AXStepper"
             | "AXCheckBox"
             | "AXRadioButton"
+            | "AXDateTimeArea"
     )
 }
 
@@ -212,7 +213,15 @@ pub(crate) fn walk_tree_bounded_with_visible_menu(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
-    walk_tree_bounded_with_projection(pid, Some(window_id), query, max_elements, max_depth, false, true)
+    walk_tree_bounded_with_projection(
+        pid,
+        Some(window_id),
+        query,
+        max_elements,
+        max_depth,
+        false,
+        true,
+    )
 }
 
 /// Walk one exact native window without inheriting sibling top-level AX
@@ -225,7 +234,15 @@ pub fn walk_tree_bounded_strict_window(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
-    walk_tree_bounded_with_projection(pid, Some(window_id), query, max_elements, max_depth, true, false)
+    walk_tree_bounded_with_projection(
+        pid,
+        Some(window_id),
+        query,
+        max_elements,
+        max_depth,
+        true,
+        false,
+    )
 }
 
 fn walk_tree_bounded_with_projection(
@@ -533,7 +550,7 @@ unsafe fn walk_element(
     // (parens), breaking _find_calc_button which searches for "(2)".
     let title = copy_string_attr(element, "AXTitle");
     // Read AXValue once with enough type information to preserve the existing
-    // string-only markdown while also exposing numeric/boolean control state.
+    // string/date display text while exposing numeric/boolean control state.
     let copied_value = copy_stringish_attr(element, "AXValue");
     let value = copied_value
         .as_ref()
@@ -943,7 +960,10 @@ mod tests {
         let action = "Name:Remove unused rows\ntarget:0xa22f78900\nselector:tsaxtrimemptyrows";
         assert_eq!(display_action_name(action), "name:remove unused rows");
         assert_eq!(display_action_name("AXPress"), "press");
-        assert_eq!(display_action_name("Name:Something\nUser text"), "name:something\nuser text");
+        assert_eq!(
+            display_action_name("Name:Something\nUser text"),
+            "name:something\nuser text"
+        );
         // Rendering must not rewrite the action string kept for native dispatch.
         assert!(action.contains("target:0xa22f78900"));
     }

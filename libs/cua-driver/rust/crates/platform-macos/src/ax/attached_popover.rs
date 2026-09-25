@@ -33,12 +33,21 @@ fn native_control_role(role: Option<&str>) -> bool {
                 | "AXPopUpButton"
                 | "AXCheckBox"
                 | "AXRadioButton"
+                | "AXDateTimeArea"
         )
     )
 }
 
 pub(crate) fn native_text_role(role: Option<&str>) -> bool {
     matches!(role, Some("AXTextField" | "AXTextArea"))
+}
+
+pub(crate) fn native_date_role(role: Option<&str>) -> bool {
+    role == Some("AXDateTimeArea")
+}
+
+pub(crate) fn native_value_role(role: Option<&str>) -> bool {
+    native_text_role(role) || native_date_role(role)
 }
 
 fn native_menu_role(role: Option<&str>) -> bool {
@@ -650,6 +659,44 @@ mod tests {
     #[test]
     fn pages_swatch_crosses_its_attached_popover_to_exact_host() {
         assert!(prove(&pages(), 42, 700, &0));
+    }
+
+    #[test]
+    fn h080_native_date_editor_reaches_its_reciprocal_popover_host() {
+        let mut tree = pages();
+        let editor = tree.nodes.get_mut(&0).unwrap();
+        editor.role = "AXDateTimeArea";
+        editor.window = Some(6);
+        editor.parent = Some(2);
+        tree.nodes.get_mut(&2).unwrap().children = vec![0];
+        assert!(prove(&tree, 42, 700, &0));
+    }
+
+    #[test]
+    fn native_date_editor_does_not_relax_closed_foreign_or_replaced_popovers() {
+        for kind in 0..6 {
+            let mut tree = pages();
+            let editor = tree.nodes.get_mut(&0).unwrap();
+            editor.role = "AXDateTimeArea";
+            editor.window = Some(6);
+            editor.parent = Some(2);
+            tree.nodes.get_mut(&2).unwrap().children = vec![0];
+            match kind {
+                0 => tree.nodes.get_mut(&2).unwrap().children.clear(),
+                1 => tree.nodes.get_mut(&0).unwrap().owner = 99,
+                2 => tree.nodes.get_mut(&0).unwrap().id = Some(700),
+                3 => tree.nodes.get_mut(&2).unwrap().role = "AXWebArea",
+                4 => tree.reattach = true,
+                _ => tree.budget.set(0),
+            }
+            assert!(!prove(&tree, 42, 700, &0), "case {kind}");
+        }
+        assert!(native_value_role(Some("AXDateTimeArea")));
+        assert!(!native_text_role(Some("AXDateTimeArea")));
+        assert_eq!(
+            advertised_action(Some("AXDateTimeArea"), "confirm", &["AXConfirm".into()]),
+            None
+        );
     }
 
     fn calendar_menu() -> Tree {
