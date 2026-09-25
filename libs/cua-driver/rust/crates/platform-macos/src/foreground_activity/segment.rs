@@ -25,6 +25,10 @@ struct Inner {
     dialog_closed_destination: Option<ExactWindowTarget>,
     dialog_target: Option<crate::ax::attached_sheet::DialogAttachment>,
     dialog_observation_required: bool,
+    // A completed batch action may open a same-app window (for example Quick
+    // Look). This proof permits normal restoration only, never another input
+    // call or replacement of the segment's immutable target binding.
+    completed_return_source: Option<ExactWindowTarget>,
     cleanup_unknown: bool,
     summary: Option<Value>,
 }
@@ -196,10 +200,51 @@ impl NativeSegment {
             .unwrap_or_else(|e| e.into_inner())
             .activated;
         if activated {
-            self.current_target()
+            self.restoration_source()
         } else {
             self.original
         }
+    }
+
+    fn completed_return_source(&self) -> Option<ExactWindowTarget> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .completed_return_source
+    }
+
+    fn restoration_source(&self) -> ExactWindowTarget {
+        self.completed_return_source()
+            .unwrap_or_else(|| self.current_target())
+    }
+
+    fn record_completed_return_source(
+        &self,
+        source: ExactWindowTarget,
+        now_ms: u64,
+        activity: Snapshot,
+    ) -> bool {
+        if self.dialog_host.is_some()
+            || source.pid != self.binding.target.pid
+            || source.window_id == 0
+            || source == self.binding.target
+            || !self.owner_live()
+        {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.activated
+            || !inner.policy.in_flight()
+            || inner.completed_return_source.is_some()
+            || inner.cleanup_unknown
+            || inner.ending
+            || inner.restoring
+            || inner.policy.check(&self.binding, now_ms, activity).is_err()
+        {
+            return false;
+        }
+        inner.completed_return_source = Some(source);
+        true
     }
 
     fn cleanup_is_settled(&self) -> bool {
@@ -252,6 +297,13 @@ impl NativeSegment {
         tool: &str,
         target: ExactWindowTarget,
     ) -> Result<(), ToolResult> {
+        if self.completed_return_source().is_some() {
+            return Err(failure(
+                "foreground_segment_not_available",
+                "The completed action changed the focused window; finish this segment and observe the new context before further input",
+                true,
+            ));
+        }
         if tool == "prepare_dialog" && self.dialog_host.is_none() {
             return Err(failure(
                 "foreground_dialog_required",
@@ -495,6 +547,37 @@ impl Call {
         {
             inner.dialog_observation_required = false;
         }
+    }
+
+    /// This is called only after successful input and owned-key release. It
+    /// keeps the original activity lease and freezes further batch calls. An
+    /// explicit normal segment end may return from the proven owned window;
+    /// cancellation, a takeover, or an abort still cannot reclaim focus.
+    pub(super) fn settle_completed_batch_return(
+        &self,
+        mut check_live: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if self.is_dialog() {
+            return Ok(false);
+        }
+        check_live()?;
+        let Some(window_id) = owned_return_source_window(self.target.pid) else {
+            return Ok(false);
+        };
+        check_live()?;
+        let source = ExactWindowTarget {
+            pid: self.target.pid,
+            window_id,
+        };
+        let accepted = self
+            .segment
+            .record_completed_return_source(source, clock_ms(), snapshot());
+        if accepted {
+            tracing::debug!(target: "cua_focus_restore", pid=source.pid,
+                requested_window=self.target.window_id, return_source_window=source.window_id,
+                "Completed batch window transition retained for restoration only");
+        }
+        Ok(accepted)
     }
 
     /// A sheet can become focused after the preceding input RPC has finished.
@@ -1074,6 +1157,7 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
             dialog_closed_destination: None,
             dialog_target: attachment,
             dialog_observation_required: false,
+            completed_return_source: None,
             cleanup_unknown: false,
             summary: None,
         }),
@@ -1336,19 +1420,21 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
                         .policy
                         .state()
                         == SegmentState::Closing;
+                let source = worker_segment.restoration_source();
                 let restoration = if !live {
                     "skipped_interrupted"
                 } else if exact_front(worker_segment.original) {
                     "unchanged"
                 } else if worker_segment.original == worker_segment.binding.target
-                    && worker_segment.accept_dialog_return()
+                    && (worker_segment.accept_dialog_return()
+                        || worker_segment
+                            .completed_return_source()
+                            .is_some_and(exact_front))
                 {
-                    // The original WAS the sheet. It closed normally; leave
-                    // its host in front instead of restoring a vanished window.
+                    // The task already owned the original foreground window.
+                    // Keep its legitimate resulting host/popup in front.
                     "unchanged"
-                } else if !exact_front(worker_segment.current_target())
-                    && !worker_segment.accept_dialog_return()
-                {
+                } else if !exact_front(source) && !worker_segment.accept_dialog_return() {
                     worker_segment.revoke();
                     "skipped_interrupted"
                 } else if crate::input::skylight::restore_exact_window_guarded(
@@ -1358,6 +1444,17 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
                         worker_context.check()?;
                         if !worker_segment.owner_live() || !lease.permits(clock_ms(), snapshot()) {
                             anyhow::bail!("foreground segment interrupted during restoration");
+                        }
+                        if crate::input::skylight::front_process_matches(
+                            source.pid,
+                            source.window_id,
+                        ) != Some(true)
+                            && crate::input::skylight::front_process_matches(
+                                worker_segment.original.pid,
+                                worker_segment.original.window_id,
+                            ) != Some(true)
+                        {
+                            anyhow::bail!("foreground segment restoration source changed");
                         }
                         Ok(())
                     },
@@ -1588,6 +1685,7 @@ mod tests {
                 dialog_closed_destination: None,
                 dialog_target: None,
                 dialog_observation_required: false,
+                completed_return_source: None,
                 cleanup_unknown: false,
                 summary: None,
             }),
@@ -1921,6 +2019,176 @@ mod tests {
         assert_eq!(segment.expected_front(), segment.binding.target);
         ticket.revoke();
         assert_eq!(segment.expected_front(), segment.binding.target);
+    }
+
+    #[tokio::test]
+    async fn completed_batch_window_transition_cannot_authorize_another_call() {
+        let (segment, _, _) = fixture().await;
+        let ticket = call(&segment);
+        ticket.mark_activated();
+        let binding = segment.binding.clone();
+        let original = segment.original;
+        let deadline = segment.inner.lock().unwrap().policy.deadline_ms();
+        let popup = ExactWindowTarget {
+            pid: 42,
+            window_id: 99,
+        };
+        assert!(segment.record_completed_return_source(popup, 5_001, idle()));
+        assert_eq!(segment.expected_front(), popup);
+        assert_eq!(segment.restoration_source(), popup);
+        assert_eq!(segment.current_target(), binding.target);
+        assert_eq!(ticket.target(), binding.target);
+        assert_eq!(segment.binding, binding);
+        assert_eq!(segment.original, original);
+        assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
+        for target in [binding.target, popup] {
+            for tool in ["click", "press_key", "set_value", "get_window_state"] {
+                let error = segment.validate_dialog_call(tool, target).unwrap_err();
+                let data = error.structured_content.unwrap();
+                assert_eq!(data["code"], "foreground_segment_not_available");
+                assert_eq!(data["effect"], "refused");
+            }
+        }
+        assert!(!segment.record_completed_return_source(
+            ExactWindowTarget {
+                pid: 42,
+                window_id: 100
+            },
+            5_002,
+            idle()
+        ));
+        assert_eq!(segment.restoration_source(), popup);
+        ticket.settle();
+        // Normal end retains the original lease and may restore. The proof is
+        // not a new target binding or a capability to start another call.
+        let mut inner = segment.inner.lock().unwrap();
+        claim_end(&mut inner, &binding, true).unwrap();
+        assert_eq!(inner.policy.state(), SegmentState::Closing);
+        assert_eq!(inner.policy.deadline_ms(), deadline);
+    }
+
+    #[tokio::test]
+    async fn completed_batch_return_rejects_foreign_or_unsettled_ownership() {
+        for (source, now, activity, revoked) in [
+            (
+                ExactWindowTarget {
+                    pid: 99,
+                    window_id: 99,
+                },
+                5_001,
+                idle(),
+                false,
+            ),
+            (
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 0,
+                },
+                5_001,
+                idle(),
+                false,
+            ),
+            (
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 71,
+                },
+                5_001,
+                idle(),
+                false,
+            ),
+            (
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 99,
+                },
+                5_001,
+                Snapshot {
+                    generation: 8,
+                    ..idle()
+                },
+                false,
+            ),
+            (
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 99,
+                },
+                5_001,
+                Snapshot {
+                    reliable: false,
+                    ..idle()
+                },
+                false,
+            ),
+            (
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 99,
+                },
+                u64::MAX,
+                idle(),
+                false,
+            ),
+            (
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 99,
+                },
+                5_001,
+                idle(),
+                true,
+            ),
+        ] {
+            let (segment, _, _) = fixture().await;
+            let ticket = call(&segment);
+            ticket.mark_activated();
+            if revoked {
+                ticket.revoke();
+            }
+            assert!(!segment.record_completed_return_source(source, now, activity));
+            assert_eq!(segment.completed_return_source(), None);
+            ticket.revoke();
+            ticket.settle();
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_batch_return_requires_this_activated_inflight_call() {
+        let (segment, _, _) = fixture().await;
+        let popup = ExactWindowTarget {
+            pid: 42,
+            window_id: 99,
+        };
+        let ticket = call(&segment);
+        assert!(!segment.record_completed_return_source(popup, 5_001, idle()));
+        ticket.mark_activated();
+        ticket.settle();
+        assert!(!segment.record_completed_return_source(popup, 5_001, idle()));
+        assert_eq!(segment.completed_return_source(), None);
+        ticket.revoke();
+    }
+
+    #[tokio::test]
+    async fn dialog_segments_still_require_their_attachment_return_proof() {
+        let (mut segment, _, _) = fixture().await;
+        Arc::get_mut(&mut segment).unwrap().dialog_host = Some(ExactWindowTarget {
+            pid: 42,
+            window_id: 70,
+        });
+        let ticket = call(&segment);
+        ticket.mark_activated();
+        assert!(!segment.record_completed_return_source(
+            ExactWindowTarget {
+                pid: 42,
+                window_id: 99
+            },
+            5_001,
+            idle()
+        ));
+        assert_eq!(segment.completed_return_source(), None);
+        ticket.revoke();
+        ticket.settle();
     }
 
     #[tokio::test]
