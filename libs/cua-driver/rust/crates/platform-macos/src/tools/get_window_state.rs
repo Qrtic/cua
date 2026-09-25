@@ -658,19 +658,81 @@ fn app_context_changed_refusal(
     }))
 }
 
-fn release_unpublished_tree_result(tree_result: &Option<crate::ax::tree::TreeWalkResult>) {
-    use core_foundation::base::{CFRelease, CFTypeRef};
+/// A walk owns one retain per actionable node until the cache takes them.
+/// Keep ownership inside the blocking task's result: if its JoinHandle is
+/// dropped at the deadline, Tokio will drop a late result on the worker.
+/// The same guard covers refused observations, read-only probes and async
+/// cancellation between the AX walk and publication.
+struct OwnedTreeWalk {
+    tree: crate::ax::tree::TreeWalkResult,
+    handles_published: bool,
+}
 
-    let Some(tree) = tree_result else {
-        return;
-    };
-    for node in tree
-        .nodes
-        .iter()
-        .filter(|node| node.element_index.is_some())
-    {
-        unsafe { CFRelease(node.element_ptr as crate::ax::bindings::AXUIElementRef as CFTypeRef) };
+impl OwnedTreeWalk {
+    fn new(tree: crate::ax::tree::TreeWalkResult) -> Self {
+        Self { tree, handles_published: false }
     }
+
+    fn publish_handles(
+        &mut self,
+        cache: &crate::ax::cache::ElementCache,
+        pid: i32,
+        window_id: u32,
+        snapshot_id: Option<u32>,
+    ) {
+        cache.update(pid, window_id, snapshot_id, &self.tree.nodes);
+        self.handles_published = true;
+    }
+}
+
+impl std::ops::Deref for OwnedTreeWalk {
+    type Target = crate::ax::tree::TreeWalkResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tree
+    }
+}
+
+impl Drop for OwnedTreeWalk {
+    fn drop(&mut self) {
+        use core_foundation::base::{CFRelease, CFTypeRef};
+
+        if self.handles_published {
+            return;
+        }
+        for node in self.tree.nodes.iter().filter(|node| node.element_index.is_some()) {
+            if node.element_ptr != 0 {
+                unsafe { CFRelease(node.element_ptr as CFTypeRef) };
+            }
+        }
+    }
+}
+
+const AX_TREE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn ax_tree_failure(
+    pid: i32,
+    window_id: u32,
+    max_elements: usize,
+    max_depth: usize,
+    worker_error: Option<&str>,
+) -> ToolResult {
+    let (code, message) = match worker_error {
+        Some(error) => ("ax_tree_worker_failed", format!("AX tree worker failed: {error}")),
+        None => (
+            "ax_tree_timeout",
+            "The accessibility-tree read exceeded its 20-second deadline. The cause is not established. Try a smaller tree, or a screenshot-only observation of the current window.".to_owned(),
+        ),
+    };
+    tracing::warn!(target: "cua_observation_timing", code, pid, window_id,
+        max_elements, max_depth, timeout_ms = AX_TREE_TIMEOUT.as_millis() as u64,
+        "AX observation did not complete");
+    ToolResult::error(message).with_structured(serde_json::json!({
+        "code": code, "effect": "refused", "retryable": true,
+        "pid": pid, "window_id": window_id, "phase": "ax_tree_walk",
+        "timeout_ms": AX_TREE_TIMEOUT.as_millis() as u64,
+        "max_elements": max_elements, "max_depth": max_depth,
+    }))
 }
 
 #[async_trait]
@@ -1108,7 +1170,7 @@ impl Tool for GetWindowStateTool {
         // the old frame. Single-modality observations keep their direct path.
         let tree_branch = async {
             if !plan.include_elements || transient_target.is_some() {
-                return Ok::<Option<crate::ax::tree::TreeWalkResult>, ToolResult>(None);
+                return Ok::<Option<OwnedTreeWalk>, ToolResult>(None);
             }
             let q = query.clone();
             // Keep the product deadline below the public client's 25-second
@@ -1116,7 +1178,7 @@ impl Tool for GetWindowStateTool {
             // walker also applies a native per-element messaging timeout because
             // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
             let walk_future = crate::foreground_activity::spawn_blocking(move || {
-                if delegated_panel {
+                let tree = if delegated_panel {
                     crate::ax::tree::walk_tree_bounded_strict_window(
                         pid,
                         window_id,
@@ -1140,19 +1202,17 @@ impl Tool for GetWindowStateTool {
                         max_elements,
                         max_depth,
                     )
-                }
+                };
+                OwnedTreeWalk::new(tree)
             });
-            match tokio::time::timeout(std::time::Duration::from_secs(20), walk_future).await {
+            match tokio::time::timeout(AX_TREE_TIMEOUT, walk_future).await {
                 Ok(Ok(result)) => Ok(Some(result)),
-                Ok(Err(error)) => Err(ToolResult::error(format!("AX tree walk failed: {error}"))),
-                Err(_elapsed) => Err(ToolResult::error(format!(
-                    "AX tree walk for pid={pid} timed out after 20 s. \
-                         The app (likely Arc, Electron, or Safari with many tabs) has a \
-                         pathologically large accessibility tree. \
-                         Workaround: re-call with a depth-limited scan \
-                         (max_elements / max_depth), then act by pixel (x,y) off \
-                         the screenshot if the tree stays unusable."
-                ))),
+                Ok(Err(error)) => Err(ax_tree_failure(
+                    pid, window_id, max_elements, max_depth, Some(&error.to_string()),
+                )),
+                Err(_elapsed) => Err(ax_tree_failure(
+                    pid, window_id, max_elements, max_depth, None,
+                )),
             }
         };
 
@@ -1185,7 +1245,7 @@ impl Tool for GetWindowStateTool {
             }
         };
 
-        let (tree_result, screenshot_result) =
+        let (mut tree_result, screenshot_result) =
             match observe_tree_then_screenshot(tree_branch, screenshot_branch).await {
                 Ok(result) => result,
                 Err(error) => return error,
@@ -1200,7 +1260,6 @@ impl Tool for GetWindowStateTool {
             && captured_screenshot.is_some()
             && !application_menu_branches_match(tree_menu, screenshot_menu.as_ref())
         {
-            release_unpublished_tree_result(&tree_result);
             return ToolResult::error(
                 "The AX and screenshot reads did not agree on the active application-menu scope. Re-observe the application; no mixed observation was published.",
             ).with_structured(serde_json::json!({
@@ -1226,11 +1285,9 @@ impl Tool for GetWindowStateTool {
             let after = match after {
                 Ok(Ok(after)) => after,
                 Ok(Err(error)) => {
-                    release_unpublished_tree_result(&tree_result);
                     return app_context_resolution_refusal(requested_pid, expected, &error);
                 }
                 Err(error) => {
-                    release_unpublished_tree_result(&tree_result);
                     return ToolResult::error(format!(
                         "Application-context revalidation task failed: {error}"
                     ))
@@ -1245,7 +1302,6 @@ impl Tool for GetWindowStateTool {
             match crate::ax::app_context::accept_revalidated_app_context(&before, after) {
                 Ok(after) => *context = after,
                 Err(after_context) => {
-                    release_unpublished_tree_result(&tree_result);
                     return app_context_changed_refusal(
                         requested_pid,
                         before.selection.window_id,
@@ -1291,7 +1347,6 @@ impl Tool for GetWindowStateTool {
             .await
             .unwrap_or(false)
             {
-                release_unpublished_tree_result(&tree_result);
                 return ToolResult::error(
                     "The application menu changed during observation. Re-observe the application; no menu pixels or new AX binding were published.",
                 ).with_structured(serde_json::json!({
@@ -1373,7 +1428,6 @@ impl Tool for GetWindowStateTool {
                         {
                             Ok(after) => after,
                             Err(_) => {
-                                release_unpublished_tree_result(&tree_result);
                                 return ToolResult::error(
                                 "The Open/Save panel changed before its observation could be committed. Re-observe the host application.",
                             )
@@ -1386,7 +1440,6 @@ impl Tool for GetWindowStateTool {
                         }
                     }
                     _ => {
-                        release_unpublished_tree_result(&tree_result);
                         return ToolResult::error(
                             "The Open/Save panel changed before its observation could be committed. Re-observe the host application.",
                         )
@@ -1403,7 +1456,6 @@ impl Tool for GetWindowStateTool {
                     .app_context_delegation_registry
                     .commit_observation(ticket, expected.clone(), context)
                 {
-                    release_unpublished_tree_result(&tree_result);
                     return ToolResult::error(
                         "The Open/Save panel changed before its observation could be committed. Re-observe the host application.",
                     )
@@ -1434,7 +1486,6 @@ impl Tool for GetWindowStateTool {
                 application_menu.as_ref(),
             )
         {
-            release_unpublished_tree_result(&tree_result);
             return ToolResult::error("Application-menu observation capacity is exhausted; no new observation or action binding was published.")
                 .with_structured(serde_json::json!({"code":"application_menu_observation_capacity","effect":"refused","retryable":true}));
         }
@@ -1524,11 +1575,11 @@ impl Tool for GetWindowStateTool {
                     crate::transient_ui::WindowTarget { pid, window_id },
                 );
             } else {
-                match tree_result.as_ref() {
+                match tree_result.as_mut() {
                     Some(result) if scope_matched => {
-                        self.state
-                            .element_cache
-                            .update(pid, window_id, snapshot_id, &result.nodes);
+                        result.publish_handles(
+                            &self.state.element_cache, pid, window_id, snapshot_id,
+                        );
                     }
                     _ => {
                         // A screenshot-only observation intentionally creates no
@@ -2837,6 +2888,8 @@ mod window_scope_contract_tests {
 mod tests {
     use super::*;
     use crate::ax::tree::AXNode;
+    use core_foundation::base::{CFGetRetainCount, CFRetain, CFTypeRef, TCFType};
+    use core_foundation::string::CFString;
     use cua_driver_core::element_query::project_elements_for_query;
 
     fn node(
@@ -2867,6 +2920,102 @@ mod tests {
             enabled: None,
             selected: None,
             in_web_content: false,
+        }
+    }
+
+    fn owned_tree_fixture(ptr: usize, borrowed_ptr: usize) -> OwnedTreeWalk {
+        unsafe { CFRetain(ptr as CFTypeRef) };
+        let mut action = node(Some(0), "AXButton", Some("Action"), 0, None, None);
+        action.element_ptr = ptr;
+        let mut display = node(None, "AXStaticText", Some("Context"), 0, None, None);
+        display.element_ptr = borrowed_ptr;
+        OwnedTreeWalk::new(crate::ax::tree::TreeWalkResult {
+            tree_markdown: String::new(),
+            nodes: vec![action, display],
+            truncated: false,
+            window_scope: None,
+            application_menu: None,
+        })
+    }
+
+    #[test]
+    fn unpublished_walk_releases_only_its_actionable_retains() {
+        let action = CFString::new(&format!("unpublished-action-{}", uuid::Uuid::new_v4()));
+        let display = CFString::new(&format!("borrowed-display-{}", uuid::Uuid::new_v4()));
+        let ptr = action.as_CFTypeRef();
+        let borrowed = display.as_CFTypeRef();
+        let base = unsafe { CFGetRetainCount(ptr) };
+        let display_base = unsafe { CFGetRetainCount(borrowed) };
+        let walk = owned_tree_fixture(ptr as usize, borrowed as usize);
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, base + 1);
+        drop(walk);
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, base);
+        assert_eq!(unsafe { CFGetRetainCount(borrowed) }, display_base);
+    }
+
+    #[test]
+    fn published_walk_transfers_retains_until_cache_replacement() {
+        let action = CFString::new(&format!("published-action-{}", uuid::Uuid::new_v4()));
+        let ptr = action.as_CFTypeRef();
+        let base = unsafe { CFGetRetainCount(ptr) };
+        let cache = crate::ax::ElementCache::new();
+        let mut walk = owned_tree_fixture(ptr as usize, 0);
+        walk.publish_handles(&cache, 701, 702, Some(703));
+        drop(walk);
+        assert_eq!(cache.element_count(701, 702), 1);
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, base + 1);
+        cache.update(701, 702, None, &[]);
+        assert_eq!(unsafe { CFGetRetainCount(ptr) }, base);
+    }
+
+    #[tokio::test]
+    async fn abandoned_blocking_walk_releases_a_late_result() {
+        struct NotifyOnDrop {
+            walk: Option<OwnedTreeWalk>,
+            dropped: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                drop(self.walk.take());
+                let _ = self.dropped.take().unwrap().send(());
+            }
+        }
+        let action = CFString::new(&format!("late-action-{}", uuid::Uuid::new_v4()));
+        let ptr = action.as_CFTypeRef() as usize;
+        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let worker = crate::foreground_activity::spawn_blocking(move || {
+            let walk = owned_tree_fixture(ptr, 0);
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            NotifyOnDrop { walk: Some(walk), dropped: Some(dropped_tx) }
+        });
+        ready_rx.await.unwrap();
+        // This is what timeout/drop does to a running blocking JoinHandle.
+        drop(worker);
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await.unwrap().unwrap();
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
+    }
+
+    #[test]
+    fn ax_walk_failures_identify_the_phase_without_guessing_the_app_cause() {
+        for (error, code) in [(None, "ax_tree_timeout"), (Some("worker cancelled"), "ax_tree_worker_failed")] {
+            let result = ax_tree_failure(701, 702, 120, 8, error);
+            assert_eq!(result.is_error, Some(true));
+            let detail = result.structured_content.unwrap();
+            assert_eq!(detail["code"], code);
+            assert_eq!(detail["phase"], "ax_tree_walk");
+            assert_eq!(detail["timeout_ms"], 20_000);
+            assert_eq!(detail["max_elements"], 120);
+            assert_eq!(detail["max_depth"], 8);
+            assert_eq!(detail["effect"], "refused");
+            let text = format!("{:?}", result.content);
+            assert!(!text.contains("pathologically"));
+            assert!(!text.contains("likely Arc"));
         }
     }
 
