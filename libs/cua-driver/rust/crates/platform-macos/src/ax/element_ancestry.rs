@@ -158,6 +158,65 @@ fn resolve_embedded_control<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u3
     None
 }
 
+/// A native text editor must have a complete reciprocal chain to the exact
+/// physical surface. An AXWindow attribute alone cannot distinguish a native
+/// field from a detached or incompletely exposed web input. This stricter
+/// proof authorizes editor focus preparation, not a new pointer/keyboard route.
+fn prove_native_text<T: Ancestry>(tree: &T, start: &T::Node, pid: i32, window_id: u32) -> bool {
+    if !matches!(tree.role(start).as_deref(), Some("AXTextField" | "AXTextArea")) {
+        return false;
+    }
+    let mut node = start.clone();
+    let mut visited: Vec<(T::Node, String)> = Vec::new();
+    for _ in 0..MAX_DEPTH {
+        if !tree.within_budget()
+            || tree.owner(&node) != Some(pid)
+            || visited.iter().any(|(prior, _)| tree.same(prior, &node))
+        {
+            return false;
+        }
+        let Some(role) = tree.role(&node).filter(|role| !role.is_empty()) else {
+            return false;
+        };
+        match role.as_str() {
+            "AXWebArea" | "AXApplication" => return false,
+            "AXWindow" | "AXSheet" | "AXPopover" => {
+                if tree.window_id(&node) != Some(window_id) || !tree.owns_window(pid, window_id) {
+                    return false;
+                }
+                // Focus may follow immediately: do not authorize it from a
+                // chain that detached while the remaining ancestors were read.
+                for (index, (child, observed_role)) in visited.iter().enumerate() {
+                    let parent = visited.get(index + 1).map_or(&node, |(parent, _)| parent);
+                    if !tree.within_budget()
+                        || tree.owner(child) != Some(pid)
+                        || tree.role(child).as_deref() != Some(observed_role.as_str())
+                        || !tree.relation(child, "AXParent").is_some_and(|live| tree.same(&live, parent))
+                        || !tree.contains_child(parent, child)
+                    {
+                        return false;
+                    }
+                }
+                return tree.within_budget()
+                    && tree.owner(&node) == Some(pid)
+                    && tree.role(&node).as_deref() == Some(role.as_str())
+                    && tree.window_id(&node) == Some(window_id)
+                    && tree.owns_window(pid, window_id);
+            }
+            _ => {}
+        }
+        let Some(parent) = tree.relation(&node, "AXParent") else {
+            return false;
+        };
+        if !tree.contains_child(&parent, &node) {
+            return false;
+        }
+        visited.push((node, role));
+        node = parent;
+    }
+    false
+}
+
 struct Node(AXUIElementRef);
 impl Clone for Node {
     fn clone(&self) -> Self {
@@ -244,6 +303,15 @@ pub(super) unsafe fn parent_window_id(element: AXUIElementRef) -> Option<u32> {
     native_window_id(element, false)
 }
 
+/// # Safety
+/// The addressed element stays retained with a bounded AX messaging timeout.
+pub(super) unsafe fn proves_native_text(element: AXUIElementRef, pid: i32, window_id: u32) -> bool {
+    CFRetain(element as CFTypeRef);
+    let node = Node(element);
+    let tree = Native(Instant::now() + Duration::from_secs(1));
+    prove_native_text(&tree, &node, pid, window_id)
+}
+
 unsafe fn native_window_id(element: AXUIElementRef, allow_window_attribute: bool) -> Option<u32> {
     CFRetain(element as CFTypeRef);
     let node = Node(element);
@@ -323,6 +391,43 @@ mod tests {
             child_checks: Cell::new(0),
             fail_child_check_after: None,
             expired: false,
+        }
+    }
+    #[test]
+    fn native_text_preparation_requires_the_exact_reciprocal_surface() {
+        let mut t = sheet();
+        t.nodes.get_mut(&0).unwrap().0 = "AXTextField";
+        assert!(prove_native_text(&t, &0, 42, 8));
+        assert!(!prove_native_text(&t, &0, 42, 7));
+        t.nodes.get_mut(&0).unwrap().1 = Some(2);
+        t.children.insert(2, vec![0, 1]);
+        assert!(prove_native_text(&t, &0, 42, 7));
+        t.nodes.get_mut(&0).unwrap().0 = "AXTextArea";
+        assert!(prove_native_text(&t, &0, 42, 7));
+        t.nodes.get_mut(&0).unwrap().1 = None;
+        // A plausible AXWindow=7 still does not authorize editor focus.
+        assert_eq!(resolve(&t, &0), Some(7));
+        assert!(!prove_native_text(&t, &0, 42, 7));
+    }
+
+    #[test]
+    fn native_text_preparation_rejects_web_unknown_detached_or_foreign_nodes() {
+        for kind in 0..10 {
+            let mut t = sheet();
+            t.nodes.get_mut(&0).unwrap().0 = "AXTextField";
+            match kind {
+                0 => t.nodes.get_mut(&0).unwrap().0 = "AXButton",
+                1 => t.nodes.get_mut(&1).unwrap().0 = "AXWebArea",
+                2 => t.nodes.get_mut(&1).unwrap().0 = "AXApplication",
+                3 => t.nodes.get_mut(&1).unwrap().0 = "",
+                4 => t.nodes.get_mut(&1).unwrap().4 = 99,
+                5 => { t.children.insert(1, Vec::new()); }
+                6 => t.nodes.get_mut(&0).unwrap().1 = Some(0),
+                7 => t.expired = true,
+                8 => { t.window_owners.insert(8, 99); }
+                _ => t.fail_child_check_after = Some(1),
+            }
+            assert!(!prove_native_text(&t, &0, 42, 8), "case {kind}");
         }
     }
     #[test]

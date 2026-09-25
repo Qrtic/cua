@@ -11,8 +11,10 @@
 //! * **AXDateTimeArea**: Write a typed CFDate parsed from an explicit RFC 3339
 //!   timestamp. A locale-dependent date or a time without a zone is rejected.
 //!
-//! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
-//!   text fields that expose a settable AXValue).
+//! * **Native text fields**: Enter the exact field's editor before writing
+//!   `AXValue`, so AppKit commits the value when the form is saved.
+//!
+//! * **Everything else**: Write `AXValue` directly (sliders, steppers).
 
 use async_trait::async_trait;
 use cua_driver_core::{
@@ -61,8 +63,10 @@ fn def() -> &'static ToolDef {
              with an explicit timezone offset. Preserve components the user did not \
              ask to change; do not send a plain time or locale-dependent date.\n\
              \n\
-             - **All other elements**: writes AXValue directly (sliders, steppers, \
-             native text fields that expose settable AXValue).\n\
+             - **Native text fields**: prepares and verifies the exact field's \
+             editing focus before writing a string AXValue.\n\
+             \n\
+             - **All other elements**: writes AXValue directly (sliders, steppers).\n\
              \n\
              For free-form text entry into web inputs, prefer `type_text_chars` \
              which synthesises key events — AXValue writes are ignored by WebKit."
@@ -192,7 +196,7 @@ impl Tool for SetValueTool {
         // window immediately before any cursor or AX work; a cache hit alone
         // is not delivery proof after a window lifecycle or Space change.
         let route_element = element_guard.clone();
-        let (native_date, attached_popover_value) =
+        let (native_date, native_text, attached_popover_value) =
             match crate::foreground_activity::spawn_blocking(move || unsafe {
                 let element = route_element.as_ptr() as AXUIElementRef;
                 let role = copy_string_attr(element, "AXRole");
@@ -201,7 +205,11 @@ impl Tool for SetValueTool {
                     && crate::ax::attached_popover::has_displaced_popover_window(
                         element, window_id,
                     );
-                (native_date, attached)
+                let native_text = crate::ax::attached_popover::native_text_role(role.as_deref())
+                    && (attached || crate::ax::exact_target::native_text_field_in_window(
+                        element, pid, window_id,
+                    ));
+                (native_date, native_text, attached)
             })
             .await
             {
@@ -292,12 +300,13 @@ impl Tool for SetValueTool {
                             attached_popover_value,
                             &value,
                         )
-                    } else if attached_popover_value {
-                        set_attached_popover_text_value(
+                    } else if native_text {
+                        set_native_text_value(
                             element_ptr,
                             element_index,
                             pid,
                             window_id,
+                            attached_popover_value,
                             &value,
                         )
                     } else {
@@ -413,13 +422,14 @@ trait NativeValueField {
     fn set_value(&self, value: &str) -> i32;
 }
 
-struct LiveNativePopoverTextField {
+struct LiveNativeTextField {
     element_ptr: usize,
     pid: i32,
     window_id: u32,
+    attached: bool,
 }
 
-impl NativeValueField for LiveNativePopoverTextField {
+impl NativeValueField for LiveNativeTextField {
     fn validate(&self) -> anyhow::Result<()> {
         use cua_driver_core::background_input::{
             decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
@@ -430,25 +440,33 @@ impl NativeValueField for LiveNativePopoverTextField {
             self.window_id,
             Some(self.element_ptr),
         );
+        let action = if self.attached {
+            BackgroundAction::AttachedPopoverSemantic
+        } else {
+            BackgroundAction::AxSemantic
+        };
         if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
             ExactWindowTarget {
                 pid: self.pid,
                 window_id: self.window_id,
             },
             &facts,
-            BackgroundAction::AttachedPopoverSemantic,
+            action,
         ) {
             anyhow::bail!(
-                "Native popover text write refused before dispatch: {}",
+                "Native text write refused before dispatch: {}",
                 refusal.reason
             );
         }
         let role = unsafe { copy_string_attr(element, "AXRole") };
         if !crate::ax::attached_popover::native_text_role(role.as_deref())
+            || (!self.attached && !unsafe {
+                crate::ax::exact_target::native_text_field_in_window(element, self.pid, self.window_id)
+            })
             || unsafe { crate::ax::bindings::copy_bool_attr(element, "AXEnabled") } == Some(false)
             || !unsafe { crate::ax::bindings::is_attribute_settable(element, "AXValue") }
         {
-            anyhow::bail!("Native popover target is not an enabled, settable text field; no value write was sent");
+            anyhow::bail!("Native target is not a proven, enabled, settable text field; no value write was sent");
         }
         crate::foreground_activity::check_request()
     }
@@ -484,8 +502,7 @@ impl NativeValueField for LiveNativePopoverTextField {
 }
 
 struct LiveNativeDateField {
-    base: LiveNativePopoverTextField,
-    attached: bool,
+    base: LiveNativeTextField,
     requested_absolute_time: f64,
 }
 
@@ -500,7 +517,7 @@ impl NativeValueField for LiveNativeDateField {
             self.base.window_id,
             Some(self.base.element_ptr),
         );
-        let action = if self.attached {
+        let action = if self.base.attached {
             BackgroundAction::AttachedPopoverSemantic
         } else {
             BackgroundAction::AxSemantic
@@ -568,12 +585,12 @@ fn set_native_date_value(
     })?;
     write_native_value(
         &LiveNativeDateField {
-            base: LiveNativePopoverTextField {
+            base: LiveNativeTextField {
                 element_ptr,
                 pid,
                 window_id,
+                attached,
             },
-            attached,
             requested_absolute_time,
         },
         element_index,
@@ -600,20 +617,22 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
     }
 }
 
-/// A projected text field stays bound to its physical popover. Do not run the
-/// generic numeric, increment/decrement, option-selection or keyboard paths.
-fn set_attached_popover_text_value(
+/// Prepare only a proven native field. A projected field stays bound to its
+/// physical popover. Text never enters numeric, stepping or keyboard fallbacks.
+fn set_native_text_value(
     element_ptr: usize,
     element_index: usize,
     pid: i32,
     window_id: u32,
+    attached: bool,
     value: &str,
 ) -> anyhow::Result<SetValueOutcome> {
     write_native_value(
-        &LiveNativePopoverTextField {
+        &LiveNativeTextField {
             element_ptr,
             pid,
             window_id,
+            attached,
         },
         element_index,
         value,

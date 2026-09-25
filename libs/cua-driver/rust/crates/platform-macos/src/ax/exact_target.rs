@@ -35,6 +35,15 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
     super::element_ancestry::window_id(element)
 }
 
+/// Prove a text editor's native ancestry before preparing its field focus.
+/// This does not replace the ordinary exact-window admission checks.
+///
+/// # Safety
+/// `element` must remain retained with its bounded messaging timeout.
+pub(crate) unsafe fn native_text_field_in_window(element: AXUIElementRef, pid: i32, window_id: u32) -> bool {
+    super::element_ancestry::proves_native_text(element, pid, window_id)
+}
+
 /// The process's focused AX element, but only when it provably belongs to the
 /// requested window. Returns a retained element the caller must release.
 ///
