@@ -565,8 +565,15 @@ pub(crate) fn resolve_app_context(
         });
     }
     let snapshot = collect_app_context_snapshot(pid);
-    let selection =
-        select_app_context_window(&snapshot).map_err(AppContextResolveError::Selection)?;
+    let selection = select_app_context_window(&snapshot).map_err(|error| {
+        // Preserve native attribute error codes for transient AX failures.
+        // The snapshot contains status/window IDs, never document text. This
+        // is diagnostic evidence only; selection and input authority do not
+        // change, and no failed action is replayed.
+        tracing::debug!(target: "cua_app_context", pid,
+            reason = error.as_str(), ?snapshot, "AX app-context selection unavailable");
+        AppContextResolveError::Selection(error)
+    })?;
     let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
     if !enumeration.succeeded {
         return Err(AppContextResolveError::WindowServerUnavailable);
