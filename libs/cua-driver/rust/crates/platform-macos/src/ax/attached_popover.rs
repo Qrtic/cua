@@ -1,7 +1,8 @@
 //! Semantic-only proof for an AXPopover or its button attached to one host window.
 //!
-//! Pages color swatches name the popover (a distinct CGWindowID) as AXWindow,
-//! while the popover's reciprocal AXParent chain and AXWindow name the document.
+//! A button can name either the AXPopover (Pages) or the document host (Keynote)
+//! as AXWindow. Its physical window ID must match the actual AXPopover, which
+//! must remain in its reciprocal AXParent chain and name the exact host.
 //! Keep that physical window identity intact for pointer and keyboard routing.
 
 use super::bindings::{
@@ -43,6 +44,40 @@ fn prove<T: PopoverTree>(tree: &T, pid: i32, host_id: u32, element: &T::Node) ->
     }
 }
 
+fn containing_popover<T: PopoverTree>(
+    tree: &T,
+    pid: i32,
+    element: &T::Node,
+) -> Result<T::Node, &'static str> {
+    let mut current = element.clone();
+    let mut visited = Vec::new();
+    for _ in 0..MAX_DEPTH {
+        if !tree.within_budget() {
+            return Err("popover_lookup_deadline");
+        }
+        if tree.owner(&current) != Some(pid) {
+            return Err("popover_lookup_owner_mismatch");
+        }
+        if visited.iter().any(|node| tree.same(node, &current)) {
+            return Err("popover_lookup_cycle");
+        }
+        match tree.role(&current).as_deref() {
+            Some("AXPopover") => return Ok(current),
+            Some("AXButton" | "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup") => {}
+            _ => return Err("popover_lookup_boundary"),
+        }
+        let parent = tree
+            .parent(&current)
+            .ok_or("popover_lookup_parent_missing")?;
+        if !tree.contains_child(&parent, &current) {
+            return Err("popover_lookup_child_relation_missing");
+        }
+        visited.push(current);
+        current = parent;
+    }
+    Err("popover_lookup_depth_limit")
+}
+
 fn prove_checked<T: PopoverTree>(
     tree: &T,
     pid: i32,
@@ -50,12 +85,21 @@ fn prove_checked<T: PopoverTree>(
     element: &T::Node,
 ) -> Result<(), &'static str> {
     // The root can advertise AXCancel. Its AXWindow names the host, whereas a
-    // button's AXWindow names the popover. Keep both physical identities intact.
+    // button's AXWindow can name the popover or the document host. That logical
+    // attribute does not replace the button's independently read physical ID.
     let is_popover_root = tree.role(element).as_deref() == Some("AXPopover");
+    let mut button_window = None;
     let popover = if is_popover_root {
         element.clone()
     } else if tree.role(element).as_deref() == Some("AXButton") {
-        tree.window(element).ok_or("element_window_missing")?
+        let window = tree.window(element).ok_or("element_window_missing")?;
+        let popover = match tree.role(&window).as_deref() {
+            Some("AXPopover") => window.clone(),
+            Some("AXWindow") => containing_popover(tree, pid, element)?,
+            _ => return Err("element_window_not_popover"),
+        };
+        button_window = Some(window);
+        popover
     } else {
         return Err("element_not_button_or_popover");
     };
@@ -74,6 +118,14 @@ fn prove_checked<T: PopoverTree>(
     let Some(host) = tree.window(&popover) else {
         return Err("popover_host_attribute_missing");
     };
+    if let Some(window) = &button_window {
+        if tree.owner(window) != Some(pid)
+            || tree.window_id(element) != Some(popover_id)
+            || !(tree.same(window, &popover) || tree.same(window, &host))
+        {
+            return Err("button_window_does_not_match_popover_or_host");
+        }
+    }
     if !matches!(tree.role(&host).as_deref(), Some("AXWindow" | "AXSheet")) {
         return Err("host_role_unexpected");
     }
@@ -107,9 +159,19 @@ fn prove_checked<T: PopoverTree>(
                     tree.same(element, &popover)
                         && tree.role(element).as_deref() == Some("AXPopover")
                 } else {
-                    tree.window(element)
-                        .is_some_and(|node| tree.same(&node, &popover))
+                    button_window.as_ref().is_some_and(|window| {
+                        tree.window(element)
+                            .is_some_and(|node| tree.same(&node, window))
+                            && tree.owner(window) == Some(pid)
+                            && tree.window_id(element) == Some(popover_id)
+                            && (tree.same(window, &popover) || tree.same(window, &host))
+                            && matches!(
+                                tree.role(window).as_deref(),
+                                Some("AXPopover" | "AXWindow")
+                            )
+                    })
                 }
+                && tree.role(&popover).as_deref() == Some("AXPopover")
                 && tree
                     .window(&popover)
                     .is_some_and(|node| tree.same(&node, &host))
@@ -121,7 +183,10 @@ fn prove_checked<T: PopoverTree>(
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
             }
-            Some("AXButton" | "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup") => {}
+            Some(
+                "AXButton" | "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup"
+                | "AXToolbar",
+            ) => {}
             // A different top-level window, nested popover, web subtree or
             // application root cannot be treated as an attachment to this host.
             _ => {
@@ -250,22 +315,18 @@ fn requires_host_attachment(
     physical_window: Option<u32>,
     host_id: u32,
 ) -> bool {
-    role == Some("AXPopover") && physical_window.is_some_and(|id| id != host_id)
+    matches!(role, Some("AXPopover" | "AXButton"))
+        && physical_window.is_some_and(|id| id != host_id)
 }
 
 /// Cheap classification only. Exact popover-window targets keep the ordinary
 /// route; the full attachment proof is mandatory only for a displaced host.
 pub(crate) unsafe fn has_displaced_popover_window(element: AXUIElementRef, host_id: u32) -> bool {
-    if copy_string_attr(element, "AXRole").as_deref() == Some("AXPopover") {
-        return requires_host_attachment(Some("AXPopover"), ax_get_window_id(element), host_id);
-    }
-    let Some(window) = copy_element_attr(element, "AXWindow").and_then(|ptr| AxNode::owned(ptr))
-    else {
-        return false;
-    };
+    // Keynote's AXWindow attribute points to the host even though the button
+    // physically lives in a separate popover. Classify the actual element ID.
     requires_host_attachment(
-        copy_string_attr(window.0, "AXRole").as_deref(),
-        ax_get_window_id(window.0),
+        copy_string_attr(element, "AXRole").as_deref(),
+        ax_get_window_id(element),
         host_id,
     )
 }
@@ -452,7 +513,81 @@ mod tests {
         assert!(!requires_host_attachment(Some("AXPopover"), Some(900), 900));
         assert!(requires_host_attachment(Some("AXPopover"), Some(900), 700));
         assert!(!requires_host_attachment(Some("AXPopover"), None, 700));
+        // Classification only. A displaced physical window still needs a
+        // separate, reciprocal AXPopover attachment before any action.
+        assert!(requires_host_attachment(Some("AXButton"), Some(900), 700));
         assert!(!requires_host_attachment(Some("AXWindow"), Some(900), 700));
+        assert!(!requires_host_attachment(Some("AXWindow"), Some(700), 700));
+    }
+    fn wrapped_toolbar_popover() -> Tree {
+        let mut tree = pages();
+        tree.nodes.get_mut(&0).unwrap().window = Some(6);
+        tree.nodes.get_mut(&3).unwrap().role = "AXButton";
+        tree.nodes.get_mut(&4).unwrap().role = "AXToolbar";
+        tree.nodes.insert(
+            9,
+            Node {
+                identity: 9,
+                role: "AXWindow",
+                owner: 42,
+                window: None,
+                id: Some(900),
+                parent: None,
+                children: vec![],
+            },
+        );
+        tree
+    }
+    #[test]
+    fn logical_host_window_does_not_hide_a_physical_toolbar_popover() {
+        assert!(prove(&wrapped_toolbar_popover(), 42, 700, &0));
+        assert!(prove(&wrapped_toolbar_popover(), 42, 700, &2));
+        assert!(!prove(&wrapped_toolbar_popover(), 42, 701, &0));
+    }
+    #[test]
+    fn logical_host_requires_matching_physical_popover_and_exact_identity() {
+        for id in [None, Some(700), Some(901)] {
+            let mut tree = wrapped_toolbar_popover();
+            tree.nodes.get_mut(&0).unwrap().id = id;
+            assert!(!prove(&tree, 42, 700, &0));
+        }
+        let mut tree = wrapped_toolbar_popover();
+        tree.nodes.get_mut(&6).unwrap().owner = 99;
+        assert!(!prove(&tree, 42, 700, &0));
+        for role in ["AXSheet", "AXApplication", "AXWebArea", "AXGroup"] {
+            let mut tree = wrapped_toolbar_popover();
+            tree.nodes.get_mut(&0).unwrap().window = Some(9);
+            tree.nodes.get_mut(&9).unwrap().role = role;
+            assert!(!prove(&tree, 42, 700, &0), "wrapper {role}");
+        }
+        let mut tree = wrapped_toolbar_popover();
+        tree.nodes.get_mut(&0).unwrap().window = Some(9);
+        assert!(!prove(&tree, 42, 700, &0), "unrelated AXWindow wrapper");
+    }
+    #[test]
+    fn wrapper_never_substitutes_for_a_live_attached_popover() {
+        for role in [
+            "AXWindow",
+            "AXSheet",
+            "AXApplication",
+            "AXWebArea",
+            "AXUnknown",
+        ] {
+            let mut tree = wrapped_toolbar_popover();
+            tree.nodes.get_mut(&2).unwrap().role = role;
+            assert!(!prove(&tree, 42, 700, &0), "ancestor {role}");
+        }
+        for i in 1..=6 {
+            let mut tree = wrapped_toolbar_popover();
+            tree.nodes.get_mut(&i).unwrap().children.clear();
+            assert!(!prove(&tree, 42, 700, &0), "detached ancestor {i}");
+        }
+        let mut tree = wrapped_toolbar_popover();
+        tree.reattach = true;
+        assert!(!prove(&tree, 42, 700, &0));
+        let tree = wrapped_toolbar_popover();
+        tree.budget.set(2);
+        assert!(!prove(&tree, 42, 700, &0));
     }
     #[test]
     fn equivalent_proxy_identity_is_accepted() {
