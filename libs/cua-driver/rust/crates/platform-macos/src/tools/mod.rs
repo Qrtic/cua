@@ -1938,6 +1938,23 @@ pub(crate) async fn guard_same_pid_transient_target(
     })?;
     match detection {
         crate::transient_ui::SamePidTransientDetection::None => Ok(()),
+        crate::transient_ui::SamePidTransientDetection::AttachedSheet(proof) => Err(
+            cua_driver_core::protocol::ToolResult::error(
+                "The requested window has a focused attached sheet. Observe that exact sheet before acting; no input was sent."
+            ).with_structured(serde_json::json!({
+                "code": "same_pid_transient_in_front",
+                "effect": "refused", "retryable": true,
+                "pid": pid, "window_id": window_id,
+                "redirect": {
+                    "kind": "same_pid_attached_sheet", "pid": pid, "window_id": proof.window_id,
+                    "proof": {
+                        "same_pid": true, "focused": true, "reciprocal_attachment": true,
+                        "host_in_ax_windows": true, "visible_chain": true,
+                        "host_window_id": proof.host_id, "path": proof.path
+                    }
+                }
+            }))
+        ),
         crate::transient_ui::SamePidTransientDetection::Unique(proof) => {
             Err(same_pid_transient_refusal(proof))
         }

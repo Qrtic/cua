@@ -318,6 +318,52 @@ pub(crate) fn copy_focused_attached_sheet(pid: i32, window_id: u32) -> Option<AX
     }
 }
 
+/// Read-only successor discovery, including sheets omitted from AXWindows.
+/// This proof grants no foreground lease and never aliases sheet input to its
+/// parent. Every caller must obtain a fresh observation of `window_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttachedSheetSuccessor {
+    pub window_id: u32,
+    pub host_id: u32,
+    pub path: Vec<u32>,
+}
+
+fn prove_successor<T: SheetTree>(tree: &T, pid: i32, source: u32) -> Option<AttachedSheetSuccessor> {
+    let focused = tree.focused()?;
+    let requested = tree.window_id(&focused)?;
+    if requested == source {
+        return None;
+    }
+    let chain = prove_chain(tree, pid, requested)?;
+    if !chain.window_ids.iter().skip(1).any(|id| *id == source)
+        || !visible_chain(tree, pid, &chain)
+    {
+        return None;
+    }
+    let current = prove_chain(tree, pid, requested)?;
+    if chain.window_ids != current.window_ids
+        || !chain.nodes.iter().zip(&current.nodes).all(|(a, b)| tree.same(a, b))
+        || !tree.within_budget()
+    {
+        return None;
+    }
+    Some(AttachedSheetSuccessor {
+        window_id: requested,
+        host_id: *chain.window_ids.last()?,
+        path: chain.window_ids,
+    })
+}
+
+pub(crate) fn focused_attached_sheet_successor(pid: i32, source: u32) -> Option<AttachedSheetSuccessor> {
+    unsafe {
+        let tree = NativeTree {
+            app: Node::owned(AXUIElementCreateApplication(pid))?,
+            deadline: Instant::now() + Duration::from_secs(2),
+        };
+        prove_successor(&tree, pid, source)
+    }
+}
+
 /// Native proof of a focused Open/Save panel or one of its attached sheets.
 /// IDs describe the checked chain; they never grant input to its other members.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -623,6 +669,51 @@ mod tests {
     fn discovers_focused_sheet_missing_from_top_level_windows() {
         let sheet = prove(&pages(), 42, 900).unwrap();
         assert_eq!(sheet.window, 900);
+    }
+
+    #[test]
+    fn attached_sheet_successor_preserves_exact_target_without_foreground_authority() {
+        let mut tree = pages();
+        tree.sheet.identifier = "AdjustSize";
+        let successor = prove_successor(&tree, 42, 700).unwrap();
+        assert_eq!(successor.window_id, 900);
+        assert_eq!(successor.host_id, 700);
+        assert_eq!(successor.path, vec![900, 700]);
+        // Observation redirect does not make an arbitrary sheet a standard
+        // Open/Save foreground segment.
+        assert!(dialog_host(&pages_with_identifier("AdjustSize"), 42, 900).is_none());
+        assert!(prove_successor(&pages(), 42, 900).is_none());
+        assert!(prove_successor(&pages(), 42, 701).is_none());
+    }
+
+    fn pages_with_identifier(identifier: &'static str) -> Tree {
+        let mut tree = pages();
+        tree.sheet.identifier = identifier;
+        tree
+    }
+
+    #[test]
+    fn attached_sheet_successor_rejects_stale_hidden_unowned_or_nonreciprocal_chains() {
+        for alter in [
+            |t: &mut Tree| t.attached = false,
+            |t: &mut Tree| t.matching_window_relation = false,
+            |t: &mut Tree| t.host_listed = false,
+            |t: &mut Tree| t.owned = false,
+            |t: &mut Tree| t.sheet.owner = 99,
+            |t: &mut Tree| t.host.owner = 99,
+            |t: &mut Tree| t.sheet.role = "AXWindow",
+            |t: &mut Tree| t.sheet.window = t.host.window,
+            |t: &mut Tree| t.sheet_on_screen = false,
+            |t: &mut Tree| t.host_on_screen = false,
+            |t: &mut Tree| t.host_minimized = Ok(true),
+            |t: &mut Tree| t.sheet_minimized = Err(super::super::bindings::kAXErrorCannotComplete),
+            |t: &mut Tree| t.focus_changed = true,
+            |t: &mut Tree| t.budget.set(0),
+        ] {
+            let mut tree = pages();
+            alter(&mut tree);
+            assert!(prove_successor(&tree, 42, 700).is_none());
+        }
     }
 
     #[test]

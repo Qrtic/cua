@@ -118,10 +118,11 @@ pub(crate) struct SamePidTransientProof {
     pub(crate) classification: SamePidTransientClassification,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SamePidTransientDetection {
     None,
     Unique(SamePidTransientProof),
+    AttachedSheet(crate::ax::attached_sheet::AttachedSheetSuccessor),
     Ambiguous,
     Indeterminate,
 }
@@ -333,6 +334,19 @@ pub(crate) fn detect_same_pid_transient_in_front(
         return SamePidTransientDetection::Indeterminate;
     }
     let windows = enumeration.windows;
+    // AppKit can omit an attached AXSheet from AXWindows and leave the document
+    // as AXMainWindow. Geometry only gates this read; reciprocal AX attachment,
+    // exact focus, ownership and visible-chain revalidation authorize the hop.
+    if windows.iter().any(|window| window.pid == source.pid
+        && window.window_id != source.window_id && window.is_on_screen
+        && window.on_current_space != Some(false))
+    {
+        if let Some(proof) = crate::ax::attached_sheet::focused_attached_sheet_successor(
+            source.pid, source.window_id,
+        ) {
+            return SamePidTransientDetection::AttachedSheet(proof);
+        }
+    }
     // Avoid an AX round-trip on the overwhelmingly common single-window path.
     // WindowServer geometry is only a prefilter; it never authorizes a
     // redirect without the exact AX focus/main proof collected below.
