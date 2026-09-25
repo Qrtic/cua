@@ -33,12 +33,17 @@ trait MenuVisualTree: MenuTree {
     fn frame(&self, node: &Self::Node) -> Option<[f64; 4]>;
 }
 
-fn select_menu_image<T: MenuVisualTree>(
+struct MenuProjection<N> {
+    root: N,
+    image: ApplicationMenuImage,
+}
+
+fn select_menu_projection<T: MenuVisualTree>(
     tree: &T,
     pid: i32,
     document_window_id: u32,
     windows: &[crate::windows::WindowInfo],
-) -> Option<ApplicationMenuImage> {
+) -> Option<MenuProjection<T::Node>> {
     if tree.focused_window() != Some(document_window_id) {
         return None;
     }
@@ -119,13 +124,26 @@ fn select_menu_image<T: MenuVisualTree>(
     {
         return None;
     }
-    Some(ApplicationMenuImage {
-        pid,
-        document_window_id,
-        menu_window_id: window.window_id,
-        document_bounds: document.bounds.clone(),
-        menu_bounds: window.bounds.clone(),
+    Some(MenuProjection {
+        root: selected.clone(),
+        image: ApplicationMenuImage {
+            pid,
+            document_window_id,
+            menu_window_id: window.window_id,
+            document_bounds: document.bounds.clone(),
+            menu_bounds: window.bounds.clone(),
+        },
     })
+}
+
+#[cfg(test)]
+fn select_menu_image<T: MenuVisualTree>(
+    tree: &T,
+    pid: i32,
+    document_window_id: u32,
+    windows: &[crate::windows::WindowInfo],
+) -> Option<ApplicationMenuImage> {
+    select_menu_projection(tree, pid, document_window_id, windows).map(|menu| menu.image)
 }
 
 fn bounds_frame(bounds: &crate::windows::WindowBounds) -> [f64; 4] {
@@ -351,12 +369,25 @@ impl MenuVisualTree for NativeMenuTree {
     }
 }
 
+/// A retained AX menu root backed by the same document/WindowServer proof as
+/// its image. The root is borrowed only inside the caller's blocking AX walk.
+pub(crate) struct ApplicationMenuProjection {
+    root: AxNode,
+    pub(crate) image: ApplicationMenuImage,
+}
+
+impl ApplicationMenuProjection {
+    pub(crate) fn root(&self) -> AXUIElementRef {
+        self.root.0
+    }
+}
+
 /// Select one currently visible application menu, never an arbitrary same-app
 /// palette or unrelated document. No application activation or AX action.
-pub(crate) fn active_application_menu(
+pub(crate) fn active_application_menu_projection(
     pid: i32,
     document_window_id: u32,
-) -> Option<ApplicationMenuImage> {
+) -> Option<ApplicationMenuProjection> {
     let enumeration = crate::windows::all_windows_including_accessory_layers_with_snapshot();
     if !enumeration.succeeded {
         return None;
@@ -388,21 +419,34 @@ pub(crate) fn active_application_menu(
         app,
         deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
     };
-    select_menu_image(&tree, pid, document_window_id, &enumeration.windows)
+    let selected = select_menu_projection(&tree, pid, document_window_id, &enumeration.windows)?;
+    Some(ApplicationMenuProjection {
+        root: selected.root,
+        image: selected.image,
+    })
+}
+
+pub(crate) fn active_application_menu(
+    pid: i32,
+    document_window_id: u32,
+) -> Option<ApplicationMenuImage> {
+    active_application_menu_projection(pid, document_window_id).map(|menu| menu.image)
+}
+
+pub(crate) fn same_menu_scope(left: &ApplicationMenuImage, right: &ApplicationMenuImage) -> bool {
+    left.pid == right.pid
+        && left.document_window_id == right.document_window_id
+        && left.menu_window_id == right.menu_window_id
+        && frames_match(&bounds_frame(&left.menu_bounds), &bounds_frame(&right.menu_bounds))
+        && frames_match(
+            &bounds_frame(&left.document_bounds),
+            &bounds_frame(&right.document_bounds),
+        )
 }
 
 pub(crate) fn revalidate_menu_image(image: &ApplicationMenuImage) -> bool {
-    active_application_menu(image.pid, image.document_window_id).is_some_and(|current| {
-        current.menu_window_id == image.menu_window_id
-            && frames_match(
-                &bounds_frame(&current.menu_bounds),
-                &bounds_frame(&image.menu_bounds),
-            )
-            && frames_match(
-                &bounds_frame(&current.document_bounds),
-                &bounds_frame(&image.document_bounds),
-            )
-    })
+    active_application_menu(image.pid, image.document_window_id)
+        .is_some_and(|current| same_menu_scope(&current, image))
 }
 
 // This is an observation-scope guard, not a new pointer route. A tree-only
@@ -694,8 +738,10 @@ mod tests {
     }
     #[test]
     fn menu_image_keeps_document_anchor_and_selects_only_proven_popup() {
-        let image = select_menu_image(&visual_tree(), 42, 7, &visual_windows())
+        let projection = select_menu_projection(&visual_tree(), 42, 7, &visual_windows())
             .expect("the current AX menu has an exact same-owner CG frame");
+        assert_eq!(projection.root, 2, "walk the proven visible menu rather than the document or other menu branches");
+        let image = projection.image;
         assert_eq!(
             (image.pid, image.document_window_id, image.menu_window_id),
             (42, 7, 9)

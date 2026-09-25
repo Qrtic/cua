@@ -398,10 +398,9 @@ fn capture_screenshot(
     Ok((png, width, height, resized_from_width, bounds, scale))
 }
 
-fn apply_application_menu_metadata(
+fn apply_application_menu_scope_metadata(
     structured: &mut Value,
     menu: &crate::ax::application_menu::ApplicationMenuImage,
-    scale: f64,
 ) {
     // AX tokens remain document-anchored; these pixels deliberately do not.
     structured["window_bounds"] = serde_json::json!({
@@ -411,7 +410,6 @@ fn apply_application_menu_metadata(
     structured["screenshot_scope"] = serde_json::json!("application_menu");
     structured["screenshot_coordinates_actionable"] = serde_json::json!(false);
     structured["screenshot_target"] = serde_json::json!("application_menu.visual_target");
-    structured["screenshot_scale"] = serde_json::json!(scale);
     structured["application_menu"] = serde_json::json!({
         "host_pid":menu.pid,"host_window_id":menu.document_window_id,
         "visual_target":{
@@ -422,6 +420,28 @@ fn apply_application_menu_metadata(
             },
         },
     });
+}
+
+fn apply_application_menu_metadata(
+    structured: &mut Value,
+    menu: &crate::ax::application_menu::ApplicationMenuImage,
+    scale: f64,
+) {
+    apply_application_menu_scope_metadata(structured, menu);
+    structured["screenshot_scale"] = serde_json::json!(scale);
+}
+
+fn application_menu_branches_match(
+    tree: Option<&crate::ax::application_menu::ApplicationMenuImage>,
+    screenshot: Option<&crate::ax::application_menu::ApplicationMenuImage>,
+) -> bool {
+    match (tree, screenshot) {
+        (None, None) => true,
+        (Some(tree), Some(screenshot)) => {
+            crate::ax::application_menu::same_menu_scope(tree, screenshot)
+        }
+        _ => false,
+    }
 }
 
 fn chromium_browser_window(pid: i32) -> bool {
@@ -1092,6 +1112,14 @@ impl Tool for GetWindowStateTool {
                         max_elements,
                         max_depth,
                     )
+                } else if !observation_only {
+                    crate::ax::tree::walk_tree_bounded_with_visible_menu(
+                        pid,
+                        window_id,
+                        q.as_deref(),
+                        max_elements,
+                        max_depth,
+                    )
                 } else {
                     crate::ax::tree::walk_tree_bounded(
                         pid,
@@ -1151,7 +1179,23 @@ impl Tool for GetWindowStateTool {
             Ok(tree) => tree,
             Err(error) => return error,
         };
-        let (captured_screenshot, screenshot_frame_error, application_menu) = screenshot_result;
+        let (captured_screenshot, screenshot_frame_error, screenshot_menu) = screenshot_result;
+        let tree_menu = tree_result.as_ref().and_then(|tree| tree.application_menu.as_ref());
+        // Reject a menu opening, closing, or changing between the parallel
+        // reads instead of combining menu AX with document or other-menu pixels.
+        if tree_result.is_some()
+            && captured_screenshot.is_some()
+            && !application_menu_branches_match(tree_menu, screenshot_menu.as_ref())
+        {
+            release_unpublished_tree_result(&tree_result);
+            return ToolResult::error(
+                "The AX and screenshot reads did not agree on the active application-menu scope. Re-observe the application; no mixed observation was published.",
+            ).with_structured(serde_json::json!({
+                "code":"application_menu_changed_during_observation",
+                "effect":"refused","retryable":true,"pid":pid,"window_id":window_id,
+            }));
+        }
+        let application_menu = tree_menu.cloned().or(screenshot_menu);
 
         // App-context observations choose their exact window inside this call.
         // Re-read the application identity and selection after both observation
@@ -1366,27 +1410,27 @@ impl Tool for GetWindowStateTool {
             }
         }
 
+        // Tree-only visible-menu reads also withhold document-relative pixels.
+        // Reserve the scope before publishing any new AX token or output file.
+        if !observation_only
+            && transient_target.is_none()
+            && application_menu.is_some()
+            && !crate::ax::application_menu::remember_observed_image(
+                pid,
+                window_id,
+                application_menu.as_ref(),
+            )
+        {
+            release_unpublished_tree_result(&tree_result);
+            return ToolResult::error("Application-menu observation capacity is exhausted; no new observation or action binding was published.")
+                .with_structured(serde_json::json!({"code":"application_menu_observation_capacity","effect":"refused","retryable":true}));
+        }
+
         let screenshot = if let Some((png, width, height, original_width, bounds, scale)) =
             captured_screenshot
         {
             use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-            // Reserve the restrictive pixel scope before writing an output
-            // file. A capacity refusal must not publish menu pixels. If a
-            // later write fails, retaining the restriction is fail-closed.
-            if !observation_only
-                && transient_target.is_none()
-                && application_menu.is_some()
-                && !crate::ax::application_menu::remember_observed_image(
-                    pid,
-                    window_id,
-                    application_menu.as_ref(),
-                )
-            {
-                release_unpublished_tree_result(&tree_result);
-                return ToolResult::error("Application-menu observation capacity is exhausted; no new menu image or action binding was published.")
-                    .with_structured(serde_json::json!({"code":"application_menu_observation_capacity","effect":"refused","retryable":true}));
-            }
             let (b64, file_path) = if let Some(path) = screenshot_out_file.clone() {
                 if let Err(error) = std::fs::write(&path, &png) {
                     let frame_error = super::px_frame::PxFrameError::CaptureUnavailable {
@@ -1609,6 +1653,9 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if let Some(menu) = application_menu.as_ref() {
+            apply_application_menu_scope_metadata(&mut structured, menu);
+        }
         if let Some(tree) = published_tree_result {
             structured["tree_truncated"] = serde_json::json!(tree.truncated);
         }
@@ -3216,10 +3263,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn application_menu_metadata_keeps_document_action_anchor_and_withholds_pixels() {
-        let mut structured = serde_json::json!({"pid":42,"window_id":7,"screenshot_width":406,"screenshot_height":234});
-        let menu = crate::ax::application_menu::ApplicationMenuImage {
+    fn menu_image_fixture() -> crate::ax::application_menu::ApplicationMenuImage {
+        crate::ax::application_menu::ApplicationMenuImage {
             pid: 42,
             document_window_id: 7,
             menu_window_id: 9,
@@ -3235,7 +3280,21 @@ mod tests {
                 width: 203.0,
                 height: 117.0,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn application_menu_metadata_keeps_document_action_anchor_and_withholds_pixels() {
+        let mut tree_only = serde_json::json!({"pid":42,"window_id":7});
+        let menu = menu_image_fixture();
+        apply_application_menu_scope_metadata(&mut tree_only, &menu);
+        assert_eq!(tree_only["window_id"], 7);
+        assert_eq!(tree_only["screenshot_scope"], "application_menu");
+        assert_eq!(tree_only["screenshot_coordinates_actionable"], false);
+        for key in ["screenshot_width", "screenshot_height", "screenshot_scale", "screenshot_frame_valid"] {
+            assert!(tree_only.get(key).is_none(), "tree-only reads must not invent {key}");
+        }
+        let mut structured = serde_json::json!({"pid":42,"window_id":7,"screenshot_width":406,"screenshot_height":234});
         apply_application_menu_metadata(&mut structured, &menu, 2.0);
         assert_eq!(structured["window_id"], 7);
         assert_eq!(structured["pid"], 42);
@@ -3257,5 +3316,32 @@ mod tests {
         );
         assert_eq!(structured["screenshot_width"], 406);
         assert_eq!(structured["screenshot_scale"], 2.0);
+    }
+
+    #[test]
+    fn menu_tree_and_screenshot_reject_menu_opening_or_closing_between_reads() {
+        let menu = menu_image_fixture();
+        assert!(application_menu_branches_match(None, None));
+        assert!(application_menu_branches_match(Some(&menu), Some(&menu)));
+        assert!(!application_menu_branches_match(Some(&menu), None));
+        assert!(!application_menu_branches_match(None, Some(&menu)));
+    }
+
+    #[test]
+    fn menu_tree_and_screenshot_reject_changed_owner_anchor_menu_or_frames() {
+        let tree = menu_image_fixture();
+        for mutation in 0..7 {
+            let mut image = tree.clone();
+            match mutation {
+                0 => image.pid += 1,
+                1 => image.document_window_id += 1,
+                2 => image.menu_window_id += 1,
+                3 => image.document_bounds.x += 1.0,
+                4 => image.menu_bounds.y += 1.0,
+                5 => image.menu_bounds.width = f64::NAN,
+                _ => image.document_bounds.height = 0.0,
+            }
+            assert!(!application_menu_branches_match(Some(&tree), Some(&image)), "mutation {mutation}");
+        }
     }
 }

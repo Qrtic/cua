@@ -156,6 +156,9 @@ pub struct TreeWalkResult {
     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
+    /// When present, the bounded projection walks only this proven visible
+    /// application menu. Its action anchor remains the exact document window.
+    pub(crate) application_menu: Option<super::application_menu::ApplicationMenuImage>,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -197,7 +200,19 @@ pub fn walk_tree_bounded(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
-    walk_tree_bounded_with_projection(pid, window_id, query, max_elements, max_depth, false)
+    walk_tree_bounded_with_projection(pid, window_id, query, max_elements, max_depth, false, false)
+}
+
+/// Prioritize a proven visible application menu so unrelated document and
+/// closed menu branches cannot consume the caller's bounded observation.
+pub(crate) fn walk_tree_bounded_with_visible_menu(
+    pid: i32,
+    window_id: u32,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+) -> TreeWalkResult {
+    walk_tree_bounded_with_projection(pid, Some(window_id), query, max_elements, max_depth, false, true)
 }
 
 /// Walk one exact native window without inheriting sibling top-level AX
@@ -210,7 +225,7 @@ pub fn walk_tree_bounded_strict_window(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
-    walk_tree_bounded_with_projection(pid, Some(window_id), query, max_elements, max_depth, true)
+    walk_tree_bounded_with_projection(pid, Some(window_id), query, max_elements, max_depth, true, false)
 }
 
 fn walk_tree_bounded_with_projection(
@@ -220,12 +235,14 @@ fn walk_tree_bounded_with_projection(
     max_elements: usize,
     max_depth: usize,
     strict_exact_window: bool,
+    prioritize_visible_menu: bool,
 ) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     let mut limits = WalkLimits::new(max_elements, max_depth);
     let mut window_scope: Option<WindowScope> = None;
+    let mut application_menu = None;
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -237,6 +254,7 @@ fn walk_tree_bounded_with_projection(
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
+                application_menu: None,
             };
         }
         set_messaging_timeout(app_elem);
@@ -339,8 +357,28 @@ fn walk_tree_bounded_with_projection(
             top_level.to_vec()
         };
 
-        // Walk each top-level child at depth 0.
-        for child in walk_these {
+        // A menu projection is admitted only where ordinary exact-window
+        // scoping already permits the application's menu bar. Dialogs and
+        // delegated helper windows keep their strict existing surface.
+        let visible_menu = window_id
+            .filter(|_| {
+                prioritize_visible_menu
+                    && !strict_exact_window
+                    && window_scope.as_ref().is_some_and(WindowScope::is_matched)
+                    && walk_these.iter().any(|&child| {
+                        copy_string_attr(child, "AXRole").as_deref() == Some("AXMenuBar")
+                    })
+            })
+            .and_then(|wid| super::application_menu::active_application_menu_projection(pid, wid));
+        let roots = if let Some(menu) = visible_menu.as_ref() {
+            application_menu = Some(menu.image.clone());
+            vec![menu.root()]
+        } else {
+            walk_these
+        };
+
+        // The retained menu root, if selected, outlives this whole walk.
+        for child in roots {
             walk_element(
                 child,
                 0,
@@ -376,6 +414,7 @@ fn walk_tree_bounded_with_projection(
         nodes,
         truncated: truncated_flag,
         window_scope,
+        application_menu,
     }
 }
 
