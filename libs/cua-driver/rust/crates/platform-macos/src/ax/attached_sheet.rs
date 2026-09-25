@@ -1,12 +1,14 @@
-//! Discover an exact focused AXSheet that AppKit omits from AXWindows.
+//! Discover an exact attached AXSheet that AppKit omits from AXWindows.
 //!
 //! The sheet remains its own target. A live reciprocal attachment to a current
 //! AXWindows host proves discovery; it does not alias sheet input to that host.
+//! Some apps keep AXFocusedWindow on that host while its sheet is open.
 
 use super::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorAttributeUnsupported,
     kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr, AXError,
-    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementGetPid,
+    AXUIElementGetTypeID, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
 };
 use core_foundation::{
@@ -25,6 +27,9 @@ trait SheetTree {
     fn owner(&self, node: &Self::Node) -> Option<i32>;
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn relation(&self, node: &Self::Node, name: &str) -> Option<Self::Node>;
+    // Complete direct-child query, retaining only AXSheet roles. None means
+    // unreadable/incomplete, not an empty list and not authority to choose.
+    fn child_sheets(&self, node: &Self::Node) -> Option<Vec<Self::Node>>;
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn owns_window(&self, pid: i32, window_id: u32) -> bool;
@@ -44,16 +49,42 @@ struct Attachment<N> {
     window_ids: Vec<u32>,
 }
 
-fn prove_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attachment<T::Node>> {
+fn selected_sheet<T: SheetTree>(tree: &T) -> Option<(T::Node, T::Node)> {
     let focused = tree.focused()?;
-    if tree.role(&focused).as_deref() != Some("AXSheet")
-        || tree.window_id(&focused) != Some(requested)
-    {
+    match tree.role(&focused).as_deref() {
+        Some("AXSheet") => return Some((focused.clone(), focused)),
+        Some("AXWindow") => {}
+        _ => return None,
+    }
+    // Follow only one unambiguous direct-sheet chain below the focused host.
+    // A same-PID sibling, an ordinary descendant or a geometry match cannot
+    // supply this missing focus relationship. prove_chain validates every
+    // reciprocal attachment and native window before using the selected leaf.
+    let mut current = focused.clone();
+    let mut seen = Vec::new();
+    for _ in 0..=MAX_SHEET_DEPTH {
+        if !tree.within_budget() || seen.iter().any(|node| tree.same(node, &current)) {
+            return None;
+        }
+        seen.push(current.clone());
+        let children = tree.child_sheets(&current)?;
+        match children.as_slice() {
+            [] if !tree.same(&current, &focused) => return Some((focused, current)),
+            [child] if tree.role(child).as_deref() == Some("AXSheet") => current = child.clone(),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn prove_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attachment<T::Node>> {
+    let (focused, sheet) = selected_sheet(tree)?;
+    if tree.window_id(&sheet) != Some(requested) {
         return None;
     }
     let mut nodes = Vec::new();
     let mut window_ids = Vec::new();
-    let mut current = focused.clone();
+    let mut current = sheet.clone();
     loop {
         let id = tree.window_id(&current)?;
         if !tree.within_budget()
@@ -102,16 +133,24 @@ fn prove_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attac
             return None;
         }
     }
-    if !tree
-        .focused()
-        .is_some_and(|node| tree.same(&node, &focused))
-        || tree.owner(host) != Some(pid)
+    if tree.owner(host) != Some(pid)
         || tree.window_id(host) != window_ids.last().copied()
         || !tree.within_budget()
     {
         return None;
     }
-    Some(Attachment { nodes, window_ids })
+    let chain = Attachment { nodes, window_ids };
+    if !tree.same(&focused, &sheet)
+        && (!tree.same(&focused, chain.nodes.last()?) || !visible_chain(tree, pid, &chain))
+    {
+        return None;
+    }
+    // Recheck selection as well as focus. A newly attached sibling or nested
+    // sheet invalidates a host-focused proof even when AXFocusedWindow stays
+    // unchanged throughout the operation.
+    let (current_focus, current_sheet) = selected_sheet(tree)?;
+    (tree.same(&current_focus, &focused) && tree.same(&current_sheet, &sheet)
+        && tree.within_budget()).then_some(chain)
 }
 
 fn prove<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::Node> {
@@ -256,6 +295,34 @@ impl SheetTree for NativeTree {
     fn relation(&self, node: &Node, name: &str) -> Option<Node> {
         unsafe { Node::owned(copy_element_attr(node.0, name)?) }
     }
+    fn child_sheets(&self, node: &Node) -> Option<Vec<Node>> {
+        unsafe {
+            let attr = CFString::new("AXChildren");
+            let mut value: CFTypeRef = std::ptr::null();
+            if AXUIElementCopyAttributeValue(node.0, attr.as_concrete_TypeRef(), &mut value)
+                != kAXErrorSuccess || value.is_null()
+            {
+                return None;
+            }
+            if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
+                CFRelease(value);
+                return None;
+            }
+            let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+            if children.len() > 1024 { return None; }
+            let mut sheets = Vec::new();
+            for index in 0..children.len() {
+                if !self.within_budget() { return None; }
+                let ptr = *children.get(index)?;
+                if CFGetTypeID(ptr) != AXUIElementGetTypeID() { return None; }
+                CFRetain(ptr);
+                let child = Node::owned(ptr as AXUIElementRef)?;
+                let role = self.role(&child)?;
+                if role == "AXSheet" { sheets.push(child); }
+            }
+            Some(sheets)
+        }
+    }
     fn contains_child(&self, parent: &Node, child: &Node) -> bool {
         unsafe {
             let attr = CFString::new("AXChildren");
@@ -329,8 +396,8 @@ pub(crate) struct AttachedSheetSuccessor {
 }
 
 fn prove_successor<T: SheetTree>(tree: &T, pid: i32, source: u32) -> Option<AttachedSheetSuccessor> {
-    let focused = tree.focused()?;
-    let requested = tree.window_id(&focused)?;
+    let (_, selected) = selected_sheet(tree)?;
+    let requested = tree.window_id(&selected)?;
     if requested == source {
         return None;
     }
@@ -608,6 +675,11 @@ mod tests {
             } else {
                 Some(self.host.clone())
             }
+        }
+        fn child_sheets(&self, node: &FakeNode) -> Option<Vec<FakeNode>> {
+            Some(if self.attached && node.identity == self.host.identity {
+                vec![self.sheet.clone()]
+            } else { Vec::new() })
         }
         fn contains_child(&self, _parent: &FakeNode, child: &FakeNode) -> bool {
             self.attached && child.identity == self.sheet.identity

@@ -20,6 +20,9 @@ struct Tree {
     reads: Cell<u32>,
     change_focus: bool,
     budget: Cell<usize>,
+    children_complete: bool,
+    host_child_reads: Cell<usize>,
+    new_sibling_after_selection: bool,
 }
 
 impl SheetTree for Tree {
@@ -50,6 +53,21 @@ impl SheetTree for Tree {
             "AXWindow" => self.nodes.get(n)?.window,
             _ => None,
         }
+    }
+    fn child_sheets(&self, n: &u32) -> Option<Vec<u32>> {
+        if !self.children_complete { return None; }
+        if *n == 700 {
+            let reads = self.host_child_reads.get();
+            self.host_child_reads.set(reads + 1);
+            if self.new_sibling_after_selection && reads > 0 {
+                return Some(vec![900, 901]);
+            }
+        }
+        let mut sheets = Vec::new();
+        for child in &self.nodes.get(n)?.children {
+            if self.nodes.get(child)?.role == "AXSheet" { sheets.push(*child); }
+        }
+        Some(sheets)
     }
     fn contains_child(&self, parent: &u32, child: &u32) -> bool {
         self.nodes
@@ -104,6 +122,112 @@ fn xcode() -> Tree {
         reads: Cell::new(0),
         change_focus: false,
         budget: Cell::new(1000),
+        children_complete: true,
+        host_child_reads: Cell::new(0),
+        new_sibling_after_selection: false,
+    }
+}
+
+fn chess_with_host_focus() -> Tree {
+    let mut tree = xcode();
+    tree.nodes.remove(&950);
+    tree.nodes.get_mut(&900).unwrap().children.clear();
+    tree.nodes.get_mut(&900).unwrap().id = "_NS:394";
+    tree.nodes.get_mut(&700).unwrap().id = "_NS:582";
+    tree.focused = 700;
+    tree
+}
+
+#[test]
+fn host_focused_chess_sheet_is_discovered_as_its_own_window() {
+    // Chess exposes its new-game sheet as a reciprocal AXChild of the
+    // AXFocusedWindow host, with a separate native window omitted from
+    // AXWindows. Its buttons must be addressed in that sheet, not the host.
+    let tree = chess_with_host_focus();
+    assert_eq!(prove(&tree, 42, 900), Some(900));
+    assert_eq!(prove_with_visibility(&tree, 42, 900, true), Some(900));
+    assert_eq!(prove_successor(&tree, 42, 700), Some(AttachedSheetSuccessor {
+        window_id: 900, host_id: 700, path: vec![900, 700],
+    }));
+    assert!(prove(&tree, 42, 700).is_none());
+    // Discovery must not grant this arbitrary sheet a standard file-dialog
+    // foreground lease or substitute its host for the requested target.
+    assert!(dialog_host(&tree, 42, 900).is_none());
+}
+
+#[test]
+fn host_focused_nested_sheet_selects_only_the_unique_leaf() {
+    let mut tree = xcode();
+    tree.focused = 700;
+    assert_eq!(prove(&tree, 42, 950), Some(950));
+    assert_eq!(dialog_host(&tree, 42, 950), Some(700));
+    assert!(prove(&tree, 42, 900).is_none());
+    assert_eq!(prove_successor(&tree, 42, 700).unwrap().path, [950, 900, 700]);
+}
+
+#[test]
+fn host_focused_sheet_rejects_ambiguous_incomplete_or_changed_selection() {
+    let mut tree = chess_with_host_focus();
+    tree.children_complete = false;
+    assert!(prove(&tree, 42, 900).is_none());
+
+    let mut tree = chess_with_host_focus();
+    tree.nodes.insert(901, tree.nodes[&900].clone());
+    tree.nodes.get_mut(&700).unwrap().children.push(901);
+    assert!(prove(&tree, 42, 900).is_none());
+    assert!(prove_successor(&tree, 42, 700).is_none());
+
+    let mut tree = chess_with_host_focus();
+    tree.nodes.insert(901, tree.nodes[&900].clone());
+    tree.new_sibling_after_selection = true;
+    assert!(prove(&tree, 42, 900).is_none());
+
+    let mut tree = chess_with_host_focus();
+    tree.change_focus = true;
+    assert!(prove(&tree, 42, 900).is_none());
+}
+
+#[test]
+fn host_focused_sheet_requires_visible_same_process_unminimized_ancestry() {
+    for id in [700, 900] {
+        let mut tree = chess_with_host_focus();
+        tree.nodes.get_mut(&id).unwrap().owner = 99;
+        assert!(prove(&tree, 42, 900).is_none());
+        let mut tree = chess_with_host_focus();
+        tree.nodes.get_mut(&id).unwrap().visible = false;
+        assert!(prove(&tree, 42, 900).is_none());
+        for minimized in [Ok(true), Err(crate::ax::bindings::kAXErrorCannotComplete)] {
+            let mut tree = chess_with_host_focus();
+            tree.nodes.get_mut(&id).unwrap().minimized = minimized;
+            assert!(prove(&tree, 42, 900).is_none());
+        }
+    }
+    let mut tree = chess_with_host_focus();
+    tree.nodes.get_mut(&900).unwrap().window = Some(901);
+    assert!(prove(&tree, 42, 900).is_none());
+    let mut tree = chess_with_host_focus();
+    tree.nodes.get_mut(&900).unwrap().parent = None;
+    assert!(prove(&tree, 42, 900).is_none());
+}
+
+#[test]
+fn host_focused_sheet_never_uses_a_sibling_host_or_incomplete_inventory() {
+    for windows in [vec![], vec![700, 700], vec![900]] {
+        let mut tree = chess_with_host_focus();
+        tree.windows = windows;
+        assert!(prove(&tree, 42, 900).is_none());
+    }
+    let mut tree = chess_with_host_focus();
+    let mut sibling = tree.nodes[&700].clone();
+    sibling.children.clear();
+    tree.nodes.insert(701, sibling);
+    tree.windows.push(701);
+    tree.focused = 701;
+    assert!(prove(&tree, 42, 900).is_none());
+    for budget in [0, 2, 5] {
+        let tree = chess_with_host_focus();
+        tree.budget.set(budget);
+        assert!(prove(&tree, 42, 900).is_none());
     }
 }
 
