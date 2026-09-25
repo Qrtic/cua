@@ -334,24 +334,52 @@ impl WindowCaptureIdentity {
     }
 }
 
-fn capture_includes_child_windows(proven_focused_attached_sheet: bool) -> bool {
-    // Host observations need their attached popovers/children. Only a proven
-    // focused AXSheet is captured independently: composing its children can
-    // make ScreenCaptureKit fit the entire host into the sheet-sized output.
-    !proven_focused_attached_sheet
+fn capture_includes_child_windows(exact_host: bool, role: Option<&str>, subrole: Option<&str>) -> bool {
+    // Child composition is appropriate only for a positively identified host.
+    // For a sheet, physical popover or unresolved auxiliary window SCK can
+    // otherwise shrink the whole host into a correctly sized output bitmap;
+    // checking just its final pixel dimensions cannot detect that corruption.
+    exact_host && role == Some("AXWindow") && subrole == Some("AXStandardWindow")
 }
 
 fn resolve_capture_child_composition(pid: i32, window_id: u32) -> bool {
-    let sheet = crate::ax::attached_sheet::copy_focused_attached_sheet(pid, window_id);
-    let proven_sheet = sheet.is_some();
-    if let Some(sheet) = sheet {
-        // Discovery returns a retained reference. Only its proven surface
-        // classification is needed by the capture plan, not the AX handle.
-        unsafe {
-            core_foundation::base::CFRelease(sheet as core_foundation::base::CFTypeRef);
+    use crate::ax::bindings::{
+        ax_get_window_id, copy_string_attr, kAXErrorSuccess, try_copy_ax_windows,
+        AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef,
+        AXUIElementSetMessagingTimeout,
+    };
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    struct OwnedAx(AXUIElementRef);
+    impl Drop for OwnedAx {
+        fn drop(&mut self) { unsafe { CFRelease(self.0 as CFTypeRef) }; }
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() { return false; }
+        let app = OwnedAx(app);
+        if AXUIElementSetMessagingTimeout(app.0, 0.2) != kAXErrorSuccess { return false; }
+        let Ok(snapshot) = try_copy_ax_windows(app.0) else { return false; };
+        let windows: Vec<_> = snapshot.windows.into_iter().map(OwnedAx).collect();
+        if !snapshot.complete || windows.len() > 64 { return false; }
+        for window in windows {
+            if Instant::now() >= deadline { return false; }
+            if AXUIElementSetMessagingTimeout(window.0, 0.2) != kAXErrorSuccess { continue; }
+            if ax_get_window_id(window.0) != Some(window_id) { continue; }
+            let mut owner = 0;
+            if AXUIElementGetPid(window.0, &mut owner) != kAXErrorSuccess || owner != pid {
+                return false;
+            }
+            let role = copy_string_attr(window.0, "AXRole");
+            let subrole = copy_string_attr(window.0, "AXSubrole");
+            let still_exact = Instant::now() < deadline
+                && ax_get_window_id(window.0) == Some(window_id);
+            return capture_includes_child_windows(still_exact, role.as_deref(), subrole.as_deref());
         }
     }
-    capture_includes_child_windows(proven_sheet)
+    // Absence from AXWindows is common for physical popovers whose AXWindow
+    // names the host. Capture that exact WindowServer surface independently.
+    false
 }
 
 fn capture_plan_is_reusable(
@@ -883,13 +911,23 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn proven_focused_attached_sheet_excludes_child_composition() {
-        assert!(!capture_includes_child_windows(true));
+    fn only_exact_standard_host_includes_child_composition() {
+        assert!(capture_includes_child_windows(true, Some("AXWindow"), Some("AXStandardWindow")));
+        assert!(!capture_includes_child_windows(false, Some("AXWindow"), Some("AXStandardWindow")));
     }
 
     #[test]
-    fn host_or_unproven_surface_preserves_child_composition() {
-        assert!(capture_includes_child_windows(false));
+    fn sheet_popover_and_unknown_capture_are_not_fitted_to_their_host() {
+        for (role, subrole) in [
+            (Some("AXSheet"), Some("AXDialog")),
+            (Some("AXPopover"), None),
+            (Some("AXWindow"), Some("AXFloatingWindow")),
+            (Some("AXWindow"), Some("AXDialog")),
+            (Some("AXWindow"), None),
+            (None, None),
+        ] {
+            assert!(!capture_includes_child_windows(true, role, subrole));
+        }
     }
 
     #[test]
