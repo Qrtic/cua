@@ -321,32 +321,8 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
-            Ok(Ok(mut outcome)) => {
-                apply_surface_trust(&mut outcome, ax_echo_surface);
-                apply_verification_label(&mut outcome);
-                let mut msg = outcome.detail;
-                msg.push_str(&changes.result_suffix());
-                let verified = outcome.verified.unwrap_or(false);
-                let mut structured = serde_json::json!({
-                    "path": "ax",
-                    "verified": verified,
-                    "effect": if verified { "confirmed" } else { "unverifiable" },
-                });
-                if let Some(response) = outcome.native_response {
-                    structured["native_ax_response"] = response.json();
-                }
-                if outcome.editor_rebound {
-                    structured["native_text_editor_rebound"] = serde_json::json!(true);
-                }
-                if ax_echo_surface {
-                    structured["escalation"] = serde_json::json!({
-                        "recommended": "px",
-                        "reason": "AXValue read-back is not trusted for web content. Verify \
-                                   through the renderer; use browser page tools for a tab or \
-                                   manipulate the control through its pixel action."
-                    });
-                }
-                ToolResult::text(msg).with_structured(structured)
+            Ok(Ok(outcome)) => {
+                native_value_tool_result(outcome, ax_echo_surface, &changes.result_suffix())
             }
             Ok(Err(e)) => match e.downcast_ref::<NativeValueResponse>() {
                 Some(response) => response.result(),
@@ -376,6 +352,44 @@ struct SetValueOutcome {
     changed: Option<bool>,
     native_response: Option<NativeValueResponse>,
     editor_rebound: bool,
+}
+
+fn native_value_tool_result(
+    mut outcome: SetValueOutcome,
+    ax_echo_surface: bool,
+    window_change_suffix: &str,
+) -> ToolResult {
+    apply_surface_trust(&mut outcome, ax_echo_surface);
+    apply_verification_label(&mut outcome);
+    let mut msg = outcome.detail;
+    msg.push_str(window_change_suffix);
+    let verified = outcome.verified.unwrap_or(false);
+    let mut structured = serde_json::json!({
+        "path": "ax",
+        "verified": verified,
+        "effect": if verified { "confirmed" } else { "unverifiable" },
+    });
+    if let Some(response) = outcome.native_response {
+        structured["native_ax_response"] = response.json();
+    }
+    if ax_echo_surface {
+        structured["escalation"] = serde_json::json!({
+            "recommended": "px",
+            "reason": "AXValue read-back is not trusted for web content. Verify \
+                       through the renderer; use browser page tools for a tab or \
+                       manipulate the control through its pixel action."
+        });
+    }
+    let mut result = ToolResult::text(msg).with_structured(structured);
+    if outcome.editor_rebound {
+        // Dispatch replaces structuredContent with the closed ActionResult.
+        // Binding invalidation is native control metadata, like dialog return
+        // state; keep it outside that outcome so the client can refresh once.
+        result.meta = Some(serde_json::json!({
+            "ai.cua/native_editor": {"version": 1, "rebound": true},
+        }));
+    }
+    result
 }
 
 /// A native response is separate from the value read back on the same control.
@@ -1209,7 +1223,8 @@ fn hex_digit(n: u8) -> char {
 mod tests {
     use super::{
         apply_surface_trust, apply_verification_label, classify_write, kAXErrorSuccess,
-        write_native_value, NativeValueField, NativeValueResponse, SetValueOutcome,
+        native_value_tool_result, write_native_value, NativeValueField, NativeValueResponse,
+        SetValueOutcome,
     };
     use std::cell::{Cell, RefCell};
 
@@ -1644,6 +1659,45 @@ mod tests {
         assert_eq!(outcome.verified, Some(true));
         assert_eq!(outcome.changed, Some(true));
         assert_eq!(outcome.detail, "Set value.");
+    }
+
+    #[test]
+    fn native_editor_rebind_metadata_survives_action_projection() {
+        for rebound in [false, true] {
+            let mut result = native_value_tool_result(
+                SetValueOutcome {
+                    detail: "Native value read back.".into(),
+                    verified: Some(true),
+                    changed: Some(true),
+                    native_response: None,
+                    editor_rebound: rebound,
+                },
+                false,
+                "",
+            );
+            let record = cua_driver_core::action_record::ActionExecutionRecord::from_legacy(
+                "set_value",
+                &serde_json::json!({"pid": 42, "window_id": 7}),
+                result.structured_content.as_ref().unwrap(),
+            )
+            .unwrap();
+            let public = record.public_result().unwrap();
+            public.validate_invariants().unwrap();
+            result.structured_content = Some(serde_json::to_value(public).unwrap());
+            let wire = serde_json::to_value(result).unwrap();
+            assert_eq!(wire["structuredContent"]["effect"], "confirmed");
+            assert!(wire["structuredContent"]
+                .get("native_text_editor_rebound")
+                .is_none());
+            if rebound {
+                assert_eq!(
+                    wire["_meta"]["ai.cua/native_editor"],
+                    serde_json::json!({"version": 1, "rebound": true})
+                );
+            } else {
+                assert!(wire.get("_meta").is_none());
+            }
+        }
     }
 
     #[test]
