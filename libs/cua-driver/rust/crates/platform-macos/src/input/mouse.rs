@@ -73,6 +73,28 @@ pub(crate) fn foreground_keyboard_anchor(
 enum MousePostMode {
     Both,
     PublicOnly,
+    SkyLightOrPublic,
+}
+
+/// In SkyLightOrPublic mode the public API is only a fallback when SkyLight
+/// cannot post, never a second delivery of an already queued event.
+fn post_mouse_event_transport(
+    mode: MousePostMode,
+    private_post: impl FnOnce() -> bool,
+    public_post: impl FnOnce(),
+) {
+    match mode {
+        MousePostMode::Both => {
+            private_post();
+            public_post();
+        }
+        MousePostMode::PublicOnly => public_post(),
+        MousePostMode::SkyLightOrPublic => {
+            if !private_post() {
+                public_post();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1297,6 +1319,10 @@ fn right_click_at_xy_inner(
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let flags = parse_modifier_flags(modifiers);
+    // A single right gesture must produce one down/up pair. Posting through
+    // both APIs duplicates real AppKit callbacks and can toggle a context menu
+    // twice. Keep the existing window stamps and use only one transport.
+    let post_mode = MousePostMode::SkyLightOrPublic;
 
     let click_group_id: Option<i64> = wid.map(|_| {
         SystemTime::now()
@@ -1314,7 +1340,7 @@ fn right_click_at_xy_inner(
         window_local,
         wid,
         click_group_id,
-        MousePostMode::Both,
+        post_mode,
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
@@ -1330,7 +1356,9 @@ fn right_click_at_xy_inner(
     }
     // button_number = 1 (right). Stamping 0 here routes the event as a left
     // button-number on the receiving side even though the type is rightMouseDown.
-    post_mouse_event(pid, &down, window_local, wid, click_group_id, 1, 1, 3);
+    post_mouse_event_with_mode(
+        pid, &down, window_local, wid, click_group_id, 1, 1, 3, post_mode,
+    );
     std::thread::sleep(std::time::Duration::from_millis(28));
 
     let up = CGEvent::new_mouse_event(
@@ -1343,7 +1371,9 @@ fn right_click_at_xy_inner(
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
-    post_mouse_event(pid, &up, window_local, wid, click_group_id, 1, 1, 3);
+    post_mouse_event_with_mode(
+        pid, &up, window_local, wid, click_group_id, 1, 1, 3, post_mode,
+    );
 
     Ok(())
 }
@@ -1436,14 +1466,11 @@ fn post_mouse_event_with_mode(
     // Always stamp f40 = target pid (Chromium synthetic-event filter).
     crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
 
-    match mode {
-        MousePostMode::Both => {
-            // Preserve the established transport for non-left-click callers.
-            crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-            event.post_to_pid(pid as libc::pid_t);
-        }
-        MousePostMode::PublicOnly => event.post_to_pid(pid as libc::pid_t),
-    }
+    post_mouse_event_transport(
+        mode,
+        || crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false),
+        || event.post_to_pid(pid as libc::pid_t),
+    );
 }
 
 /// Post a stamped `mouseMoved` to `pid` at `point` before a down/up pair.
@@ -1617,6 +1644,53 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn targeted_right_click_transport_delivers_each_event_once() {
+        let delivered = RefCell::new(Vec::new());
+        for event in ["move", "right_down", "right_up"] {
+            post_mouse_event_transport(
+                MousePostMode::SkyLightOrPublic,
+                || {
+                    delivered.borrow_mut().push(event);
+                    true
+                },
+                || {
+                    delivered.borrow_mut().push(event);
+                },
+            );
+        }
+        assert_eq!(*delivered.borrow(), ["move", "right_down", "right_up"]);
+    }
+
+    #[test]
+    fn targeted_right_click_transport_falls_back_when_private_post_is_unavailable() {
+        let attempts = RefCell::new(Vec::new());
+        post_mouse_event_transport(
+            MousePostMode::SkyLightOrPublic,
+            || {
+                attempts.borrow_mut().push("private_unavailable");
+                false
+            },
+            || {
+                attempts.borrow_mut().push("public_post");
+            },
+        );
+        assert_eq!(*attempts.borrow(), ["private_unavailable", "public_post"]);
+    }
+
+    #[test]
+    fn explicit_public_mouse_transport_never_tries_private_post() {
+        let delivered = RefCell::new(0);
+        post_mouse_event_transport(
+            MousePostMode::PublicOnly,
+            || panic!("public delivery must not inject a private event"),
+            || {
+                *delivered.borrow_mut() += 1;
+            },
+        );
+        assert_eq!(*delivered.borrow(), 1);
+    }
 
     #[test]
     fn chromium_click_count_preserves_triple_click() {
