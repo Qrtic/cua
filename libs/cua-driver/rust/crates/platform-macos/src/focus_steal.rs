@@ -352,6 +352,7 @@ impl Dispatcher {
         if let Some(entry) = self.entries.lock().unwrap().get_mut(&handle.0) {
             entry.activity_restore = evidence;
             tracing::debug!(target: "cua_focus_restore", origin = entry.origin,
+                lease = %handle.0, target_pid = ?entry.target_pid,
                 restore_pid = pid, has_restore_evidence = evidence.is_some(),
                 "Captured launch/action restoration evidence");
         }
@@ -450,7 +451,13 @@ impl Dispatcher {
     fn remove(&self, handle: SuppressionHandle) {
         let now_empty = {
             let mut guard = self.entries.lock().unwrap();
-            guard.remove(&handle.0);
+            if let Some(entry) = guard.remove(&handle.0) {
+                tracing::debug!(target: "cua_focus_restore", lease = %handle.0,
+                    origin = entry.origin, target_pid = ?entry.target_pid,
+                    returned_tail = entry.returned_tail,
+                    expired = entry.deadline <= Instant::now(),
+                    "Ended restoration lease");
+            }
             guard.is_empty()
         };
         if now_empty {
@@ -467,6 +474,10 @@ impl Dispatcher {
         }
         entry.returned_tail = true;
         entry.deadline = deadline;
+        tracing::debug!(target: "cua_focus_restore", lease = %handle.0,
+            origin = entry.origin, target_pid = ?entry.target_pid,
+            remaining_ms = deadline.saturating_duration_since(Instant::now()).as_millis() as u64,
+            "Deferred restoration lease");
         Some(deadline)
     }
 
@@ -749,7 +760,13 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
     };
 
     let current_front = crate::apps::frontmost_pid();
+    let entry_count = dispatcher.len();
     let candidates = dispatcher.snapshot_restore_candidates(activated_pid, current_front);
+    if entry_count > 0 {
+        tracing::debug!(target: "cua_focus_restore", activated_pid,
+            current_front = ?current_front, entry_count, candidate_count = candidates.len(),
+            "Received activation during restoration protection");
+    }
     for candidate in candidates {
         // Notification delivery and restoration are asynchronous. If another
         // application is already frontmost, the user (or an unrelated system
@@ -763,9 +780,16 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
             .get(&candidate.handle.0)
             .and_then(|entry| entry.activity_restore);
         if let Some(evidence) = evidence {
-            dispatcher.submit_restore_if_current(candidate, crate::apps::frontmost_pid, |pid| {
+            let admitted = dispatcher.submit_restore_if_current(candidate, crate::apps::frontmost_pid, |pid| {
                 crate::foreground_activity::restore_background_focus(evidence, pid)
             });
+            tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
+                activated_pid, restore_pid = candidate.restore_to, admitted,
+                "Evaluated activation restoration candidate");
+        } else {
+            tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
+                activated_pid, restore_pid = candidate.restore_to,
+                "Activation candidate has no current restoration evidence");
         }
     }
 }
