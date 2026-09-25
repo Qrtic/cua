@@ -335,15 +335,28 @@ fn commit_transient_observation(
     }
 }
 
-async fn join_observation_branches<Tree, Screenshot, TreeFuture, ScreenshotFuture>(
+async fn observe_tree_then_screenshot<Tree, Screenshot, Error, TreeFuture, ScreenshotFuture>(
     tree: TreeFuture,
     screenshot: ScreenshotFuture,
-) -> (Tree, Screenshot)
+) -> Result<(Tree, Screenshot), Error>
 where
-    TreeFuture: std::future::Future<Output = Tree>,
+    TreeFuture: std::future::Future<Output = Result<Tree, Error>>,
     ScreenshotFuture: std::future::Future<Output = Screenshot>,
 {
-    tokio::join!(tree, screenshot)
+    // AX can complete a pending application action while being queried. In
+    // that case a parallel, faster capture can contain the pre-action frame
+    // next to the post-action tree (H064). Start pixels only after the tree
+    // finishes; keep the existing scope/owner checks before publication.
+    // This orders the reads, but does not claim an atomic application snapshot.
+    let started = std::time::Instant::now();
+    let tree = tree.await?;
+    let tree_elapsed = started.elapsed();
+    let screenshot = screenshot.await;
+    tracing::debug!(target: "cua_observation_timing",
+        tree_ms = tree_elapsed.as_secs_f64() * 1000.0,
+        screenshot_ms = (started.elapsed() - tree_elapsed).as_secs_f64() * 1000.0,
+        "Collected AX before screenshot");
+    Ok((tree, screenshot))
 }
 
 type CapturedScreenshot = (
@@ -1090,10 +1103,9 @@ impl Tool for GetWindowStateTool {
             .map(|v| v.max(1) as usize)
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
 
-        // The expensive AX walk and screenshot encode are independent after
-        // the exact-window ownership preflight, so start both before awaiting
-        // either. Default latency becomes approximately max(tree, screenshot)
-        // instead of their sum.
+        // Collect the tree before pixels. A still-completing AX action can
+        // otherwise update the tree after a parallel capture has already read
+        // the old frame. Single-modality observations keep their direct path.
         let tree_branch = async {
             if !plan.include_elements || transient_target.is_some() {
                 return Ok::<Option<crate::ax::tree::TreeWalkResult>, ToolResult>(None);
@@ -1174,14 +1186,15 @@ impl Tool for GetWindowStateTool {
         };
 
         let (tree_result, screenshot_result) =
-            join_observation_branches(tree_branch, screenshot_branch).await;
-        let tree_result = match tree_result {
-            Ok(tree) => tree,
-            Err(error) => return error,
-        };
+            match observe_tree_then_screenshot(tree_branch, screenshot_branch).await {
+                Ok(result) => result,
+                Err(error) => return error,
+            };
         let (captured_screenshot, screenshot_frame_error, screenshot_menu) = screenshot_result;
-        let tree_menu = tree_result.as_ref().and_then(|tree| tree.application_menu.as_ref());
-        // Reject a menu opening, closing, or changing between the parallel
+        let tree_menu = tree_result
+            .as_ref()
+            .and_then(|tree| tree.application_menu.as_ref());
+        // Reject a menu opening, closing, or changing between the ordered
         // reads instead of combining menu AX with document or other-menu pixels.
         if tree_result.is_some()
             && captured_screenshot.is_some()
@@ -1290,7 +1303,7 @@ impl Tool for GetWindowStateTool {
 
         // Re-prove the exact native owner after the pixels were captured and
         // before any image/file-path is returned. A CGWindowID can disappear
-        // or be recycled while the AX walk and screenshot run in parallel;
+        // or be recycled between the AX walk and screenshot capture;
         // publishing that frame under the old (pid, window_id) would bind
         // pixels from a different surface to the caller's target.
         let captured_screenshot = if let Some(screenshot) = captured_screenshot {
@@ -1780,7 +1793,9 @@ impl Tool for GetWindowStateTool {
             if matches!(degradation, Degradation::AxWindowUnresolved { .. }) {
                 if let Ok(Some(hint)) = crate::foreground_activity::spawn_blocking(move || {
                     crate::ax::window_tabs::find_hint(pid, window_id)
-                }).await {
+                })
+                .await
+                {
                     structured["window_tab_hint"] = serde_json::json!(hint);
                 }
             }
@@ -2789,29 +2804,32 @@ mod window_scope_contract_tests {
     }
 
     #[tokio::test]
-    async fn observation_branches_are_polled_concurrently() {
-        let (tree_started_tx, tree_started_rx) = tokio::sync::oneshot::channel();
-        let (screenshot_started_tx, screenshot_started_rx) = tokio::sync::oneshot::channel();
-
-        let tree = async move {
-            tree_started_tx.send(()).unwrap();
-            screenshot_started_rx.await.unwrap();
-            "tree"
+    async fn screenshot_does_not_read_before_a_pending_tree_update() {
+        let scene = std::sync::atomic::AtomicUsize::new(1);
+        let tree = async {
+            tokio::task::yield_now().await;
+            scene.store(2, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, ()>(2)
         };
-        let screenshot = async move {
-            screenshot_started_tx.send(()).unwrap();
-            tree_started_rx.await.unwrap();
-            "screenshot"
-        };
+        let screenshot = async { scene.load(std::sync::atomic::Ordering::SeqCst) };
+        let observed = observe_tree_then_screenshot(tree, screenshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed,
+            (2, 2),
+            "Never pair the new AX scene with pre-update pixels"
+        );
+    }
 
-        let joined = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            join_observation_branches(tree, screenshot),
-        )
-        .await
-        .expect("both branches must be polled instead of awaiting one before the other");
-
-        assert_eq!(joined, ("tree", "screenshot"));
+    #[tokio::test]
+    async fn failed_tree_does_not_start_an_unpublishable_capture() {
+        let observed: Result<((), ()), &str> =
+            observe_tree_then_screenshot(async { Err::<(), _>("tree failed") }, async {
+                panic!("A failed tree response must not start screenshot work")
+            })
+            .await;
+        assert_eq!(observed, Err("tree failed"));
     }
 }
 
@@ -3291,8 +3309,16 @@ mod tests {
         assert_eq!(tree_only["window_id"], 7);
         assert_eq!(tree_only["screenshot_scope"], "application_menu");
         assert_eq!(tree_only["screenshot_coordinates_actionable"], false);
-        for key in ["screenshot_width", "screenshot_height", "screenshot_scale", "screenshot_frame_valid"] {
-            assert!(tree_only.get(key).is_none(), "tree-only reads must not invent {key}");
+        for key in [
+            "screenshot_width",
+            "screenshot_height",
+            "screenshot_scale",
+            "screenshot_frame_valid",
+        ] {
+            assert!(
+                tree_only.get(key).is_none(),
+                "tree-only reads must not invent {key}"
+            );
         }
         let mut structured = serde_json::json!({"pid":42,"window_id":7,"screenshot_width":406,"screenshot_height":234});
         apply_application_menu_metadata(&mut structured, &menu, 2.0);
@@ -3341,7 +3367,10 @@ mod tests {
                 5 => image.menu_bounds.width = f64::NAN,
                 _ => image.document_bounds.height = 0.0,
             }
-            assert!(!application_menu_branches_match(Some(&tree), Some(&image)), "mutation {mutation}");
+            assert!(
+                !application_menu_branches_match(Some(&tree), Some(&image)),
+                "mutation {mutation}"
+            );
         }
     }
 }
