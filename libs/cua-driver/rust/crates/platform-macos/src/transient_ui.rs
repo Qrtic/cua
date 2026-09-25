@@ -22,7 +22,7 @@ use std::{
 use core_foundation::base::{CFRelease, CFTypeRef};
 
 use crate::ax::bindings::{
-    ax_get_window_id, copy_bool_attr, copy_string_attr, try_copy_ax_windows,
+    ax_get_window_id, copy_bool_attr, copy_string_attr, try_copy_ax_windows, try_copy_element_attr,
     AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
 };
 use crate::windows::{WindowBounds, WindowInfo};
@@ -137,6 +137,11 @@ struct SamePidAxWindowFacts {
     modal: Option<bool>,
     focused: Option<bool>,
     main: Option<bool>,
+    /// Application-level references remain meaningful when a background app's
+    /// windows all report AXFocused=false. These can require a fresh context
+    /// observation, but never authorize a modal redirect by themselves.
+    app_focused: bool,
+    app_main: bool,
 }
 
 impl SamePidAxWindowFacts {
@@ -315,8 +320,8 @@ pub(crate) fn resolve_visible_transient_helper(source: WindowTarget) -> Option<W
     detect_visible_transient_helper(source).unique_target()
 }
 
-/// Detect a same-process transient window that has taken exclusive foreground
-/// ownership from `source`.
+/// Detect a same-process transient window that has taken the app's current
+/// context from `source`, including while the application is in the background.
 ///
 /// This is intentionally much narrower than "pick the topmost window for the
 /// pid".  A candidate must be a live layer-0 AX window on the same current
@@ -326,6 +331,9 @@ pub(crate) fn resolve_visible_transient_helper(source: WindowTarget) -> Option<W
 /// dialog/modal metadata. Blender 4.5's File View exposes neither, so its only
 /// fallback is a deliberately narrow bundle-id plus exact native window-title
 /// allowlist. A merely focused, contained sibling is never redirectable.
+/// Application AXFocusedWindow/AXMainWindow references can also require an
+/// explicit context handoff when AXFocused=false on background windows. They
+/// only refuse the stale source; they do not supply missing modal authority.
 pub(crate) fn detect_same_pid_transient_in_front(
     source: WindowTarget,
 ) -> SamePidTransientDetection {
@@ -392,6 +400,14 @@ fn same_pid_ax_window_facts(pid: i32) -> Result<Vec<SamePidAxWindowFacts>, ()> {
                 return Err(());
             }
         };
+        let app_window_id = |attribute| {
+            let element = try_copy_element_attr(app, attribute).ok().flatten()?;
+            let window_id = ax_get_window_id(element);
+            CFRelease(element as CFTypeRef);
+            window_id
+        };
+        let app_focused_id = app_window_id("AXFocusedWindow");
+        let app_main_id = app_window_id("AXMainWindow");
         CFRelease(app as CFTypeRef);
 
         let mut complete = snapshot.complete;
@@ -409,6 +425,8 @@ fn same_pid_ax_window_facts(pid: i32) -> Result<Vec<SamePidAxWindowFacts>, ()> {
                     modal: copy_bool_attr(window, "AXModal"),
                     focused: copy_bool_attr(window, "AXFocused"),
                     main: copy_bool_attr(window, "AXMain"),
+                    app_focused: app_focused_id == Some(window_id),
+                    app_main: app_main_id == Some(window_id),
                 });
                 if facts.is_none() {
                     complete = false;
@@ -466,6 +484,20 @@ fn detect_same_pid_transient_in_front_in(
             && !source_focused
             && !source_main;
         if !exclusive_focus_handoff {
+            // Calc's background Sort window reports AXFocused=false and
+            // AXModal=false despite both application context references
+            // pointing to it. Returning the source would pair its AX tree and
+            // input target with a capture containing a different window.
+            // Refuse without redirecting; an unpinned observation can select
+            // the current application context through the normal resolver.
+            if candidate_ax.order < source_ax.order
+                && candidate_ax.app_focused
+                && candidate_ax.app_main
+                && !source_ax.app_focused
+                && !source_ax.app_main
+            {
+                unproven_focused_successor = true;
+            }
             continue;
         }
         let classification = if candidate_ax.has_dialog_metadata() {
@@ -779,6 +811,8 @@ mod tests {
             modal: Some(modal),
             focused: Some(focused),
             main: Some(main),
+            app_focused: false,
+            app_main: false,
         }
     }
 
@@ -865,6 +899,91 @@ mod tests {
             SamePidTransientDetection::Ambiguous,
             "focus and containment alone must never authorize a sibling redirect"
         );
+    }
+
+    fn background_calc_sort_context() -> (WindowTarget, Vec<WindowInfo>, Vec<SamePidAxWindowFacts>) {
+        let source = WindowTarget {
+            pid: 32147,
+            window_id: 103577,
+        };
+        let windows = vec![
+            current_window(32147, 103609, "Sort", 0, rect(562.0, 276.0, 602.0, 511.0)),
+            current_window(
+                32147,
+                103577,
+                "H068-r33-sort-source.csv",
+                2,
+                rect(172.0, 104.0, 1382.0, 856.0),
+            ),
+        ];
+        let mut successor = same_pid_ax(103609, 0, false, true, false);
+        successor.app_focused = true;
+        successor.app_main = true;
+        (
+            source,
+            windows,
+            vec![successor, same_pid_ax(103577, 2, false, false, false)],
+        )
+    }
+
+    #[test]
+    fn background_application_context_handoff_refuses_stale_host_without_redirect() {
+        let (source, windows, facts) = background_calc_sort_context();
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&facts), source, false),
+            SamePidTransientDetection::Ambiguous,
+            "the captured background Sort metadata must not yield a host AX/capture mismatch"
+        );
+        // Modal metadata alone does not turn application references into the
+        // missing per-window focus proof for an automatic redirect.
+        let mut modal = facts.clone();
+        modal[0].modal = Some(true);
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(&windows, Some(&modal), source, false),
+            SamePidTransientDetection::Ambiguous
+        );
+    }
+
+    #[test]
+    fn background_handoff_requires_both_application_references_and_exclusive_source() {
+        let (source, windows, facts) = background_calc_sort_context();
+        for change in 0..4 {
+            let mut changed = facts.clone();
+            match change {
+                0 => changed[0].app_focused = false,
+                1 => changed[0].app_main = false,
+                2 => changed[1].app_focused = true,
+                _ => changed[1].app_main = true,
+            }
+            assert_eq!(
+                detect_same_pid_transient_in_front_in(&windows, Some(&changed), source, false),
+                SamePidTransientDetection::None
+            );
+        }
+    }
+
+    #[test]
+    fn application_context_references_do_not_override_geometry_space_or_window_order() {
+        let (source, windows, facts) = background_calc_sort_context();
+        for change in 0..4 {
+            let mut changed_windows = windows.clone();
+            let mut changed_facts = facts.clone();
+            match change {
+                0 => changed_windows[0].bounds.x = 2000.0,
+                1 => changed_windows[0].on_current_space = Some(false),
+                2 => changed_windows[0].current_space_id = Some(2),
+                _ => changed_facts[0].order = 3,
+            }
+            assert_eq!(
+                detect_same_pid_transient_in_front_in(
+                    &changed_windows,
+                    Some(&changed_facts),
+                    source,
+                    false
+                ),
+                SamePidTransientDetection::None
+            );
+        }
     }
 
     #[test]

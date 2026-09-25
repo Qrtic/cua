@@ -1970,7 +1970,7 @@ pub(crate) async fn guard_same_pid_transient_target(
                 "pid": pid,
                 "window_id": window_id,
                 "retryable": true,
-                "suggestion": "Close extra transient windows and observe the app again."
+                "suggestion": "Observe the application's current context without a window_id, or enumerate windows and explicitly select the intended target. Use only that fresh observation for input."
             })),
         ),
         crate::transient_ui::SamePidTransientDetection::Indeterminate => Err(
