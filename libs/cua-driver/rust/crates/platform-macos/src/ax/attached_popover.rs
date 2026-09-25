@@ -314,13 +314,16 @@ fn requires_host_attachment(
     role: Option<&str>,
     physical_window: Option<u32>,
     host_id: u32,
+    parent_window: impl FnOnce() -> Option<u32>,
 ) -> bool {
     matches!(role, Some("AXPopover" | "AXButton"))
         && physical_window.is_some_and(|id| id != host_id)
+        && parent_window() != Some(host_id)
 }
 
-/// Cheap classification only. Exact popover-window targets keep the ordinary
-/// route; the full attachment proof is mandatory only for a displaced host.
+/// Classification only. Exact surfaces and controls whose nearest parent
+/// surface is the target keep the ordinary route. A different or unknown
+/// logical surface still requires the full attachment proof.
 pub(crate) unsafe fn has_displaced_popover_window(element: AXUIElementRef, host_id: u32) -> bool {
     // Keynote's AXWindow attribute points to the host even though the button
     // physically lives in a separate popover. Classify the actual element ID.
@@ -328,6 +331,11 @@ pub(crate) unsafe fn has_displaced_popover_window(element: AXUIElementRef, host_
         copy_string_attr(element, "AXRole").as_deref(),
         ax_get_window_id(element),
         host_id,
+        // TextEdit's save sheet hosts buttons on a separate accessory
+        // CGWindow. Physical displacement alone does not make them popovers.
+        // Do not use AXWindow here: Keynote can alias that attribute to a host
+        // even for a real popover. Require the nearest AXParent surface.
+        || super::element_ancestry::parent_window_id(element),
     )
 }
 
@@ -510,14 +518,89 @@ mod tests {
     }
     #[test]
     fn exact_popover_window_keeps_ordinary_route() {
-        assert!(!requires_host_attachment(Some("AXPopover"), Some(900), 900));
-        assert!(requires_host_attachment(Some("AXPopover"), Some(900), 700));
-        assert!(!requires_host_attachment(Some("AXPopover"), None, 700));
+        assert!(!requires_host_attachment(
+            Some("AXPopover"),
+            Some(900),
+            900,
+            || panic!("exact physical surface needs no ancestry read")
+        ));
+        assert!(requires_host_attachment(
+            Some("AXPopover"),
+            Some(900),
+            700,
+            || Some(900)
+        ));
+        assert!(!requires_host_attachment(
+            Some("AXPopover"),
+            None,
+            700,
+            || panic!("unmapped surface needs no classification read")
+        ));
         // Classification only. A displaced physical window still needs a
         // separate, reciprocal AXPopover attachment before any action.
-        assert!(requires_host_attachment(Some("AXButton"), Some(900), 700));
-        assert!(!requires_host_attachment(Some("AXWindow"), Some(900), 700));
-        assert!(!requires_host_attachment(Some("AXWindow"), Some(700), 700));
+        assert!(requires_host_attachment(
+            Some("AXButton"),
+            Some(900),
+            700,
+            || Some(900)
+        ));
+        assert!(!requires_host_attachment(
+            Some("AXWindow"),
+            Some(900),
+            700,
+            || panic!("non-candidate needs no ancestry read")
+        ));
+        assert!(!requires_host_attachment(
+            Some("AXWindow"),
+            Some(700),
+            700,
+            || panic!("non-candidate needs no ancestry read")
+        ));
+    }
+    #[test]
+    fn accessory_button_in_exact_sheet_uses_the_descendant_semantic_route() {
+        use cua_driver_core::background_input::{
+            decide_background_input, BackgroundAction, BackgroundTargetFacts, ElementAncestry,
+            ExactWindowTarget, WindowServerOwnership,
+        };
+        // H056: native button 103307 -> AXSplitGroup -> AXSheet 103306 ->
+        // document 103289. Fresh exact-target facts already prove the sheet.
+        let target = ExactWindowTarget {
+            pid: 42,
+            window_id: 103306,
+        };
+        let facts = BackgroundTargetFacts {
+            window_server: WindowServerOwnership::SamePid,
+            ax_window_present: true,
+            target_minimized: Some(false),
+            app_hidden: Some(false),
+            competing_keyboard_destinations: 2,
+            element: ElementAncestry::ProvenDescendant,
+        };
+        let action =
+            if requires_host_attachment(Some("AXButton"), Some(103307), target.window_id, || {
+                Some(103306)
+            }) {
+                BackgroundAction::AttachedPopoverSemantic
+            } else {
+                BackgroundAction::AxSemantic
+            };
+        assert!(decide_background_input(target, &facts, action).is_execute());
+        // The old physical-ID classification chose this incompatible route.
+        assert!(!decide_background_input(
+            target,
+            &facts,
+            BackgroundAction::AttachedPopoverSemantic
+        )
+        .is_execute());
+        for other_or_unknown in [None, Some(103289), Some(103308)] {
+            assert!(requires_host_attachment(
+                Some("AXButton"),
+                Some(103307),
+                target.window_id,
+                || other_or_unknown,
+            ));
+        }
     }
     fn wrapped_toolbar_popover() -> Tree {
         let mut tree = pages();

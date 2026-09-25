@@ -26,6 +26,14 @@ trait Ancestry {
 }
 
 fn resolve<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
+    resolve_with_window_fallback(tree, start, true)
+}
+
+fn resolve_with_window_fallback<T: Ancestry>(
+    tree: &T,
+    start: &T::Node,
+    allow_window_attribute: bool,
+) -> Option<u32> {
     let pid = tree.owner(start)?;
     let mut node = start.clone();
     let mut visited = Vec::new();
@@ -43,6 +51,9 @@ fn resolve<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
             _ => {}
         }
         let Some(parent) = tree.relation(&node, "AXParent") else {
+            if !allow_window_attribute {
+                return None;
+            }
             // Some accessibility implementations omit parent links. Retain
             // the existing direct AXWindow proof only when no nearer surface
             // was encountered, never after an unmappable sheet/popover or a cycle.
@@ -100,13 +111,32 @@ impl Ancestry for Native {
 /// `element` is a live retained AX reference with its caller's bounded messaging
 /// timeout for the duration of the call.
 pub(super) unsafe fn window_id(element: AXUIElementRef) -> Option<u32> {
+    native_window_id(element, true)
+}
+
+/// Resolve a surface through AXParent only. A displaced physical surface may
+/// expose AXWindow = host even when its parent chain is missing; that attribute
+/// alone must not downgrade an attached-popover route to an ordinary action.
+///
+/// # Safety
+/// Same retained-element and messaging-timeout requirements as `window_id`.
+pub(super) unsafe fn parent_window_id(element: AXUIElementRef) -> Option<u32> {
+    native_window_id(element, false)
+}
+
+unsafe fn native_window_id(element: AXUIElementRef, allow_window_attribute: bool) -> Option<u32> {
     CFRetain(element as CFTypeRef);
     let node = Node(element);
     // The observation retains this exact object for the later action. Lowering
     // its per-object timeout here also lowers AXPress's timeout and can report
     // CannotComplete while an AppKit sheet is already opening/closing. Bound
     // newly copied ancestors, but preserve the caller's timeout on the start.
-    resolve(&Native(Instant::now() + Duration::from_secs(1)), &node)
+    let tree = Native(Instant::now() + Duration::from_secs(1));
+    if allow_window_attribute {
+        resolve(&tree, &node)
+    } else {
+        resolve_with_window_fallback(&tree, &node, false)
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +230,24 @@ mod tests {
         assert_eq!(resolve(&t, &0), Some(7));
         t.nodes.get_mut(&0).unwrap().1 = None;
         assert_eq!(resolve(&t, &0), Some(7));
+    }
+    #[test]
+    fn displaced_surface_classification_requires_a_parent_chain_not_host_attribute() {
+        let mut t = sheet();
+        // TextEdit's Save/Cancel controls live on an accessory CGWindow while
+        // their nearest logical surface is the requested save sheet.
+        t.nodes.get_mut(&0).unwrap().3 = Some(9);
+        assert_eq!(resolve_with_window_fallback(&t, &0, false), Some(8));
+        // Keynote may expose AXWindow=host for a separate chart popover. A
+        // missing parent must not turn that host attribute into sheet proof.
+        t.nodes.get_mut(&0).unwrap().1 = None;
+        assert_eq!(resolve(&t, &0), Some(7));
+        assert_eq!(resolve_with_window_fallback(&t, &0, false), None);
+        t.nodes.get_mut(&0).unwrap().1 = Some(1);
+        t.nodes.get_mut(&1).unwrap().0 = "AXPopover";
+        assert_eq!(resolve_with_window_fallback(&t, &0, false), Some(8));
+        t.nodes.get_mut(&1).unwrap().3 = None;
+        assert_eq!(resolve_with_window_fallback(&t, &0, false), None);
     }
     #[test]
     fn cycles_foreign_parents_and_application_menus_fail_closed() {
