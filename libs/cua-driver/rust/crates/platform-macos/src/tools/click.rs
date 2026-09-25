@@ -1338,6 +1338,12 @@ impl Tool for ClickTool {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
+                    tracing::debug!(target: "cua_pointer_target", pid,
+                        requested_window_id = hit_test_wid, screen_x, screen_y,
+                        physical_window_id = ?crate::ax::bindings::ax_get_window_id(element),
+                        ancestor_window_id = ?crate::ax::exact_target::element_window_id(element),
+                        role = ?copy_string_attr(element, "AXRole"),
+                        "Resolved background coordinate AX target");
                     // Keep the hit-tested element alive across every proof and
                     // release it even if the semantic action returns an error.
                     let result = (|| {
