@@ -219,6 +219,7 @@ impl Tool for LaunchAppTool {
             || !additional_arguments.is_empty()
             || !env.is_empty()
             || creates_new_instance;
+        let expected_bundle_id = response_bundle_id.clone();
 
         // Move the launch closure inputs into spawn_blocking. The
         // blocking task returns (pid, app_info, windows). Suppression
@@ -260,6 +261,12 @@ impl Tool for LaunchAppTool {
                 }
             };
 
+            // LaunchServices can acknowledge rapp while leaving an existing
+            // document app hidden (notably when a Save sheet is open). The
+            // caller explicitly requested reopening this application. Restore
+            // only its visibility; do not request activation or a window raise.
+            let visibility = unhide_requested_application(pid, expected_bundle_id.as_deref());
+
             // Retry loop: LaunchServices returns before WindowServer has
             // registered the new windows. Poll up to 5x100ms.
             let windows = resolve_windows_for_pid(pid);
@@ -269,7 +276,7 @@ impl Tool for LaunchAppTool {
                 apps.into_iter().find(|a| a.pid == pid)
             };
 
-            Ok::<_, anyhow::Error>((pid, app_info, windows))
+            Ok::<_, anyhow::Error>((pid, app_info, windows, visibility))
         })
         .await;
 
@@ -280,7 +287,7 @@ impl Tool for LaunchAppTool {
         // Report the actual foreground state at the end of suppression.
         // This does not prove who caused an activation or retry a demotion.
         let mut self_activation_suppressed: Option<bool> = None;
-        if let Ok(Ok((pid, _, _))) = &launch_result {
+        if let Ok(Ok((pid, _, _, _))) = &launch_result {
             if let Some(prior) = prior_frontmost {
                 if *pid != prior {
                     let targeted_lease = wildcard_lease
@@ -326,7 +333,7 @@ impl Tool for LaunchAppTool {
         }
 
         match launch_result {
-            Ok(Ok((pid, app_info, windows))) => {
+            Ok(Ok((pid, app_info, windows, visibility))) => {
                 let (app_name, bid) = response_identity(
                     app_info.as_ref(),
                     response_bundle_id.as_deref(),
@@ -362,6 +369,7 @@ impl Tool for LaunchAppTool {
                     "name": app_name,
                     "windows": windows_json,
                     "launch_state": launch_state(true, true, !windows.is_empty()),
+                    "visibility_request": visibility,
                 });
                 // Only emit `self_activation_suppressed` when the
                 // bounded suppression window actually ran. `None`
@@ -397,6 +405,37 @@ fn protected_host_launch_refusal() -> ToolResult {
 }
 
 // ── Blocking helpers ──────────────────────────────────────────────────────────
+
+/// Ask only the exact launched application to become visible, without activation.
+fn unhide_requested_application(pid: i32, expected_bundle_id: Option<&str>) -> Value {
+    use objc2_app_kit::NSRunningApplication;
+    let Some(expected_bundle_id) = expected_bundle_id else {
+        return serde_json::json!({"requested": false, "reason": "bundle_identity_unavailable"});
+    };
+    unsafe {
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+            return serde_json::json!({"requested": false, "reason": "process_unavailable"});
+        };
+        if app.isTerminated()
+            || app.bundleIdentifier().map(|bid| bid.to_string()).as_deref() != Some(expected_bundle_id)
+        {
+            return serde_json::json!({"requested": false, "reason": "process_identity_changed"});
+        }
+        if !app.isHidden() {
+            return serde_json::json!({"requested": false, "was_hidden": false});
+        }
+        if crate::foreground_activity::check_request().is_err() {
+            return serde_json::json!({"requested": false, "was_hidden": true, "reason": "request_interrupted"});
+        }
+        // unhide() acknowledges only that AppKit accepted the request. Its
+        // asynchronous effect must be checked by the next observation; never
+        // advertise it as verified visibility or successful document opening.
+        let accepted = app.unhide();
+        tracing::debug!(target: "cua_focus_restore", pid, accepted,
+            "Requested background application visibility");
+        serde_json::json!({"requested": true, "accepted": accepted, "was_hidden": true})
+    }
+}
 
 /// Poll for the pid's layer-0 windows, retrying up to 5x100ms to absorb
 /// LaunchServices → WindowServer latency (mirrors the Swift reference).
