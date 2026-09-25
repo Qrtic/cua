@@ -1338,45 +1338,70 @@ impl Tool for ClickTool {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
-                    // The pid-scoped hit-test can resolve an element from a
-                    // same-process sibling overlapping the requested point.
-                    // Require proven ancestry in the requested window before
-                    // acting; otherwise fall through to the routed pixel path
-                    // (already gated for this exact window).
-                    if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
-                        CFRelease(element as _);
-                        return Ok(false);
-                    }
-                    let role = copy_string_attr(element, "AXRole").unwrap_or_default();
-                    let enabled = copy_bool_attr(element, "AXEnabled");
-                    let advertised_actions = copy_action_names(element);
-                    let identifier = if role == "AXCheckBox" {
-                        copy_string_attr(element, "AXIdentifier").unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    let delivered = if focus_only {
-                        crate::input::ax_actions::focus_element(element as usize).is_ok()
-                    } else if qt_checkable_press_is_toggle(&role, &identifier, &advertised_actions)
-                        || !background_pixel_ax_press_eligible(
-                            press_only,
-                            &role,
-                            &advertised_actions,
-                            enabled,
-                        )
-                    {
-                        false
-                    } else {
-                        if let Err(error) = crate::foreground_activity::check_request() {
-                            CFRelease(element as _);
-                            return Err(error);
+                    // Keep the hit-tested element alive across every proof and
+                    // release it even if the semantic action returns an error.
+                    let result = (|| {
+                        // A composed host screenshot can show a button whose
+                        // physical window is its attached popover. Sending raw
+                        // host events through that button hits the document
+                        // behind it (H062). Use the same reciprocal ownership
+                        // proof as an indexed AX action; never grant pointer
+                        // or sibling authority from a matching coordinate.
+                        if crate::ax::attached_popover::has_displaced_popover_window(
+                            element,
+                            hit_test_wid,
+                        ) {
+                            if focus_only {
+                                return Ok(false);
+                            }
+                            perform_attached_popover_action(
+                                element as usize,
+                                pid,
+                                hit_test_wid,
+                                "press",
+                            )?;
+                            return Ok(true);
                         }
+                        if crate::ax::exact_target::element_window_id(element)
+                            != Some(hit_test_wid)
+                        {
+                            return Ok(false);
+                        }
+                        let role = copy_string_attr(element, "AXRole").unwrap_or_default();
+                        let enabled = copy_bool_attr(element, "AXEnabled");
+                        let advertised_actions = copy_action_names(element);
+                        let identifier = if role == "AXCheckBox" {
+                            copy_string_attr(element, "AXIdentifier").unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        if focus_only {
+                            return Ok(crate::input::ax_actions::focus_element(element as usize)
+                                .is_ok());
+                        }
+                        if qt_checkable_press_is_toggle(&role, &identifier, &advertised_actions)
+                            || !background_pixel_ax_press_eligible(
+                                press_only,
+                                &role,
+                                &advertised_actions,
+                                enabled,
+                            )
+                        {
+                            return Ok(false);
+                        }
+                        crate::foreground_activity::check_request()?;
                         let press = core_foundation::string::CFString::new("AXPress");
-                        AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                            == kAXErrorSuccess
-                    };
+                        let error = AXUIElementPerformAction(element, press.as_concrete_TypeRef());
+                        check_ax_action_response(error)?;
+                        if error != kAXErrorSuccess {
+                            anyhow::bail!(
+                                "AXUIElementPerformAction(AXPress) returned {error}; no fallback was attempted"
+                            );
+                        }
+                        Ok(true)
+                    })();
                     CFRelease(element as _);
-                    Ok(delivered)
+                    result
                 })
                 .await;
                 match ax_result {
@@ -1400,14 +1425,23 @@ impl Tool for ClickTool {
                             "effect": "refused"
                         }));
                     }
-                    Ok(Err(error)) if focus_only => {
-                        return ToolResult::error(format!("Background PX focus failed: {error}"))
-                            .with_structured(serde_json::json!({
-                                "code": "background_unavailable",
-                                "effect": "refused"
-                            }));
+                    Ok(Err(error)) => {
+                        if let Some(unconfirmed) = error.downcast_ref::<AxActionResponseUnconfirmed>() {
+                            return unconfirmed.result();
+                        }
+                        if let Some(refusal) = error.downcast_ref::<ApplicationMenuRefusal>() {
+                            return super::background_refusal_result(pid, hit_test_wid, &refusal.0);
+                        }
+                        return ToolResult::error(format!(
+                            "Background coordinate AX action failed: {error}. No fallback input was sent."
+                        ))
+                        .with_structured(serde_json::json!({
+                            "code": "ax_action_failed", "effect": "unverifiable",
+                            "verified": false, "retryable": false,
+                        }));
                     }
-                    _ => {}
+                    Err(_) => return AxActionResponseUnconfirmed.result(),
+                    Ok(Ok(false)) => {}
                 }
             }
 
@@ -2069,6 +2103,16 @@ fn perform_attached_popover_click(
     window_id: u32,
     action: &str,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+    let native = perform_attached_popover_action(element_ptr, pid, window_id, action)?;
+    Ok((format!("Performed {native} on observed host-attached popover element [{idx}]; verify the visible effect."), false, false, false, false))
+}
+
+fn perform_attached_popover_action(
+    element_ptr: usize,
+    pid: i32,
+    window_id: u32,
+    action: &str,
+) -> anyhow::Result<&'static str> {
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
@@ -2099,7 +2143,7 @@ fn perform_attached_popover_click(
             "AXUIElementPerformAction({native}) returned {error}; no fallback was attempted"
         );
     }
-    Ok((format!("Performed {native} on observed host-attached popover element [{idx}]; verify the visible effect."), false, false, false, false))
+    Ok(native)
 }
 
 /// Returns `(summary_text, needs_text_input_settle, suspected_noop,
