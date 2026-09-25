@@ -1,6 +1,6 @@
-//! Semantic-only proof for an AXPopover or its button attached to one host window.
+//! Element-bound semantic proof for native controls in one attached AXPopover.
 //!
-//! A button can name either the AXPopover (Pages) or the document host (Keynote)
+//! A control can name either the AXPopover (Calendar/Pages) or the host (Keynote)
 //! as AXWindow. Its physical window ID must match the actual AXPopover, which
 //! must remain in its reciprocal AXParent chain and name the exact host.
 //! Keep that physical window identity intact for pointer and keyboard routing.
@@ -19,6 +19,31 @@ use std::time::{Duration, Instant};
 
 const MAX_DEPTH: usize = 32;
 const MAX_CHILDREN: isize = 1024;
+
+fn native_control_role(role: Option<&str>) -> bool {
+    matches!(
+        role,
+        Some(
+            "AXButton"
+                | "AXTextField"
+                | "AXTextArea"
+                | "AXPopUpButton"
+                | "AXCheckBox"
+                | "AXRadioButton"
+        )
+    )
+}
+
+pub(crate) fn native_text_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXTextField" | "AXTextArea"))
+}
+
+fn container_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup" | "AXToolbar"
+    )
+}
 
 trait PopoverTree {
     type Node: Clone;
@@ -63,7 +88,7 @@ fn containing_popover<T: PopoverTree>(
         }
         match tree.role(&current).as_deref() {
             Some("AXPopover") => return Ok(current),
-            Some("AXButton" | "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup") => {}
+            Some(role) if native_control_role(Some(role)) || container_role(role) => {}
             _ => return Err("popover_lookup_boundary"),
         }
         let parent = tree
@@ -88,20 +113,20 @@ fn prove_checked<T: PopoverTree>(
     // button's AXWindow can name the popover or the document host. That logical
     // attribute does not replace the button's independently read physical ID.
     let is_popover_root = tree.role(element).as_deref() == Some("AXPopover");
-    let mut button_window = None;
+    let mut control_window = None;
     let popover = if is_popover_root {
         element.clone()
-    } else if tree.role(element).as_deref() == Some("AXButton") {
+    } else if native_control_role(tree.role(element).as_deref()) {
         let window = tree.window(element).ok_or("element_window_missing")?;
         let popover = match tree.role(&window).as_deref() {
             Some("AXPopover") => window.clone(),
             Some("AXWindow") => containing_popover(tree, pid, element)?,
             _ => return Err("element_window_not_popover"),
         };
-        button_window = Some(window);
+        control_window = Some(window);
         popover
     } else {
-        return Err("element_not_button_or_popover");
+        return Err("element_not_native_control_or_popover");
     };
     let popover_role = tree.role(&popover);
     if popover_role.as_deref() != Some("AXPopover") {
@@ -118,12 +143,12 @@ fn prove_checked<T: PopoverTree>(
     let Some(host) = tree.window(&popover) else {
         return Err("popover_host_attribute_missing");
     };
-    if let Some(window) = &button_window {
+    if let Some(window) = &control_window {
         if tree.owner(window) != Some(pid)
             || tree.window_id(element) != Some(popover_id)
             || !(tree.same(window, &popover) || tree.same(window, &host))
         {
-            return Err("button_window_does_not_match_popover_or_host");
+            return Err("control_window_does_not_match_popover_or_host");
         }
     }
     if !matches!(tree.role(&host).as_deref(), Some("AXWindow" | "AXSheet")) {
@@ -159,7 +184,7 @@ fn prove_checked<T: PopoverTree>(
                     tree.same(element, &popover)
                         && tree.role(element).as_deref() == Some("AXPopover")
                 } else {
-                    button_window.as_ref().is_some_and(|window| {
+                    control_window.as_ref().is_some_and(|window| {
                         tree.window(element)
                             .is_some_and(|node| tree.same(&node, window))
                             && tree.owner(window) == Some(pid)
@@ -183,10 +208,7 @@ fn prove_checked<T: PopoverTree>(
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
             }
-            Some(
-                "AXButton" | "AXRadioGroup" | "AXGroup" | "AXScrollArea" | "AXSplitGroup"
-                | "AXToolbar",
-            ) => {}
+            Some(role) if native_control_role(Some(role)) || container_role(role) => {}
             // A different top-level window, nested popover, web subtree or
             // application root cannot be treated as an attachment to this host.
             _ => {
@@ -217,9 +239,13 @@ pub(crate) fn advertised_action(
 ) -> Option<&'static str> {
     let native = match (role, action) {
         (Some("AXPopover"), "cancel") => "AXCancel",
-        (Some("AXButton"), "press" | "click") => "AXPress",
-        (Some("AXButton"), "pick") => "AXPick",
-        (Some("AXButton"), "show_menu") => "AXShowMenu",
+        (
+            Some("AXButton" | "AXPopUpButton" | "AXCheckBox" | "AXRadioButton"),
+            "press" | "click",
+        ) => "AXPress",
+        (Some("AXButton" | "AXPopUpButton" | "AXCheckBox" | "AXRadioButton"), "pick") => "AXPick",
+        (role, "show_menu") if native_control_role(role) => "AXShowMenu",
+        (role, "confirm") if native_text_role(role) => "AXConfirm",
         _ => return None,
     };
     advertised
@@ -316,7 +342,7 @@ fn requires_host_attachment(
     host_id: u32,
     parent_window: impl FnOnce() -> Option<u32>,
 ) -> bool {
-    matches!(role, Some("AXPopover" | "AXButton"))
+    (role == Some("AXPopover") || native_control_role(role))
         && physical_window.is_some_and(|id| id != host_id)
         && parent_window() != Some(host_id)
 }
@@ -470,6 +496,74 @@ mod tests {
     #[test]
     fn pages_swatch_crosses_its_attached_popover_to_exact_host() {
         assert!(prove(&pages(), 42, 700, &0));
+    }
+    #[test]
+    fn calendar_fields_and_choices_keep_their_attached_popover_identity() {
+        // T022: Calendar exposes a title field and calendar choice in its
+        // host tree while their physical window remains the AXPopover.
+        for role in [
+            "AXTextField",
+            "AXTextArea",
+            "AXPopUpButton",
+            "AXCheckBox",
+            "AXRadioButton",
+        ] {
+            for logical_window in [2, 6] {
+                let mut tree = pages();
+                tree.nodes.get_mut(&0).unwrap().role = role;
+                tree.nodes.get_mut(&0).unwrap().window = Some(logical_window);
+                assert!(
+                    prove(&tree, 42, 700, &0),
+                    "{role}, logical window {logical_window}"
+                );
+                assert!(requires_host_attachment(Some(role), Some(900), 700, || {
+                    Some(900)
+                }));
+                assert!(
+                    !requires_host_attachment(Some(role), Some(900), 700, || Some(700)),
+                    "an accessory field belonging to the exact sheet keeps its ordinary route"
+                );
+                tree.nodes.get_mut(&2).unwrap().window = Some(8);
+                assert!(
+                    !prove(&tree, 42, 700, &0),
+                    "changed attachment must refuse {role}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn calendar_text_field_proof_rejects_missing_child_edges_and_foreign_nodes() {
+        for changed in 0..=6 {
+            let mut tree = pages();
+            tree.nodes.get_mut(&0).unwrap().role = "AXTextField";
+            tree.nodes.get_mut(&changed).unwrap().owner = 99;
+            assert!(!prove(&tree, 42, 700, &0), "foreign node {changed}");
+        }
+        for changed in 1..=6 {
+            let mut tree = pages();
+            tree.nodes.get_mut(&0).unwrap().role = "AXTextField";
+            tree.nodes.get_mut(&changed).unwrap().children.clear();
+            assert!(!prove(&tree, 42, 700, &0), "detached node {changed}");
+        }
+    }
+    #[test]
+    fn calendar_field_confirm_and_choice_press_require_the_advertised_action() {
+        assert_eq!(
+            advertised_action(Some("AXTextField"), "confirm", &["AXConfirm".into()]),
+            Some("AXConfirm")
+        );
+        assert_eq!(
+            advertised_action(Some("AXTextField"), "confirm", &["AXShowMenu".into()]),
+            None
+        );
+        assert_eq!(
+            advertised_action(Some("AXPopUpButton"), "press", &["AXPress".into()]),
+            Some("AXPress")
+        );
+        assert_eq!(
+            advertised_action(Some("AXTextField"), "press", &["AXConfirm".into()]),
+            None
+        );
     }
     #[test]
     fn popover_root_proves_its_own_attachment_for_direct_cancel() {

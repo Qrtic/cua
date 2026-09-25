@@ -319,6 +319,42 @@ fn background_pixel_ax_press_eligible(
         && is_concrete_press_control
         && advertised_actions.iter().any(|action| action == "AXPress")
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackgroundPointRoute {
+    ExactWindow,
+    AttachedPopover,
+    NoAxTarget,
+    RefuseDifferentSurface,
+}
+
+fn background_point_route(
+    requested_window: u32,
+    element_window: Option<u32>,
+    physical_window: Option<u32>,
+    displaced_popover_control: bool,
+    single_unmodified_primary: bool,
+) -> BackgroundPointRoute {
+    if displaced_popover_control {
+        if single_unmodified_primary {
+            BackgroundPointRoute::AttachedPopover
+        } else {
+            // A multi-click or secondary pointer gesture has no equivalent
+            // direct AX operation. Never send it to the host behind a popup.
+            BackgroundPointRoute::RefuseDifferentSurface
+        }
+    } else {
+        match element_window {
+            Some(window) if window == requested_window => BackgroundPointRoute::ExactWindow,
+            Some(_) => BackgroundPointRoute::RefuseDifferentSurface,
+            None if physical_window.is_some_and(|window| window != requested_window) => {
+                BackgroundPointRoute::RefuseDifferentSurface
+            }
+            None => BackgroundPointRoute::NoAxTarget,
+        }
+    }
+}
+
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
@@ -711,13 +747,19 @@ impl Tool for ClickTool {
                     // These isolated semantic surfaces never gain pointer
                     // authority from being observed alongside a host window.
                     let menu = inspect_background_surface
-                        && crate::ax::application_menu::supports_menu_action_role(&role, &inspection_action)
+                        && crate::ax::application_menu::supports_menu_action_role(
+                            &role,
+                            &inspection_action,
+                        )
                         && crate::ax::exact_target::element_window_id(element).is_none();
                     let popover = inspect_background_surface
                         && !menu
                         && crate::ax::attached_popover::has_displaced_popover_window(element, wid);
                     let pointer_candidate = primary_press
-                        && matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXCheckBox" | "AXCell")
+                        && matches!(
+                            role.as_str(),
+                            "AXTextField" | "AXTextArea" | "AXCheckBox" | "AXCell"
+                        )
                         && (role != "AXCell" || count == 1)
                         && !menu
                         && !popover;
@@ -739,9 +781,15 @@ impl Tool for ClickTool {
                                 && crate::ax::attached_popover::has_displaced_popover_window(
                                     element, wid,
                                 ));
-                        let route_selection = role == "AXCell"
-                            && copy_bool_attr(element, "AXSelected").is_some();
-                        primary_element_click_route(&role, &identifier, &actions, route_selection, auxiliary)
+                        let route_selection =
+                            role == "AXCell" && copy_bool_attr(element, "AXSelected").is_some();
+                        primary_element_click_route(
+                            &role,
+                            &identifier,
+                            &actions,
+                            route_selection,
+                            auxiliary,
+                        )
                     } else {
                         ElementClickRoute::AxSemantic
                     };
@@ -762,15 +810,20 @@ impl Tool for ClickTool {
             // stricter WindowPointer rung with the retained element proof. Gate
             // BEFORE any cursor/dispatch work so a stale or sibling-owned
             // target refuses instead of acting on the wrong window.
-            let menu_requires_context = background_menu && !effective_action.eq_ignore_ascii_case("cancel");
+            let menu_requires_context =
+                background_menu && !effective_action.eq_ignore_ascii_case("cancel");
             if menu_requires_context {
                 let proof_element = element_guard.clone();
                 let proof_action = effective_action.clone();
                 let owned = crate::foreground_activity::spawn_blocking(move || unsafe {
                     crate::ax::application_menu::menu_context_preparation_is_owned(
-                        pid, proof_element.as_ptr() as AXUIElementRef, &proof_action,
+                        pid,
+                        proof_element.as_ptr() as AXUIElementRef,
+                        &proof_action,
                     )
-                }).await.unwrap_or(false);
+                })
+                .await
+                .unwrap_or(false);
                 if !owned {
                     return ToolResult::error("The application-menu context could not be proven before preparation; no input was sent.")
                         .with_structured(serde_json::json!({
@@ -779,7 +832,10 @@ impl Tool for ClickTool {
                 }
             }
             let _mutation_lease = if !delivery_mode.is_foreground() {
-                let gate_action = if button_str == "middle" || element_route.uses_pointer() || menu_requires_context {
+                let gate_action = if button_str == "middle"
+                    || element_route.uses_pointer()
+                    || menu_requires_context
+                {
                     cua_driver_core::background_input::BackgroundAction::WindowPointer
                 } else if background_menu {
                     cua_driver_core::background_input::BackgroundAction::ApplicationMenuSemantic
@@ -1173,7 +1229,9 @@ impl Tool for ClickTool {
                 Ok(Err(e)) => {
                     if let Some(unconfirmed) = e.downcast_ref::<AxActionResponseUnconfirmed>() {
                         unconfirmed.result()
-                    } else if let Some(disabled) = e.downcast_ref::<crate::input::ax_actions::AxActionDisabled>() {
+                    } else if let Some(disabled) =
+                        e.downcast_ref::<crate::input::ax_actions::AxActionDisabled>()
+                    {
                         disabled_ax_action_result(disabled)
                     } else if let Some(refusal) = e.downcast_ref::<ApplicationMenuRefusal>() {
                         super::background_refusal_result(pid, wid, &refusal.0)
@@ -1327,23 +1385,22 @@ impl Tool for ClickTool {
             // backend after resolving the requested screen point. This keeps
             // targeting (PX) orthogonal to delivery (AX) and avoids making a
             // Chromium/AppKit window key merely to satisfy first-mouse rules.
-            if !delivery_mode.is_foreground()
-                && window_id.is_some()
-                && button_str == "left"
-                && count == 1
-                && modifiers.is_empty()
-            {
+            if !delivery_mode.is_foreground() && window_id.is_some() {
                 let focus_only = action == "focus";
                 let press_only = action == "press";
+                let single_primary = button_str == "left" && count == 1 && modifiers.is_empty();
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                 let ax_result = crate::foreground_activity::spawn_blocking(move || unsafe {
+                    let mut action_snapshot = None;
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
-                        return Ok::<bool, anyhow::Error>(false);
+                        return (Ok::<bool, anyhow::Error>(false), action_snapshot);
                     };
+                    let element_window = crate::ax::exact_target::element_window_id(element);
+                    let physical_window = crate::ax::bindings::ax_get_window_id(element);
                     tracing::debug!(target: "cua_pointer_target", pid,
                         requested_window_id = hit_test_wid, screen_x, screen_y,
-                        physical_window_id = ?crate::ax::bindings::ax_get_window_id(element),
-                        ancestor_window_id = ?crate::ax::exact_target::element_window_id(element),
+                        physical_window_id = ?physical_window,
+                        ancestor_window_id = ?element_window,
                         role = ?copy_string_attr(element, "AXRole"),
                         "Resolved background coordinate AX target");
                     // Keep the hit-tested element alive across every proof and
@@ -1355,24 +1412,28 @@ impl Tool for ClickTool {
                         // behind it (H062). Use the same reciprocal ownership
                         // proof as an indexed AX action; never grant pointer
                         // or sibling authority from a matching coordinate.
-                        if crate::ax::attached_popover::has_displaced_popover_window(
-                            element,
-                            hit_test_wid,
+                        match background_point_route(
+                            hit_test_wid, element_window, physical_window,
+                            crate::ax::attached_popover::has_displaced_popover_window(element, hit_test_wid),
+                            single_primary,
                         ) {
-                            if focus_only {
-                                return Ok(false);
+                            BackgroundPointRoute::AttachedPopover => {
+                                action_snapshot = Some(WindowChangeDetector::snapshot_targeted(apps::frontmost_pid(), pid));
+                                perform_attached_popover_action(
+                                    element as usize, pid, hit_test_wid,
+                                    if focus_only { "focus" } else { "press" },
+                                )?;
+                                return Ok(true);
                             }
-                            perform_attached_popover_action(
-                                element as usize,
-                                pid,
-                                hit_test_wid,
-                                "press",
-                            )?;
-                            return Ok(true);
+                            BackgroundPointRoute::RefuseDifferentSurface => {
+                                return Err(ElementPointerRefusal::Target(
+                                    "the observed point belongs to another native surface; use its exposed element action or text value, or observe that exact popup before a pointer gesture",
+                                ).into());
+                            }
+                            BackgroundPointRoute::NoAxTarget => return Ok(false),
+                            BackgroundPointRoute::ExactWindow => {}
                         }
-                        if crate::ax::exact_target::element_window_id(element)
-                            != Some(hit_test_wid)
-                        {
+                        if !single_primary {
                             return Ok(false);
                         }
                         let role = copy_string_attr(element, "AXRole").unwrap_or_default();
@@ -1384,6 +1445,7 @@ impl Tool for ClickTool {
                             String::new()
                         };
                         if focus_only {
+                            action_snapshot = Some(WindowChangeDetector::snapshot_targeted(apps::frontmost_pid(), pid));
                             return Ok(crate::input::ax_actions::focus_element(element as usize)
                                 .is_ok());
                         }
@@ -1397,6 +1459,7 @@ impl Tool for ClickTool {
                         {
                             return Ok(false);
                         }
+                        action_snapshot = Some(WindowChangeDetector::snapshot_targeted(apps::frontmost_pid(), pid));
                         crate::foreground_activity::check_request()?;
                         let press = core_foundation::string::CFString::new("AXPress");
                         let error = AXUIElementPerformAction(element, press.as_concrete_TypeRef());
@@ -1409,14 +1472,25 @@ impl Tool for ClickTool {
                         Ok(true)
                     })();
                     CFRelease(element as _);
-                    result
+                    (result, action_snapshot)
                 })
                 .await;
+                let mut ax_changes = String::new();
+                let ax_result = match ax_result {
+                    Ok((result, snapshot)) => {
+                        if let Some(snapshot) = snapshot {
+                            ax_changes = super::finish_window_observation(snapshot, &args)
+                                .await
+                                .result_suffix();
+                        }
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                };
                 match ax_result {
                     Ok(Ok(true)) => {
-                        let label = if focus_only { "focused" } else { "pressed" };
                         return ToolResult::text(format!(
-                            "✅ PX hit-test {label} the background element via AX."
+                            "✅ PX hit-test applied a direct background AX operation on the observed element.{ax_changes}"
                         ))
                         .with_structured(serde_json::json!({
                             "path": "ax",
@@ -1434,14 +1508,21 @@ impl Tool for ClickTool {
                         }));
                     }
                     Ok(Err(error)) => {
-                        if let Some(unconfirmed) = error.downcast_ref::<AxActionResponseUnconfirmed>() {
+                        if let Some(unconfirmed) =
+                            error.downcast_ref::<AxActionResponseUnconfirmed>()
+                        {
                             return unconfirmed.result();
                         }
-                        if let Some(disabled) = error.downcast_ref::<crate::input::ax_actions::AxActionDisabled>() {
+                        if let Some(disabled) =
+                            error.downcast_ref::<crate::input::ax_actions::AxActionDisabled>()
+                        {
                             return disabled_ax_action_result(disabled);
                         }
                         if let Some(refusal) = error.downcast_ref::<ApplicationMenuRefusal>() {
                             return super::background_refusal_result(pid, hit_test_wid, &refusal.0);
+                        }
+                        if let Some(refusal) = error.downcast_ref::<ElementPointerRefusal>() {
+                            return refusal.result(pid, hit_test_wid);
                         }
                         return ToolResult::error(format!(
                             "Background coordinate AX action failed: {error}. No fallback input was sent."
@@ -1856,7 +1937,9 @@ fn perform_element_pointer_click(
     )?;
     let selection = if selected_route == ElementClickRoute::CellSelectionPointer {
         let selection = crate::input::ax_actions::capture_exact_cell_selection(element_ptr)
-            .ok_or_else(|| anyhow::anyhow!("the exact cell selection evidence became unavailable before input"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("the exact cell selection evidence became unavailable before input")
+            })?;
         Some(selection)
     } else {
         None
@@ -1925,7 +2008,9 @@ fn perform_element_pointer_click(
                     ), foreground));
                 }
             }
-            if std::time::Instant::now() >= deadline { break; }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             std::thread::sleep(SELECTION_READBACK_POLL);
         }
         // The gesture already ran. Preserve an unverified receipt; never
@@ -2018,12 +2103,16 @@ fn perform_application_menu_click(
     let context = if existing.is_some() {
         existing
     } else if prepare_context {
-        if !unsafe { crate::ax::application_menu::menu_context_preparation_is_owned(pid, element, action) } {
+        if !unsafe {
+            crate::ax::application_menu::menu_context_preparation_is_owned(pid, element, action)
+        } {
             anyhow::bail!("application-menu preparation ancestry changed; no input was sent");
         }
         let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
         if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
-            ExactWindowTarget { pid, window_id }, &facts, BackgroundAction::WindowPointer,
+            ExactWindowTarget { pid, window_id },
+            &facts,
+            BackgroundAction::WindowPointer,
         ) {
             return Err(ApplicationMenuRefusal(refusal).into());
         }
@@ -2031,13 +2120,17 @@ fn perform_application_menu_click(
         let context = crate::input::skylight::begin_synthetic_target_focus(pid, window_id)?;
         context.make_window_key()?;
         Some(crate::ax::menu_context::MenuContextLease::new(
-            context, owner.unwrap_or_default().to_owned(), pid, window_id,
+            context,
+            owner.unwrap_or_default().to_owned(),
+            pid,
+            window_id,
         ))
     } else {
         None
     };
     let outcome = (|| {
-        let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, Some(element_ptr));
+        let facts =
+            crate::ax::exact_target::gather_background_facts(pid, window_id, Some(element_ptr));
         if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
             ExactWindowTarget { pid, window_id },
             &facts,
@@ -2047,12 +2140,13 @@ fn perform_application_menu_click(
         }
         let advertised = unsafe { copy_action_names(element) };
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let native = crate::ax::application_menu::advertised_menu_element_action(&role, action, &advertised)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
+        let native =
+            crate::ax::application_menu::advertised_menu_element_action(&role, action, &advertised)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
                     "application-menu action is not supported and advertised; take a fresh snapshot"
                 )
-            })?;
+                })?;
         crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
         crate::foreground_activity::check_request()?;
         let error = unsafe { crate::ax::bindings::perform_action(element, native) };
@@ -2080,8 +2174,11 @@ fn perform_application_menu_click(
         if opens_menu {
             for _ in 0..3 {
                 crate::foreground_activity::check_request()?;
-                visible = crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
-                if visible { break; }
+                visible =
+                    crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
+                if visible {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(35));
             }
         } else if owner.is_some() && !action.eq_ignore_ascii_case("cancel") {
@@ -2089,7 +2186,8 @@ fn perform_application_menu_click(
             let mut closed_since = None;
             loop {
                 crate::foreground_activity::check_request()?;
-                visible = crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
+                visible =
+                    crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
                 let now = std::time::Instant::now();
                 if visible {
                     closed_since = None;
@@ -2099,7 +2197,9 @@ fn perform_application_menu_click(
                         break;
                     }
                 }
-                if now >= deadline { break; }
+                if now >= deadline {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
@@ -2122,7 +2222,7 @@ fn perform_attached_popover_click(
     action: &str,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let native = perform_attached_popover_action(element_ptr, pid, window_id, action)?;
-    Ok((format!("Performed {native} on observed host-attached popover element [{idx}]; verify the visible effect."), false, false, false, false))
+    Ok((format!("Performed {native} on observed host-attached popover element [{idx}]; verify the visible effect."), native == "AXFocused", false, false, false))
 }
 
 fn perform_attached_popover_action(
@@ -2145,6 +2245,24 @@ fn perform_attached_popover_action(
     }
     let advertised = unsafe { copy_action_names(element) };
     let role = unsafe { copy_string_attr(element, "AXRole") };
+    if crate::ax::attached_popover::native_text_role(role.as_deref())
+        && matches!(action, "press" | "click" | "focus")
+    {
+        if unsafe { copy_bool_attr(element, "AXEnabled") } == Some(false)
+            || !unsafe { crate::ax::bindings::is_attribute_settable(element, "AXFocused") }
+        {
+            anyhow::bail!("Native popover text focus is not settable; use its exposed set_value operation. No input was sent");
+        }
+        crate::foreground_activity::check_request()?;
+        let error = unsafe { crate::ax::bindings::set_bool_attr_true(element, "AXFocused") };
+        check_ax_action_response(error)?;
+        if error != kAXErrorSuccess {
+            anyhow::bail!(
+                "Native popover AXFocused write returned {error}; no fallback was attempted"
+            );
+        }
+        return Ok("AXFocused");
+    }
     let native =
         crate::ax::attached_popover::advertised_action(role.as_deref(), action, &advertised)
             .ok_or_else(|| {
@@ -2463,13 +2581,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn projected_popup_point_never_falls_through_to_the_host_pointer() {
+        // T022's title is shown in host 47233 but physically belongs to 97609.
+        assert_eq!(
+            background_point_route(47233, Some(97609), Some(97609), true, true),
+            BackgroundPointRoute::AttachedPopover
+        );
+        for single_primary in [false, true] {
+            assert_eq!(
+                background_point_route(47233, Some(97609), Some(97609), false, single_primary),
+                BackgroundPointRoute::RefuseDifferentSurface
+            );
+        }
+        // Double/triple/right/modified clicks must not bypass this guard.
+        assert_eq!(
+            background_point_route(47233, Some(97609), Some(97609), true, false),
+            BackgroundPointRoute::RefuseDifferentSurface
+        );
+        for single_primary in [false, true] {
+            assert_eq!(
+                background_point_route(47233, Some(47233), Some(47233), false, single_primary),
+                BackgroundPointRoute::ExactWindow
+            );
+        }
+        assert_eq!(
+            background_point_route(47233, None, Some(97609), false, false),
+            BackgroundPointRoute::RefuseDifferentSurface
+        );
+        assert_eq!(
+            background_point_route(47233, Some(47233), Some(97609), false, true),
+            BackgroundPointRoute::ExactWindow,
+            "a proven exact-sheet accessory still uses its logical event window"
+        );
+        assert_eq!(
+            background_point_route(47233, None, None, false, true),
+            BackgroundPointRoute::NoAxTarget
+        );
+    }
+
+    #[test]
     fn selectable_cell_uses_one_pointer_route_despite_advertised_press() {
         let actions = ["AXPress".to_owned(), "AXShowMenu".to_owned()];
         assert_eq!(
             primary_element_click_route("AXCell", "", &actions, true, false),
             ElementClickRoute::CellSelectionPointer,
         );
-        assert!(pointer_control_enabled(ElementClickRoute::CellSelectionPointer, Ok(true), false));
+        assert!(pointer_control_enabled(
+            ElementClickRoute::CellSelectionPointer,
+            Ok(true),
+            false
+        ));
     }
 
     #[test]
@@ -2485,40 +2646,85 @@ mod tests {
             ("press", "left", false, true, true),
         ] {
             assert_eq!(
-                element_click_route(action, button, modified, "AXCell", &actions, selected, auxiliary),
+                element_click_route(
+                    action, button, modified, "AXCell", &actions, selected, auxiliary
+                ),
                 ElementClickRoute::AxSemantic,
             );
         }
         for role in ["AXRow", "AXButton", "AXTextArea"] {
-            assert_eq!(primary_element_click_route(role, "", &actions, true, false), ElementClickRoute::AxSemantic);
+            assert_eq!(
+                primary_element_click_route(role, "", &actions, true, false),
+                ElementClickRoute::AxSemantic
+            );
         }
     }
 
     #[test]
     fn cell_pointer_requires_positive_enabled_state() {
-        for enabled in [Ok(false), Err(crate::ax::bindings::kAXErrorAttributeUnsupported),
-            Err(crate::ax::bindings::kAXErrorCannotComplete), Err(crate::ax::bindings::kAXErrorFailure)] {
-            assert!(!pointer_control_enabled(ElementClickRoute::CellSelectionPointer, enabled, true));
+        for enabled in [
+            Ok(false),
+            Err(crate::ax::bindings::kAXErrorAttributeUnsupported),
+            Err(crate::ax::bindings::kAXErrorCannotComplete),
+            Err(crate::ax::bindings::kAXErrorFailure),
+        ] {
+            assert!(!pointer_control_enabled(
+                ElementClickRoute::CellSelectionPointer,
+                enabled,
+                true
+            ));
         }
     }
 
     #[test]
     fn writable_appkit_text_input_can_omit_enabled_attribute() {
         let missing = Err(crate::ax::bindings::kAXErrorAttributeUnsupported);
-        assert!(pointer_control_enabled(ElementClickRoute::TextInputPointer, missing, true));
-        assert!(!pointer_control_enabled(ElementClickRoute::TextInputPointer, missing, false));
-        assert!(!pointer_control_enabled(ElementClickRoute::QtCheckablePointer, missing, true));
-        assert!(!pointer_control_enabled(ElementClickRoute::AxSemantic, missing, true));
+        assert!(pointer_control_enabled(
+            ElementClickRoute::TextInputPointer,
+            missing,
+            true
+        ));
+        assert!(!pointer_control_enabled(
+            ElementClickRoute::TextInputPointer,
+            missing,
+            false
+        ));
+        assert!(!pointer_control_enabled(
+            ElementClickRoute::QtCheckablePointer,
+            missing,
+            true
+        ));
+        assert!(!pointer_control_enabled(
+            ElementClickRoute::AxSemantic,
+            missing,
+            true
+        ));
     }
 
     #[test]
     fn writable_value_never_overrides_disabled_or_failed_enabled_read() {
-        for value in [Ok(false), Err(crate::ax::bindings::kAXErrorCannotComplete),
-            Err(crate::ax::bindings::kAXErrorInvalidUIElement), Err(crate::ax::bindings::kAXErrorFailure)] {
-            assert!(!pointer_control_enabled(ElementClickRoute::TextInputPointer, value, true));
+        for value in [
+            Ok(false),
+            Err(crate::ax::bindings::kAXErrorCannotComplete),
+            Err(crate::ax::bindings::kAXErrorInvalidUIElement),
+            Err(crate::ax::bindings::kAXErrorFailure),
+        ] {
+            assert!(!pointer_control_enabled(
+                ElementClickRoute::TextInputPointer,
+                value,
+                true
+            ));
         }
-        assert!(pointer_control_enabled(ElementClickRoute::TextInputPointer, Ok(true), false));
-        assert!(pointer_control_enabled(ElementClickRoute::QtCheckablePointer, Ok(true), false));
+        assert!(pointer_control_enabled(
+            ElementClickRoute::TextInputPointer,
+            Ok(true),
+            false
+        ));
+        assert!(pointer_control_enabled(
+            ElementClickRoute::QtCheckablePointer,
+            Ok(true),
+            false
+        ));
     }
 
     #[test]

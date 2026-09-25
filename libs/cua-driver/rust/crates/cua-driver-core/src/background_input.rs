@@ -92,8 +92,9 @@ pub enum BackgroundAction {
     /// An advertised semantic action on a proven application-menu member.
     /// Never authorizes value writes, selection, pointer or keyboard fallbacks.
     ApplicationMenuSemantic,
-    /// An advertised direct AX action on a proven host-attached popover control.
-    /// Never authorizes value writes, focus, pointer or keyboard fallback.
+    /// A direct, element-bound operation on a proven host-attached native
+    /// popover: advertised AX action, settable text value, or settable focus.
+    /// Never authorizes ancestor/selection, pointer or keyboard fallback.
     AttachedPopoverSemantic,
     /// Window-local routed pointer (stamped CGWindowID; real pointer unmoved).
     WindowPointer,

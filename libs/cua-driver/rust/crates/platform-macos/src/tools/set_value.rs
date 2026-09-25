@@ -184,11 +184,33 @@ impl Tool for SetValueTool {
         // that the retained element still belongs to the requested exact
         // window immediately before any cursor or AX work; a cache hit alone
         // is not delivery proof after a window lifecycle or Space change.
+        let route_element = element_guard.clone();
+        let attached_popover_text =
+            match crate::foreground_activity::spawn_blocking(move || unsafe {
+                let element = route_element.as_ptr() as AXUIElementRef;
+                crate::ax::attached_popover::native_text_role(
+                    copy_string_attr(element, "AXRole").as_deref(),
+                ) && crate::ax::attached_popover::has_displaced_popover_window(element, window_id)
+            })
+            .await
+            {
+                Ok(attached) => attached,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "Native text surface lookup failed: {error}; no input was sent."
+                    ))
+                }
+            };
+        let gate_action = if attached_popover_text {
+            cua_driver_core::background_input::BackgroundAction::AttachedPopoverSemantic
+        } else {
+            cua_driver_core::background_input::BackgroundAction::AxSemantic
+        };
         let _mutation_lease = match super::gate_background_window_action(
             pid,
             window_id,
             Some(element_ptr),
-            cua_driver_core::background_input::BackgroundAction::AxSemantic,
+            gate_action,
         )
         .await
         {
@@ -250,7 +272,17 @@ impl Tool for SetValueTool {
                             element_ptr as AXUIElementRef,
                         )?;
                     }
-                    set_value_blocking(element_ptr, element_index, pid, &value)
+                    if attached_popover_text {
+                        set_attached_popover_text_value(
+                            element_ptr,
+                            element_index,
+                            pid,
+                            window_id,
+                            &value,
+                        )
+                    } else {
+                        set_value_blocking(element_ptr, element_index, pid, &value)
+                    }
                 })
                 .await
             },
@@ -323,6 +355,54 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
             outcome.detail = format!("📨 Sent (unverified){rest}");
         }
     }
+}
+
+/// A projected text field stays bound to its physical popover. Do not run the
+/// generic numeric, increment/decrement, option-selection or keyboard paths.
+fn set_attached_popover_text_value(
+    element_ptr: usize,
+    element_index: usize,
+    pid: i32,
+    window_id: u32,
+    value: &str,
+) -> anyhow::Result<SetValueOutcome> {
+    use cua_driver_core::background_input::{
+        decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
+    };
+    let element = element_ptr as AXUIElementRef;
+    let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, Some(element_ptr));
+    if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
+        ExactWindowTarget { pid, window_id },
+        &facts,
+        BackgroundAction::AttachedPopoverSemantic,
+    ) {
+        anyhow::bail!(
+            "Native popover text write refused before dispatch: {}",
+            refusal.reason
+        );
+    }
+    let role = unsafe { copy_string_attr(element, "AXRole") };
+    if !crate::ax::attached_popover::native_text_role(role.as_deref())
+        || unsafe { crate::ax::bindings::copy_bool_attr(element, "AXEnabled") } == Some(false)
+        || !unsafe { crate::ax::bindings::is_attribute_settable(element, "AXValue") }
+    {
+        anyhow::bail!(
+            "Native popover target is not an enabled, settable text field; no input was sent"
+        );
+    }
+    let before = unsafe { copy_string_attr(element, "AXValue") };
+    crate::foreground_activity::check_request()?;
+    let error = unsafe { set_string_attr(element, "AXValue", value) };
+    if error != kAXErrorSuccess {
+        anyhow::bail!("Native popover AXValue write returned {error}; no fallback was attempted");
+    }
+    let after = unsafe { copy_string_attr(element, "AXValue") };
+    let (verified, changed) = classify_write(before.as_deref(), after.as_deref(), value, false);
+    Ok(SetValueOutcome {
+        detail: format!("Set AXValue on host-attached native text field [{element_index}]."),
+        verified,
+        changed,
+    })
 }
 
 fn set_value_blocking(
