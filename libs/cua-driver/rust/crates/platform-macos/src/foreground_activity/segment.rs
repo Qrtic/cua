@@ -1279,9 +1279,16 @@ fn rendering_window_attributes(
 fn rendering_target_available(target: ExactWindowTarget) -> bool {
     use crate::ax::bindings as ax;
     use core_foundation::{array::CFArray, base::{CFRelease, CFTypeRef, TCFType}, string::CFString};
-    let Some(info) = crate::windows::window_info_by_id(target.window_id) else { return false };
+    // Exact identity lookups intentionally omit Space metadata. This path
+    // needs a positive, display-specific current-Space proof before activation.
+    let snapshot = crate::windows::visible_windows_with_space_snapshot();
+    let Some(info) = snapshot.windows.into_iter().find(|w| w.window_id == target.window_id) else { return false };
     if info.pid != target.pid || !info.is_on_screen || info.layer != 0
-        || info.on_current_space != Some(true) { return false; }
+        || info.on_current_space != Some(true) {
+        tracing::debug!(target: "cua_app_context", pid = target.pid, window_id = target.window_id,
+            on_current_space = ?info.on_current_space, "Rendering recovery lacks visible current-Space ownership proof");
+        return false;
+    }
     struct Owned(ax::AXUIElementRef);
     impl Drop for Owned {
         fn drop(&mut self) { unsafe { CFRelease(self.0 as _) }; }
@@ -1317,8 +1324,14 @@ fn rendering_target_available(target: ExactWindowTarget) -> bool {
                 _ => false,
             };
             if !value.is_null() { CFRelease(value); }
-            return check_request().is_ok() && rendering_window_attributes(
+            let ordinary_document = rendering_window_attributes(
                 role.as_deref(), subrole.as_deref(), modal, minimized, sheets_absent);
+            if !ordinary_document {
+                tracing::debug!(target: "cua_app_context", pid = target.pid, window_id = target.window_id,
+                    ?role, ?subrole, ?modal, ?minimized, sheets_absent,
+                    "Rendering recovery lacks ordinary document AX proof");
+            }
+            return check_request().is_ok() && ordinary_document;
         }
     }
     false
