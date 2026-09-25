@@ -734,8 +734,24 @@ impl Tool for ClickTool {
             // stricter WindowPointer rung with the retained element proof. Gate
             // BEFORE any cursor/dispatch work so a stale or sibling-owned
             // target refuses instead of acting on the wrong window.
+            let menu_requires_context = background_menu && !effective_action.eq_ignore_ascii_case("cancel");
+            if menu_requires_context {
+                let proof_element = element_guard.clone();
+                let proof_action = effective_action.clone();
+                let owned = crate::foreground_activity::spawn_blocking(move || unsafe {
+                    crate::ax::application_menu::menu_context_preparation_is_owned(
+                        pid, proof_element.as_ptr() as AXUIElementRef, &proof_action,
+                    )
+                }).await.unwrap_or(false);
+                if !owned {
+                    return ToolResult::error("The application-menu context could not be proven before preparation; no input was sent.")
+                        .with_structured(serde_json::json!({
+                            "code": "element_outside_target_window", "effect": "refused", "retryable": true
+                        }));
+                }
+            }
             let _mutation_lease = if !delivery_mode.is_foreground() {
-                let gate_action = if button_str == "middle" || element_route.uses_pointer() {
+                let gate_action = if button_str == "middle" || element_route.uses_pointer() || menu_requires_context {
                     cua_driver_core::background_input::BackgroundAction::WindowPointer
                 } else if background_menu {
                     cua_driver_core::background_input::BackgroundAction::ApplicationMenuSemantic
@@ -744,7 +760,11 @@ impl Tool for ClickTool {
                 } else {
                     cua_driver_core::background_input::BackgroundAction::AxSemantic
                 };
-                match super::gate_background_window_action(pid, wid, Some(element_ptr), gate_action)
+                // Context preparation requires the stricter visible exact-window
+                // rung. Menu input itself still passes the full semantic gate
+                // after that bounded preparation, immediately before AX action.
+                let gate_element = (!menu_requires_context).then_some(element_ptr);
+                match super::gate_background_window_action(pid, wid, gate_element, gate_action)
                     .await
                 {
                     Ok(lease) => Some(lease),
@@ -1022,6 +1042,7 @@ impl Tool for ClickTool {
                                 pid,
                                 wid,
                                 &action_clone,
+                                menu_requires_context,
                             )
                             .map(|outcome| (outcome, false))
                         } else if background_popover {
@@ -1861,38 +1882,64 @@ fn perform_application_menu_click(
     pid: i32,
     window_id: u32,
     action: &str,
+    prepare_context: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundAction, BackgroundInputDecision, ExactWindowTarget,
     };
     let element = element_ptr as AXUIElementRef;
-    let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, Some(element_ptr));
-    if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
-        ExactWindowTarget { pid, window_id },
-        &facts,
-        BackgroundAction::ApplicationMenuSemantic,
-    ) {
-        return Err(ApplicationMenuRefusal(refusal).into());
-    }
-    let advertised = unsafe { copy_action_names(element) };
-    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let native = crate::ax::application_menu::advertised_menu_element_action(&role, action, &advertised)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "application-menu action is not supported and advertised; take a fresh snapshot"
-            )
-        })?;
-    crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
-    crate::foreground_activity::check_request()?;
-    let error = unsafe { crate::ax::bindings::perform_action(element, native) };
-    check_ax_action_response(error)?;
-    if error != kAXErrorSuccess {
-        anyhow::bail!(
-            "AXUIElementPerformAction({native}) returned {error}; no fallback was attempted"
-        );
-    }
-    Ok((format!("Performed {native} on observed application-menu element [{idx}]; verify the visible effect."),
-        false, false, false, false))
+    let context = if prepare_context {
+        if !unsafe { crate::ax::application_menu::menu_context_preparation_is_owned(pid, element, action) } {
+            anyhow::bail!("application-menu preparation ancestry changed; no input was sent");
+        }
+        let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
+        if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
+            ExactWindowTarget { pid, window_id }, &facts, BackgroundAction::WindowPointer,
+        ) {
+            return Err(ApplicationMenuRefusal(refusal).into());
+        }
+        crate::foreground_activity::check_request()?;
+        let context = crate::input::skylight::begin_synthetic_target_focus(pid, window_id)?;
+        context.make_window_key()?;
+        Some(context)
+    } else {
+        None
+    };
+    let outcome = (|| {
+        let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, Some(element_ptr));
+        if let BackgroundInputDecision::Refuse(refusal) = decide_background_input(
+            ExactWindowTarget { pid, window_id },
+            &facts,
+            BackgroundAction::ApplicationMenuSemantic,
+        ) {
+            return Err(ApplicationMenuRefusal(refusal).into());
+        }
+        let advertised = unsafe { copy_action_names(element) };
+        let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+        let native = crate::ax::application_menu::advertised_menu_element_action(&role, action, &advertised)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "application-menu action is not supported and advertised; take a fresh snapshot"
+                )
+            })?;
+        crate::input::ax_actions::ensure_ax_action_enabled(element_ptr, native)?;
+        crate::foreground_activity::check_request()?;
+        let error = unsafe { crate::ax::bindings::perform_action(element, native) };
+        check_ax_action_response(error)?;
+        if error != kAXErrorSuccess {
+            anyhow::bail!(
+                "AXUIElementPerformAction({native}) returned {error}; no fallback was attempted"
+            );
+        }
+        Ok((format!("Performed {native} on observed application-menu element [{idx}]; verify the visible effect."),
+            false, false, false, false))
+    })();
+    // Restore only the synthetic belief inside this target, including error
+    // paths. Never send a resign/key event to the user's foreground process.
+    let cleanup = context.map(crate::input::skylight::end_synthetic_target_focus).transpose();
+    let result = outcome?;
+    cleanup?;
+    Ok(result)
 }
 
 /// No generic AX selection/ancestor fallback: re-prove the live attachment

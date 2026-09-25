@@ -224,6 +224,12 @@ fn proves_menu_path<T: MenuTree>(tree: &T, pid: i32, window_id: u32, element: &T
     if tree.focused_window() != Some(window_id) {
         return false;
     }
+    proves_menu_ancestry(tree, pid, element) && tree.focused_window() == Some(window_id)
+}
+
+// Application ownership alone is only preparation evidence. It never satisfies
+// the full application-menu input gate, which also requires exact local focus.
+fn proves_menu_ancestry<T: MenuTree>(tree: &T, pid: i32, element: &T::Node) -> bool {
     let Some(root) = tree.menu_bar() else {
         return false;
     };
@@ -240,9 +246,7 @@ fn proves_menu_path<T: MenuTree>(tree: &T, pid: i32, window_id: u32, element: &T
             return false;
         }
         if tree.same(&current, &root) {
-            // The application can change document context during AX reads.
-            // Re-read it after membership proof; never use global foreground.
-            return tree.focused_window() == Some(window_id);
+            return tree.within_budget();
         }
         if !matches!(
             tree.role(&current).as_deref(),
@@ -262,6 +266,33 @@ fn proves_menu_path<T: MenuTree>(tree: &T, pid: i32, window_id: u32, element: &T
         current = parent;
     }
     false
+}
+
+/// Prove only a live application's advertised menu-item ancestry before an
+/// exact-window synthetic focus preparation. This cannot authorize an action:
+/// the normal focused-document semantic gate must still pass after preparation.
+pub(crate) unsafe fn menu_context_preparation_is_owned(
+    pid: i32,
+    element: AXUIElementRef,
+    action: &str,
+) -> bool {
+    let Some(app) = AxNode::owned(AXUIElementCreateApplication(pid)) else {
+        return false;
+    };
+    if element.is_null() {
+        return false;
+    }
+    CFRetain(element as CFTypeRef);
+    let element = AxNode::owned(element).expect("retained menu element");
+    let tree = NativeMenuTree {
+        app,
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+    };
+    let role = tree.role(&element).unwrap_or_default();
+    is_actionable_menu_role(&role)
+        && !action.eq_ignore_ascii_case("cancel")
+        && advertised_menu_element_action(&role, action, &super::bindings::copy_action_names(element.0)).is_some()
+        && proves_menu_ancestry(&tree, pid, &element)
 }
 
 struct AxNode(AXUIElementRef);
@@ -971,6 +1002,19 @@ mod tests {
         let tree = menu_tree();
         assert!(proves_menu_member(&tree, 42, 7, &1));
         assert!(proves_menu_member(&tree, 42, 7, &3));
+    }
+    #[test]
+    fn menu_preparation_ownership_does_not_grant_document_action_authority() {
+        let mut tree = menu_tree();
+        tree.focused = None;
+        assert!(proves_menu_ancestry(&tree, 42, &1));
+        assert!(!proves_menu_member(&tree, 42, 7, &1));
+        tree.focused = Some(8);
+        assert!(proves_menu_ancestry(&tree, 42, &3));
+        assert!(!proves_menu_member(&tree, 42, 7, &3));
+        tree.nodes.get_mut(&2).unwrap().children.clear();
+        assert!(!proves_menu_ancestry(&tree, 42, &3));
+        assert!(!proves_menu_ancestry(&menu_tree(), 99, &3));
     }
     #[test]
     fn native_menu_proof_compares_identity_not_proxy_address() {
