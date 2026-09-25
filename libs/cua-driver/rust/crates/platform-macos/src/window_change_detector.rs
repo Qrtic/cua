@@ -34,7 +34,7 @@
 //! Dropping the `Snapshot` ends the suppression lease (RAII). `detect()`
 //! also drops the lease before returning. Ordinary input tools instead use
 //! `detect_input_async()`: report promptly while retaining only their targeted
-//! suppression lease for the original bounded protection window.
+//! suppression lease and window-order guard for the original bounded protection window.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -341,10 +341,15 @@ impl Snapshot {
             let protection_deadline = Instant::now() + DEFAULT_TIMEOUT;
             let mut snapshot = self;
             let lease = snapshot._lease.take();
+            let ordering = snapshot.ordering.take();
             snapshot.hold_targeted_lease_until_deadline = false;
             let changes = snapshot.detect_with(timeout, DEFAULT_POLL_INTERVAL);
             if let Some(lease) = lease {
-                lease.defer_release(protection_deadline);
+                if let Some(mut ordering) = ordering {
+                    lease.defer_release_with_poll(protection_deadline, move |deadline| ordering.poll(deadline));
+                } else {
+                    lease.defer_release(protection_deadline);
+                }
             }
             changes
         })
@@ -356,6 +361,7 @@ impl Snapshot {
     /// tests / callers that want a tighter or looser poll window.
     pub fn detect_with(mut self, timeout: Duration, poll_interval: Duration) -> Changes {
         let deadline = Instant::now() + timeout;
+        let mut first_change = None;
         loop {
             std::thread::sleep(poll_interval);
 
@@ -405,15 +411,16 @@ impl Snapshot {
                     // lease early; retain it for the original bounded settle
                     // window so the focus observer can restore the latest
                     // unrelated foreground instead of the stale snapshot app.
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if !remaining.is_zero() {
-                        std::thread::sleep(remaining);
-                    }
+                    // Keep polling window order as well: a sheet can be
+                    // created behind the original window, then raise its
+                    // parent on a later AppKit turn without any activation.
+                    first_change.get_or_insert(changes);
+                } else {
+                    return changes;
                 }
-                return changes;
             }
             if Instant::now() >= deadline {
-                return Changes::no_change();
+                return first_change.unwrap_or_else(Changes::no_change);
             }
         }
     }

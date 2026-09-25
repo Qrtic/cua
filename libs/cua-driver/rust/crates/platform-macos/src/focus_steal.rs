@@ -272,6 +272,45 @@ impl SuppressionLease {
             drop(self);
         });
     }
+
+    /// Retain a bounded background cleanup alongside the same cancellable
+    /// lease. Polling must not hold the tool response open. The callback runs
+    /// off the async executor and under the entry lock, so an intentional
+    /// foreground action cannot cancel this tail and then receive stale work.
+    /// Returning false stops polling while retaining ordinary focus protection
+    /// for the remainder of its original deadline.
+    pub(crate) fn defer_release_with_poll(
+        self,
+        deadline: Instant,
+        mut poll: impl FnMut(Instant) -> bool + Send + 'static,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let Some(deadline) = self.dispatcher.mark_deferred(self.handle, deadline) else { return };
+        runtime.spawn(async move {
+            let mut lease = self;
+            loop {
+                let next = (Instant::now() + Duration::from_millis(100)).min(deadline);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
+                if Instant::now() >= deadline { break; }
+                let result = tokio::task::spawn_blocking(move || {
+                    let keep_polling = lease.dispatcher.with_current_deferred(lease.handle, &mut poll);
+                    (lease, poll, keep_polling)
+                }).await;
+                let Ok((returned_lease, returned_poll, keep_polling)) = result else { return };
+                lease = returned_lease;
+                poll = returned_poll;
+                match keep_polling {
+                    Some(true) => {},
+                    Some(false) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                        break;
+                    },
+                    None => return,
+                }
+            }
+            drop(lease);
+        });
+    }
 }
 
 impl Drop for SuppressionLease {
@@ -299,6 +338,15 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
+    fn with_current_deferred<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant) -> T) -> Option<T> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(&handle.0)?;
+        if !entry.returned_tail || entry.target_pid.is_none() || entry.deadline <= Instant::now() {
+            return None;
+        }
+        Some(poll(entry.deadline))
+    }
+
     fn attach_activity_restore(&self, handle: SuppressionHandle, pid: i32) {
         let evidence = crate::foreground_activity::capture_restore(pid);
         if let Some(entry) = self.entries.lock().unwrap().get_mut(&handle.0) {
@@ -1170,6 +1218,66 @@ mod tests {
         })
         .await
         .expect("deferred lease was not released at its deadline");
+    }
+
+    #[tokio::test]
+    async fn deferred_cleanup_observes_effects_after_the_fast_response_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.delayed_ordering");
+        let polls = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&polls);
+        let dispatcher = Arc::clone(&d);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut sender = Some(sender);
+        private_lease(&d, h).defer_release_with_poll(
+            Instant::now() + Duration::from_secs(3), move |_| {
+                assert!(dispatcher.entries.try_lock().is_err(), "poll must serialize with cancellation");
+                let count = called.fetch_add(1, Ordering::SeqCst) + 1;
+                if count < 3 { return true; }
+                sender.take().unwrap().send(()).unwrap();
+                false
+            });
+        assert!(d.entries.lock().unwrap()[&h.0].returned_tail);
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "cleanup must not block the response");
+        tokio::time::timeout(Duration::from_secs(2), receiver).await.unwrap().unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert!(d.entries.lock().unwrap().contains_key(&h.0), "completed cleanup must retain focus protection");
+        d.cancel_deferred(42);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_tail_cannot_submit_its_first_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.cancelled_ordering");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&calls);
+        private_lease(&d, h).defer_release_with_poll(
+            Instant::now() + Duration::from_secs(1), move |_| {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+        d.cancel_deferred(42);
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn cleanup_poll_rejects_active_cancelled_and_expired_entries() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.poll_lifecycle");
+        assert_eq!(d.with_current_deferred(h, |_| panic!("not a returned tail")), None::<()>);
+        d.mark_deferred(h, Instant::now() + Duration::from_secs(1));
+        assert_eq!(d.with_current_deferred(h, |deadline| {
+            assert!(deadline > Instant::now());
+            9
+        }), Some(9));
+        d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline = Instant::now();
+        assert_eq!(d.with_current_deferred(h, |_| panic!("expired tail")), None::<()>);
+        d.cancel_deferred(42);
+        assert_eq!(d.with_current_deferred(h, |_| panic!("cancelled tail")), None::<()>);
     }
 
     #[test]

@@ -76,6 +76,7 @@ pub(crate) struct BackgroundOrderGuard {
     candidates: HashSet<u32>,
     generation: u64,
     started: Instant,
+    expires_at: Instant,
     attempted: bool,
 }
 
@@ -88,14 +89,30 @@ impl BackgroundOrderGuard {
         let window = focused_window(pid)?;
         let candidates = eligible_below(windows, pid, window, target_pid);
         if candidates.is_empty() { return None; }
+        let started = Instant::now();
         let result = Self { pid, window, target_pid, candidates,
-            generation: activity.generation, started: Instant::now(), attempted: false };
-        result.current().then_some(result)
+            generation: activity.generation, started, expires_at: started + MAX_AGE, attempted: false };
+        if !result.current() { return None; }
+        tracing::debug!(target: "cua_window_order", pid, window, target_pid,
+            candidates=result.candidates.len(), "Captured background window-order protection");
+        Some(result)
+    }
+
+    /// The action may have returned before AppKit attaches and raises its
+    /// sheet. Keep checking only within the owning suppression lease; neither
+    /// this guard nor its polling callback creates or extends that lease.
+    pub(crate) fn poll(&mut self, deadline: Instant) -> bool {
+        self.expires_at = self.expires_at.min(deadline);
+        if self.attempted || Instant::now() >= self.expires_at { return false; }
+        let latest = crate::windows::visible_windows_with_space_snapshot();
+        if !latest.succeeded { return false; }
+        self.restore_if_crossed(&latest.windows);
+        !self.attempted
     }
 
     fn current(&self) -> bool {
         let activity = crate::foreground_activity::snapshot();
-        unchanged_context(activity.reliable, activity.generation, self.generation,
+        Instant::now() < self.expires_at && unchanged_context(activity.reliable, activity.generation, self.generation,
             crate::apps::frontmost_pid(), focused_window(self.pid),
             self.pid, self.window, self.started.elapsed())
     }
