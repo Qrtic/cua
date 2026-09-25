@@ -85,6 +85,20 @@ impl ElementClickRoute {
     }
 }
 
+fn pointer_control_enabled(
+    route: ElementClickRoute,
+    enabled: Result<bool, crate::ax::bindings::AXError>,
+    writable_value: bool,
+) -> bool {
+    // AXEnabled is optional on AppKit text views. Explicit writable AXValue
+    // evidence can establish a text input when that attribute is unsupported,
+    // but never overrides disabled state, a failed read, or a Qt toggle gate.
+    enabled == Ok(true)
+        || (route == ElementClickRoute::TextInputPointer
+            && enabled == Err(crate::ax::bindings::kAXErrorAttributeUnsupported)
+            && writable_value)
+}
+
 /// Qt's Cocoa bridge maps AXPress on a checkable button to toggleAction(),
 /// even when that same button advertises a separate pressAction(). Toggling
 /// emits no clicked signal, so checkable navigation/tool buttons do not run
@@ -1708,7 +1722,11 @@ fn live_element_pointer_target(
         )
         .into());
     }
-    if unsafe { copy_bool_attr(element, "AXEnabled") } != Some(true) {
+    let enabled = unsafe { crate::ax::bindings::try_copy_bool_attr(element, "AXEnabled") };
+    let writable_value = expected_route == ElementClickRoute::TextInputPointer
+        && enabled == Err(crate::ax::bindings::kAXErrorAttributeUnsupported)
+        && unsafe { crate::ax::bindings::is_attribute_settable(element, "AXValue") };
+    if !pointer_control_enabled(expected_route, enabled, writable_value) {
         return Err(ElementPointerRefusal::Target(
             "the control is disabled or its enabled state is unproven",
         )
@@ -1951,7 +1969,10 @@ fn perform_application_menu_click(
     let result = outcome?;
     // Menu-bar and submenu gestures start an interaction, not its completion.
     // Keep only a freshly proven visible menu alive under the exact session,
-    // window and original two-minute deadline. Leaf commands and Cancel end it.
+    // window and original two-minute deadline. AX menu commands can enqueue
+    // their selection on AppKit's run loop before returning success. Do not
+    // immediately deactivate that target and cancel the pending selection.
+    // This bounded settling is not a command-success receipt or input authority.
     if let Some(context) = context {
         let opens_menu = owner.is_some()
             && !action.eq_ignore_ascii_case("cancel")
@@ -1963,6 +1984,24 @@ fn perform_application_menu_click(
                 visible = crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
                 if visible { break; }
                 std::thread::sleep(std::time::Duration::from_millis(35));
+            }
+        } else if owner.is_some() && !action.eq_ignore_ascii_case("cancel") {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let mut closed_since = None;
+            loop {
+                crate::foreground_activity::check_request()?;
+                visible = crate::ax::application_menu::active_application_menu(pid, window_id).is_some();
+                let now = std::time::Instant::now();
+                if visible {
+                    closed_since = None;
+                } else {
+                    let first = closed_since.get_or_insert(now);
+                    if now.duration_since(*first) >= std::time::Duration::from_millis(100) {
+                        break;
+                    }
+                }
+                if now >= deadline { break; }
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
         if visible {
@@ -2313,6 +2352,25 @@ fn map_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_appkit_text_input_can_omit_enabled_attribute() {
+        let missing = Err(crate::ax::bindings::kAXErrorAttributeUnsupported);
+        assert!(pointer_control_enabled(ElementClickRoute::TextInputPointer, missing, true));
+        assert!(!pointer_control_enabled(ElementClickRoute::TextInputPointer, missing, false));
+        assert!(!pointer_control_enabled(ElementClickRoute::QtCheckablePointer, missing, true));
+        assert!(!pointer_control_enabled(ElementClickRoute::AxSemantic, missing, true));
+    }
+
+    #[test]
+    fn writable_value_never_overrides_disabled_or_failed_enabled_read() {
+        for value in [Ok(false), Err(crate::ax::bindings::kAXErrorCannotComplete),
+            Err(crate::ax::bindings::kAXErrorInvalidUIElement), Err(crate::ax::bindings::kAXErrorFailure)] {
+            assert!(!pointer_control_enabled(ElementClickRoute::TextInputPointer, value, true));
+        }
+        assert!(pointer_control_enabled(ElementClickRoute::TextInputPointer, Ok(true), false));
+        assert!(pointer_control_enabled(ElementClickRoute::QtCheckablePointer, Ok(true), false));
+    }
 
     #[test]
     fn ax_response_timeout_is_possible_effect_not_a_retryable_refusal() {
