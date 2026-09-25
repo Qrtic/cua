@@ -2,18 +2,20 @@
 //!
 //! ## Window capture (primary: ScreenCaptureKit)
 //!
-//! Single-frame window capture prefers native ScreenCaptureKit via
-//! `SCScreenshotManager::capture_image` with a desktop-independent window
-//! filter, then encodes PNG in memory. No subprocess, temp file, or base64
-//! on the native success path.
+//! Window capture takes one complete ScreenCaptureKit stream frame with a
+//! desktop-independent window filter, validates its composition metadata,
+//! stops the stream, and encodes PNG in memory. SCScreenshotManager omits
+//! the frame metadata: a correctly sized bitmap can contain a resized or
+//! offset host after child-window composition. No subprocess, temp file,
+//! or base64 is used on the native success path.
 //!
 //! A process-local bounded warm cache (TTL 2s, capacity 32) reuses
 //! `SCContentFilter` + `SCStreamConfiguration` plans across rapid captures of
 //! the same window id so warm hits skip `SCShareableContent::get` and plan
-//! construction. This is not a persistent `SCStream` or frame cache.
+//! construction. Streams and captured frames are never cached.
 //!
 //! Sources:
-//! - https://developer.apple.com/documentation/screencapturekit/scscreenshotmanager
+//! - https://developer.apple.com/documentation/screencapturekit/scstreamframeinfo
 //! - https://developer.apple.com/documentation/screencapturekit/sccontentfilter/init(desktopindependentwindow:)
 //! - https://docs.rs/screencapturekit/6.0.1/screencapturekit/
 //!
@@ -218,13 +220,17 @@ where
                  shell fallback: {fallback_err:#}"
             )),
         },
-        Err(native_err) => match fallback(window_id) {
-            Ok(bytes) => Ok(bytes),
-            Err(fallback_err) => Err(anyhow::anyhow!(
-                "window {window_id} capture failed: native: {native_err:#}; \
-                 shell fallback: {fallback_err:#}"
-            )),
-        },
+        Err(native_err) => {
+            tracing::debug!(target: "cua_capture_geometry", window_id, error = %native_err,
+                "Native window capture unavailable; trying compatibility capture");
+            match fallback(window_id) {
+                Ok(bytes) => Ok(bytes),
+                Err(fallback_err) => Err(anyhow::anyhow!(
+                    "window {window_id} capture failed: native: {native_err:#}; \
+                     shell fallback: {fallback_err:#}"
+                )),
+            }
+        }
     }
 }
 
@@ -271,8 +277,12 @@ const MAX_CAPTURE_DIM: u32 = 16384;
 fn window_frame_usable(rect: screencapturekit::cg::CGRect) -> bool {
     let w = rect.size.width;
     let h = rect.size.height;
-    rect.origin.x.is_finite() && rect.origin.y.is_finite()
-        && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0
+    rect.origin.x.is_finite()
+        && rect.origin.y.is_finite()
+        && w.is_finite()
+        && h.is_finite()
+        && w > 0.0
+        && h > 0.0
 }
 
 /// Round a positive finite pixel extent into `1..=MAX_CAPTURE_DIM` as `u32`.
@@ -333,9 +343,22 @@ impl WindowCaptureIdentity {
             height: height.to_bits(),
         }
     }
+
+    fn frame(self) -> screencapturekit::cg::CGRect {
+        screencapturekit::cg::CGRect::new(
+            f64::from_bits(self.x),
+            f64::from_bits(self.y),
+            f64::from_bits(self.width),
+            f64::from_bits(self.height),
+        )
+    }
 }
 
-fn capture_includes_child_windows(exact_host: bool, role: Option<&str>, subrole: Option<&str>) -> bool {
+fn capture_includes_child_windows(
+    exact_host: bool,
+    role: Option<&str>,
+    subrole: Option<&str>,
+) -> bool {
     // Child composition is appropriate only for a positively identified host.
     // For a sheet, physical popover or unresolved auxiliary window SCK can
     // otherwise shrink the whole host into a correctly sized output bitmap;
@@ -352,30 +375,50 @@ fn resolve_capture_child_composition(pid: i32, window_id: u32) -> bool {
     use core_foundation::base::{CFRelease, CFTypeRef};
     struct OwnedAx(AXUIElementRef);
     impl Drop for OwnedAx {
-        fn drop(&mut self) { unsafe { CFRelease(self.0 as CFTypeRef) }; }
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0 as CFTypeRef) };
+        }
     }
     let deadline = Instant::now() + Duration::from_millis(500);
     unsafe {
         let app = AXUIElementCreateApplication(pid);
-        if app.is_null() { return false; }
+        if app.is_null() {
+            return false;
+        }
         let app = OwnedAx(app);
-        if AXUIElementSetMessagingTimeout(app.0, 0.2) != kAXErrorSuccess { return false; }
-        let Ok(snapshot) = try_copy_ax_windows(app.0) else { return false; };
+        if AXUIElementSetMessagingTimeout(app.0, 0.2) != kAXErrorSuccess {
+            return false;
+        }
+        let Ok(snapshot) = try_copy_ax_windows(app.0) else {
+            return false;
+        };
         let windows: Vec<_> = snapshot.windows.into_iter().map(OwnedAx).collect();
-        if !snapshot.complete || windows.len() > 64 { return false; }
+        if !snapshot.complete || windows.len() > 64 {
+            return false;
+        }
         for window in windows {
-            if Instant::now() >= deadline { return false; }
-            if AXUIElementSetMessagingTimeout(window.0, 0.2) != kAXErrorSuccess { continue; }
-            if ax_get_window_id(window.0) != Some(window_id) { continue; }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if AXUIElementSetMessagingTimeout(window.0, 0.2) != kAXErrorSuccess {
+                continue;
+            }
+            if ax_get_window_id(window.0) != Some(window_id) {
+                continue;
+            }
             let mut owner = 0;
             if AXUIElementGetPid(window.0, &mut owner) != kAXErrorSuccess || owner != pid {
                 return false;
             }
             let role = copy_string_attr(window.0, "AXRole");
             let subrole = copy_string_attr(window.0, "AXSubrole");
-            let still_exact = Instant::now() < deadline
-                && ax_get_window_id(window.0) == Some(window_id);
-            return capture_includes_child_windows(still_exact, role.as_deref(), subrole.as_deref());
+            let still_exact =
+                Instant::now() < deadline && ax_get_window_id(window.0) == Some(window_id);
+            return capture_includes_child_windows(
+                still_exact,
+                role.as_deref(),
+                subrole.as_deref(),
+            );
         }
     }
     // Absence from AXWindows is common for physical popovers whose AXWindow
@@ -398,24 +441,120 @@ fn window_capture_configuration(
     includes_child_windows: bool,
     frame: screencapturekit::cg::CGRect,
 ) -> screencapturekit::prelude::SCStreamConfiguration {
-    // Child composition crops in display points; a standalone window crops
-    // relative to its own origin. Using the display origin for both modes
-    // cuts off the top/left of standalone captures and adds empty margins.
-    let source_rect = if includes_child_windows {
-        frame
-    } else {
-        screencapturekit::cg::CGRect::new(0.0, 0.0, frame.size.width, frame.size.height)
-    };
-    screencapturekit::prelude::SCStreamConfiguration::new()
+    let mut config = screencapturekit::prelude::SCStreamConfiguration::new()
         .with_width(width)
         .with_height(height)
         .with_includes_child_windows(includes_child_windows)
-        // An unconstrained child composition fits the union of host, popup
-        // and shadows into the output, shifting every coordinate while the
-        // bitmap dimensions remain unchanged. Clip to the exact window extent
-        // used by AX and input calibration, keeping child pixels inside it.
-        .with_source_rect(source_rect)
         .with_ignores_shadows_single_window(true)
+        .with_shows_cursor(false)
+        .with_minimum_frame_interval(&screencapturekit::cm::CMTime::new(1, 5));
+    if includes_child_windows {
+        // SCStream's desktop-independent crop uses the host-local frame.
+        // Clip child pixels at its edges rather than fitting the enlarged
+        // union into unchanged output dimensions. A display-coordinate crop
+        // cuts off the host's top/left. The metadata below must prove the
+        // actual mapping; configured width/height alone are insufficient.
+        config.set_source_rect(screencapturekit::cg::CGRect::new(
+            0.0,
+            0.0,
+            frame.size.width,
+            frame.size.height,
+        ));
+    }
+    // A physical popover must use its default independent extent. Explicit
+    // sourceRect on that surface can fail (-3811/-3812) or return empty pixels.
+    config
+}
+
+fn capture_rect_matches(
+    actual: screencapturekit::cg::CGRect,
+    expected: screencapturekit::cg::CGRect,
+) -> bool {
+    // Metadata crosses a float32 system boundary. Allow subpixel rounding,
+    // never the hundreds of pixels of padding observed in H058.
+    let close = |a: f64, b: f64| a.is_finite() && b.is_finite() && (a - b).abs() <= 0.25;
+    window_frame_usable(actual)
+        && window_frame_usable(expected)
+        && close(actual.origin.x, expected.origin.x)
+        && close(actual.origin.y, expected.origin.y)
+        && close(actual.size.width, expected.size.width)
+        && close(actual.size.height, expected.size.height)
+}
+
+fn validate_window_capture_geometry(
+    frame: screencapturekit::cg::CGRect,
+    width: u32,
+    height: u32,
+    info: &screencapturekit::cm::FrameInfo,
+) -> anyhow::Result<()> {
+    use screencapturekit::cm::SCFrameStatus;
+    let local = screencapturekit::cg::CGRect::new(0.0, 0.0, frame.size.width, frame.size.height);
+    let scale = info
+        .scale_factor
+        .filter(|scale| scale.is_finite() && *scale > 0.0);
+    let unscaled = info
+        .content_scale
+        .is_some_and(|scale| scale.is_finite() && (scale - 1.0).abs() <= 0.000_001);
+    let dimensions_match = scale.is_some_and(|scale| {
+        (f64::from(width) - frame.size.width * scale).abs() <= 1.0
+            && (f64::from(height) - frame.size.height * scale).abs() <= 1.0
+    });
+    if info.frame_status != Some(SCFrameStatus::Complete)
+        || !unscaled
+        || !dimensions_match
+        || !info
+            .screen_rect
+            .is_some_and(|rect| capture_rect_matches(rect, frame))
+        || !info
+            .content_rect
+            .is_some_and(|rect| capture_rect_matches(rect, local))
+        || !info
+            .bounding_rect
+            .is_some_and(|rect| capture_rect_matches(rect, local))
+    {
+        anyhow::bail!(
+            "ScreenCaptureKit frame geometry does not match the exact window: \
+             expected {frame:?} at {width}x{height}, actual {info:?}"
+        );
+    }
+    Ok(())
+}
+
+fn capture_complete_window_frame(
+    filter: &screencapturekit::prelude::SCContentFilter,
+    config: &screencapturekit::prelude::SCStreamConfiguration,
+) -> anyhow::Result<screencapturekit::cm::CMSampleBuffer> {
+    use screencapturekit::cm::{CMSampleBufferSCExt, SCFrameStatus};
+    use screencapturekit::prelude::{SCStream, SCStreamOutputType};
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let first_frame = AtomicBool::new(false);
+    let mut stream = SCStream::new(filter, config);
+    let handler = stream
+        .add_output_handler(
+            move |sample: screencapturekit::cm::CMSampleBuffer, output_type| {
+                if output_type == SCStreamOutputType::Screen
+                    && sample.frame_status() == Some(SCFrameStatus::Complete)
+                    && !first_frame.swap(true, Ordering::AcqRel)
+                {
+                    let _ = sender.try_send(sample);
+                }
+            },
+            SCStreamOutputType::Screen,
+        )
+        .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit rejected window frame output"))?;
+    stream
+        .start_capture()
+        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit window stream start failed: {error}"))?;
+    let sample = receiver.recv_timeout(Duration::from_secs(1));
+    // Stop on both success and timeout. The outer worker gate also bounds
+    // a hung Apple callback and prevents accumulation of capture workers.
+    let stopped = stream.stop_capture();
+    stream.remove_output_handler(handler, SCStreamOutputType::Screen);
+    stopped
+        .map_err(|error| anyhow::anyhow!("ScreenCaptureKit window stream stop failed: {error}"))?;
+    sample.map_err(|error| {
+        anyhow::anyhow!("ScreenCaptureKit complete window frame unavailable: {error}")
+    })
 }
 
 fn current_window_capture_identity(window_id: u32) -> anyhow::Result<WindowCaptureIdentity> {
@@ -599,11 +738,10 @@ fn build_window_capture_plan(
     }))
 }
 
-/// Single-frame capture + RGBA/PNG encode from an existing plan.
-///
-/// https://developer.apple.com/documentation/screencapturekit/scscreenshotmanager
+/// Capture one complete frame, verify its actual mapping, and encode RGBA/PNG.
 fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
-    use screencapturekit::screenshot_manager::{CGImageExt, SCScreenshotManager};
+    use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt};
+    use screencapturekit::screenshot_manager::CGImageExt;
 
     let source = plan.config.source_rect();
     let content = plan.filter.content_rect();
@@ -616,12 +754,19 @@ fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow:
         content_width = content.size.width, content_height = content.size.height,
         output_width = plan.config.width(), output_height = plan.config.height(),
         "Capturing exact window with ScreenCaptureKit configuration");
-    let image = SCScreenshotManager::capture_image(&plan.filter, &plan.config).map_err(|e| {
-        anyhow::anyhow!("SCScreenshotManager::capture_image failed for window {window_id}: {e}")
+    let sample = capture_complete_window_frame(&plan.filter, &plan.config)?;
+    let info = sample.frame_info().ok_or_else(|| {
+        anyhow::anyhow!("ScreenCaptureKit omitted frame geometry for window {window_id}")
+    })?;
+    let image = sample.cg_image().map_err(|error| {
+        anyhow::anyhow!("ScreenCaptureKit frame image failed for window {window_id}: {error}")
     })?;
 
     let w = checked_image_dim(image.width(), "CGImage width")?;
     let h = checked_image_dim(image.height(), "CGImage height")?;
+    validate_window_capture_geometry(plan.identity.frame(), w, h, &info)?;
+    tracing::debug!(target: "cua_capture_geometry", window_id, ?info,
+        "Verified complete window frame composition");
 
     let rgba = image
         .rgba_data()
@@ -716,7 +861,7 @@ fn retry_after_identity_change(
 
 /// Native ScreenCaptureKit single-frame window capture (in-process PNG).
 ///
-/// Uses a desktop-independent window filter and `SCScreenshotManager` —
+/// Uses a desktop-independent filter and a bounded one-frame `SCStream` —
 /// see module docs for Apple + crate source URLs. No subprocess/temp/base64.
 /// Warm hits reuse a bounded two-second filter/config plan cache.
 fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> {
@@ -935,8 +1080,16 @@ mod tests {
 
     #[test]
     fn only_exact_standard_host_includes_child_composition() {
-        assert!(capture_includes_child_windows(true, Some("AXWindow"), Some("AXStandardWindow")));
-        assert!(!capture_includes_child_windows(false, Some("AXWindow"), Some("AXStandardWindow")));
+        assert!(capture_includes_child_windows(
+            true,
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ));
+        assert!(!capture_includes_child_windows(
+            false,
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ));
     }
 
     #[test]
@@ -966,8 +1119,8 @@ mod tests {
 
     #[test]
     fn capture_configuration_keeps_exact_size_and_explicit_composition() {
-        // A nonzero/negative origin distinguishes the two crop coordinate
-        // spaces, including displays to the left of the primary display.
+        // Neither a host-local crop nor an independent popup extent may
+        // accidentally inherit the display origin.
         let frame = screencapturekit::cg::CGRect::new(-1280.0, 36.0, 370.0, 182.0);
         for include_children in [true, false] {
             let config = window_capture_configuration(740, 364, include_children, frame);
@@ -975,12 +1128,92 @@ mod tests {
             assert_eq!(config.height(), 364);
             assert_eq!(config.includes_child_windows(), include_children);
             let expected = if include_children {
-                frame
-            } else {
                 screencapturekit::cg::CGRect::new(0.0, 0.0, 370.0, 182.0)
+            } else {
+                screencapturekit::cg::CGRect::new(0.0, 0.0, 0.0, 0.0)
             };
             assert_eq!(config.source_rect(), expected);
             assert!(config.ignores_shadows_single_window());
+        }
+    }
+
+    fn exact_frame_info(frame: screencapturekit::cg::CGRect) -> screencapturekit::cm::FrameInfo {
+        let local =
+            screencapturekit::cg::CGRect::new(0.0, 0.0, frame.size.width, frame.size.height);
+        screencapturekit::cm::FrameInfo {
+            frame_status: Some(screencapturekit::cm::SCFrameStatus::Complete),
+            scale_factor: Some(2.0),
+            content_scale: Some(1.0),
+            screen_rect: Some(frame),
+            content_rect: Some(local),
+            bounding_rect: Some(local),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frame_metadata_accepts_exact_host_and_independent_popup() {
+        for frame in [
+            screencapturekit::cg::CGRect::new(142.0, 233.0, 1357.0, 610.0),
+            screencapturekit::cg::CGRect::new(659.0, 283.0, 280.0, 608.0),
+            screencapturekit::cg::CGRect::new(-1280.0, 36.0, 370.0, 182.0),
+        ] {
+            let info = exact_frame_info(frame);
+            assert!(validate_window_capture_geometry(
+                frame,
+                (frame.size.width * 2.0) as u32,
+                (frame.size.height * 2.0) as u32,
+                &info,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn frame_metadata_rejects_observed_child_fitting_despite_matching_bitmap_size() {
+        let frame = screencapturekit::cg::CGRect::new(142.0, 233.0, 1357.0, 610.0);
+        let mut info = exact_frame_info(frame);
+        // H058: the popup extended 48 points below its host. SCK still
+        // returned 2714x1220, shrinking the composed content to 92.7%.
+        info.content_scale = Some(0.9270516633987427);
+        info.content_rect = Some(screencapturekit::cg::CGRect::new(
+            0.0,
+            0.0,
+            1258.0091072320938,
+            609.9999945163727,
+        ));
+        info.bounding_rect = info.content_rect;
+        assert!(validate_window_capture_geometry(frame, 2714, 1220, &info).is_err());
+    }
+
+    #[test]
+    fn frame_metadata_rejects_observed_display_origin_crop_with_unit_content_scale() {
+        let frame = screencapturekit::cg::CGRect::new(142.0, 233.0, 1357.0, 610.0);
+        let mut info = exact_frame_info(frame);
+        // A display-coordinate sourceRect clipped the host while retaining
+        // the requested bitmap size and contentScale=1. Dimensions or scale
+        // alone cannot admit this frame.
+        info.content_rect = Some(screencapturekit::cg::CGRect::new(0.0, 0.0, 1215.0, 425.0));
+        info.bounding_rect = info.content_rect;
+        assert!(validate_window_capture_geometry(frame, 2714, 1220, &info).is_err());
+    }
+
+    #[test]
+    fn frame_metadata_rejects_stale_origin_missing_proof_and_nonfinite_values() {
+        let frame = screencapturekit::cg::CGRect::new(142.0, 233.0, 1357.0, 610.0);
+        let exact = exact_frame_info(frame);
+        let mut stale = exact.clone();
+        stale.screen_rect = Some(screencapturekit::cg::CGRect::new(
+            100.0, 233.0, 1357.0, 610.0,
+        ));
+        let mut missing = exact.clone();
+        missing.content_rect = None;
+        let mut nonfinite = exact.clone();
+        nonfinite.scale_factor = Some(f64::INFINITY);
+        let mut incomplete = exact;
+        incomplete.frame_status = Some(screencapturekit::cm::SCFrameStatus::Idle);
+        for info in [stale, missing, nonfinite, incomplete] {
+            assert!(validate_window_capture_geometry(frame, 2714, 1220, &info).is_err());
         }
     }
 
