@@ -366,7 +366,76 @@ fn capture_includes_child_windows(
     exact_host && role == Some("AXWindow") && subrole == Some("AXStandardWindow")
 }
 
-fn resolve_capture_child_composition(pid: i32, window_id: u32) -> bool {
+fn capture_host_extent_is_unambiguous(
+    windows: &[crate::windows::WindowInfo],
+    window_id: u32,
+    identity: WindowCaptureIdentity,
+) -> bool {
+    let frame = identity.frame();
+    if identity.layer != 0 || !window_frame_usable(frame) {
+        return false;
+    }
+    let matching: Vec<_> = windows
+        .iter()
+        .filter(|window| window.window_id == window_id)
+        .collect();
+    let [target] = matching.as_slice() else {
+        return false;
+    };
+    if !target.is_on_screen
+        || WindowCaptureIdentity::new(
+            target.pid,
+            target.layer,
+            target.bounds.x,
+            target.bounds.y,
+            target.bounds.width,
+            target.bounds.height,
+        ) != identity
+    {
+        return false;
+    }
+    // Some toolkit dialogs (including Calc Sort) expose AXStandardWindow with
+    // AXModal=false. SCK then composes their owning window group when child
+    // capture is enabled, but still reports the requested dialog's geometry.
+    // A larger containing peer makes the root extent uncertain. Capture the
+    // exact target independently in that case. Containment does NOT establish
+    // parentage, modality, or permission to redirect observations or input.
+    !windows.iter().any(|peer| {
+        if peer.window_id == window_id
+            || peer.pid != identity.pid
+            || peer.layer != 0
+            || !peer.is_on_screen
+        {
+            return false;
+        }
+        let outer = screencapturekit::cg::CGRect::new(
+            peer.bounds.x,
+            peer.bounds.y,
+            peer.bounds.width,
+            peer.bounds.height,
+        );
+        if !window_frame_usable(outer) {
+            return true;
+        }
+        let tolerance = 0.25;
+        (outer.size.width > frame.size.width + tolerance
+            || outer.size.height > frame.size.height + tolerance)
+            && outer.origin.x <= frame.origin.x + tolerance
+            && outer.origin.y <= frame.origin.y + tolerance
+            && outer.origin.x + outer.size.width + tolerance >= frame.origin.x + frame.size.width
+            && outer.origin.y + outer.size.height + tolerance >= frame.origin.y + frame.size.height
+    })
+}
+
+fn current_capture_host_extent_is_unambiguous(
+    window_id: u32,
+    identity: WindowCaptureIdentity,
+) -> bool {
+    let snapshot = crate::windows::visible_windows_including_accessory_layers_with_snapshot();
+    snapshot.succeeded && capture_host_extent_is_unambiguous(&snapshot.windows, window_id, identity)
+}
+
+fn resolve_capture_child_composition(identity: WindowCaptureIdentity, window_id: u32) -> bool {
     use crate::ax::bindings::{
         ax_get_window_id, copy_string_attr, kAXErrorSuccess, try_copy_ax_windows,
         AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef,
@@ -380,6 +449,12 @@ fn resolve_capture_child_composition(pid: i32, window_id: u32) -> bool {
         }
     }
     let deadline = Instant::now() + Duration::from_millis(500);
+    if !current_capture_host_extent_is_unambiguous(window_id, identity) {
+        tracing::debug!(target: "cua_capture_geometry", window_id,
+            "Using independent capture because root host extent is unproven");
+        return false;
+    }
+    let pid = identity.pid;
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -815,6 +890,13 @@ fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow:
     let w = checked_image_dim(image.width(), "CGImage width")?;
     let h = checked_image_dim(image.height(), "CGImage height")?;
     validate_window_capture_geometry(plan.identity.frame(), w, h, &info)?;
+    if plan.includes_child_windows
+        && !current_capture_host_extent_is_unambiguous(window_id, plan.identity)
+    {
+        anyhow::bail!(
+            "ScreenCaptureKit root host extent changed during capture for window {window_id}"
+        );
+    }
     tracing::debug!(target: "cua_capture_geometry", window_id, ?info,
         "Verified complete window frame composition");
 
@@ -887,7 +969,7 @@ fn retry_after_identity_change(
     actual_identity: WindowCaptureIdentity,
 ) -> anyhow::Result<Vec<u8>> {
     evict_window_capture_plan(window_id, stale_plan);
-    let includes_child_windows = resolve_capture_child_composition(actual_identity.pid, window_id);
+    let includes_child_windows = resolve_capture_child_composition(actual_identity, window_id);
     let rebuilt = build_window_capture_plan(window_id, actual_identity, includes_child_windows)?;
     {
         let mut cache = lock_window_plan_cache();
@@ -918,7 +1000,7 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
     let identity = current_window_capture_identity(window_id)?;
     // A warm plan may predate the focused-sheet proof. Keep the cheap native
     // identity check and also reject plans with a different composition policy.
-    let includes_child_windows = resolve_capture_child_composition(identity.pid, window_id);
+    let includes_child_windows = resolve_capture_child_composition(identity, window_id);
     let cached = {
         let mut cache = lock_window_plan_cache();
         cache.get_cloned_at(&window_id, Instant::now())
@@ -1195,6 +1277,124 @@ mod tests {
         ] {
             assert!(!capture_includes_child_windows(true, role, subrole));
         }
+    }
+
+    fn capture_window_fixture(
+        window_id: u32,
+        identity: WindowCaptureIdentity,
+    ) -> crate::windows::WindowInfo {
+        let frame = identity.frame();
+        crate::windows::WindowInfo {
+            window_id,
+            pid: identity.pid,
+            app_name: "capture fixture".into(),
+            title: String::new(),
+            bounds: crate::windows::WindowBounds {
+                x: frame.origin.x,
+                y: frame.origin.y,
+                width: frame.size.width,
+                height: frame.size.height,
+            },
+            layer: identity.layer,
+            z_index: 0,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    #[test]
+    fn calc_standard_sort_window_is_independent_while_its_host_keeps_children() {
+        // Geometry from the H072 live capture matrix. Both windows report
+        // AXWindow/AXStandardWindow, so that AX classification alone is unsafe.
+        let host = WindowCaptureIdentity::new(90425, 0, 172.0, 104.0, 1382.0, 856.0);
+        let sort = WindowCaptureIdentity::new(90425, 0, 562.0, 276.0, 602.0, 511.0);
+        let windows = vec![
+            capture_window_fixture(104139, host),
+            capture_window_fixture(104171, sort),
+        ];
+        assert!(capture_host_extent_is_unambiguous(&windows, 104139, host));
+        assert!(!capture_host_extent_is_unambiguous(&windows, 104171, sort));
+        let independent = window_capture_configuration(1204, 1022, false, sort.frame());
+        assert!(!independent.includes_child_windows());
+        assert_eq!(
+            independent.source_rect(),
+            screencapturekit::cg::CGRect::new(0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn unrelated_hidden_accessory_and_noncontaining_windows_do_not_disable_host_capture() {
+        let identity = WindowCaptureIdentity::new(42, 0, 100.0, 120.0, 600.0, 500.0);
+        let target = capture_window_fixture(10, identity);
+        let containing = capture_window_fixture(
+            11,
+            WindowCaptureIdentity::new(42, 0, 0.0, 0.0, 1200.0, 1000.0),
+        );
+        for variant in 0..5 {
+            let mut peer = containing.clone();
+            match variant {
+                0 => peer.pid = 43,
+                1 => peer.layer = 3,
+                2 => peer.is_on_screen = false,
+                3 => peer.bounds.x = 200.0,
+                _ => peer.bounds.height = 400.0,
+            }
+            assert!(capture_host_extent_is_unambiguous(
+                &[target.clone(), peer],
+                10,
+                identity
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_recycled_duplicate_or_malformed_capture_targets_do_not_prove_a_host() {
+        let identity = WindowCaptureIdentity::new(42, 0, -900.0, 20.0, 600.0, 500.0);
+        let original = capture_window_fixture(10, identity);
+        assert!(capture_host_extent_is_unambiguous(
+            &[original.clone()],
+            10,
+            identity
+        ));
+        assert!(!capture_host_extent_is_unambiguous(&[], 10, identity));
+        assert!(!capture_host_extent_is_unambiguous(
+            &[original.clone(), original.clone()],
+            10,
+            identity
+        ));
+        for variant in 0..6 {
+            let mut changed = original.clone();
+            match variant {
+                0 => changed.pid = 43,
+                1 => changed.window_id = 11,
+                2 => changed.layer = 3,
+                3 => changed.bounds.x += 1.0,
+                4 => changed.bounds.width = f64::NAN,
+                _ => changed.is_on_screen = false,
+            }
+            assert!(!capture_host_extent_is_unambiguous(
+                &[changed],
+                10,
+                identity
+            ));
+        }
+    }
+
+    #[test]
+    fn containing_peer_changes_composition_without_changing_target_identity() {
+        let identity = WindowCaptureIdentity::new(42, 0, 20.0, 30.0, 600.0, 500.0);
+        let target = capture_window_fixture(10, identity);
+        let before = capture_host_extent_is_unambiguous(&[target.clone()], 10, identity);
+        let peer = capture_window_fixture(
+            11,
+            WindowCaptureIdentity::new(42, 0, 0.0, 0.0, 1200.0, 1000.0),
+        );
+        let after = capture_host_extent_is_unambiguous(&[target, peer], 10, identity);
+        assert!(before);
+        assert!(!after);
+        assert!(!capture_plan_is_reusable(identity, before, identity, after));
     }
 
     #[test]
