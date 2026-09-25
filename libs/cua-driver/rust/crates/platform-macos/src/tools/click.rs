@@ -671,6 +671,7 @@ impl Tool for ClickTool {
                 && button_str == "left"
                 && modifiers.is_empty();
             let inspect_background_surface = !foreground && button_str != "middle";
+            let inspection_action = effective_action.clone();
             let selection_action = effective_action == "press" && button_str != "middle";
             let inspection_element = element_guard.clone();
             let (background_menu, background_popover, selectable_ancestry, element_route) =
@@ -685,7 +686,7 @@ impl Tool for ClickTool {
                     // These isolated semantic surfaces never gain pointer
                     // authority from being observed alongside a host window.
                     let menu = inspect_background_surface
-                        && crate::ax::application_menu::is_actionable_menu_role(&role)
+                        && crate::ax::application_menu::supports_menu_action_role(&role, &inspection_action)
                         && crate::ax::exact_target::element_window_id(element).is_none();
                     let popover = inspect_background_surface
                         && !menu
@@ -1874,7 +1875,8 @@ fn perform_application_menu_click(
         return Err(ApplicationMenuRefusal(refusal).into());
     }
     let advertised = unsafe { copy_action_names(element) };
-    let native = crate::ax::application_menu::advertised_menu_action(action, &advertised)
+    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+    let native = crate::ax::application_menu::advertised_menu_element_action(&role, action, &advertised)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "application-menu action is not supported and advertised; take a fresh snapshot"

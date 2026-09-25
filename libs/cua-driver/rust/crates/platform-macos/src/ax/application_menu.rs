@@ -164,6 +164,22 @@ pub(crate) fn is_actionable_menu_role(role: &str) -> bool {
     matches!(role, "AXMenuBarItem" | "AXMenuItem")
 }
 
+/// Containers have no generic click semantics. A visible menu can only expose
+/// its advertised cancellation through the separately proven menu route.
+pub(crate) fn supports_menu_action_role(role: &str, action: &str) -> bool {
+    is_actionable_menu_role(role) || (role == "AXMenu" && action.eq_ignore_ascii_case("cancel"))
+}
+
+pub(crate) fn advertised_menu_element_action(
+    role: &str,
+    action: &str,
+    advertised: &[String],
+) -> Option<&'static str> {
+    supports_menu_action_role(role, action)
+        .then(|| advertised_menu_action(action, advertised))
+        .flatten()
+}
+
 /// Unlike the legacy generic click mapper, an unknown action must never turn
 /// into AXPress. Membership authorizes only the requested advertised action.
 pub(crate) fn advertised_menu_action(action: &str, advertised: &[String]) -> Option<&'static str> {
@@ -202,8 +218,8 @@ fn proves_menu_member<T: MenuTree>(tree: &T, pid: i32, window_id: u32, element: 
         && proves_menu_path(tree, pid, window_id, element)
 }
 
-// Shared read-only ancestry proof. AXMenu containers are visual evidence only;
-// the semantic action entrypoint above still requires an actionable item role.
+// Shared read-only ancestry proof. Container cancellation additionally requires
+// the exact currently visible projection; item membership retains this path.
 fn proves_menu_path<T: MenuTree>(tree: &T, pid: i32, window_id: u32, element: &T::Node) -> bool {
     if tree.focused_window() != Some(window_id) {
         return false;
@@ -520,15 +536,28 @@ pub(crate) unsafe fn proves_application_menu(
     }
     CFRetain(element as CFTypeRef);
     let element = AxNode::owned(element).expect("non-null retained element");
-    proves_menu_member(
-        &NativeMenuTree {
-            app,
-            deadline: None,
-        },
-        pid,
-        window_id,
-        &element,
-    )
+    let tree = NativeMenuTree {
+        app,
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+    };
+    if tree.role(&element).as_deref() == Some("AXMenu") {
+        let snapshot = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+        return snapshot.succeeded
+            && proves_visible_menu_container(&tree, pid, window_id, &element, &snapshot.windows);
+    }
+    proves_menu_member(&tree, pid, window_id, &element)
+}
+
+fn proves_visible_menu_container<T: MenuVisualTree>(
+    tree: &T,
+    pid: i32,
+    window_id: u32,
+    element: &T::Node,
+    windows: &[crate::windows::WindowInfo],
+) -> bool {
+    tree.role(element).as_deref() == Some("AXMenu")
+        && select_menu_projection(tree, pid, window_id, windows)
+            .is_some_and(|projection| tree.same(&projection.root, element))
 }
 
 #[cfg(test)]
@@ -735,6 +764,38 @@ mod tests {
             visual_window(7, 42, 0, [504.0, 63.0, 700.0, 892.0]),
             visual_window(9, 42, 101, [215.0, 34.0, 203.0, 117.0]),
         ]
+    }
+    #[test]
+    fn menu_container_only_accepts_explicit_advertised_cancel() {
+        assert_eq!(advertised_menu_element_action("AXMenu", "cancel", &["AXCancel".into()]), Some("AXCancel"));
+        assert_eq!(advertised_menu_element_action("AXMenu", "cancel", &[]), None);
+        for action in ["press", "click", "pick", "show_menu", "confirm", "open"] {
+            assert!(!supports_menu_action_role("AXMenu", action));
+            assert_eq!(advertised_menu_element_action("AXMenu", action,
+                &["AXPress".into(), "AXCancel".into(), "AXPick".into()]), None);
+        }
+        assert!(!supports_menu_action_role("AXMenuBar", "cancel"));
+        assert!(!supports_menu_action_role("AXWindow", "cancel"));
+    }
+
+    #[test]
+    fn menu_container_cancel_requires_current_visible_exact_projection() {
+        assert!(proves_visible_menu_container(&visual_tree(), 42, 7, &2, &visual_windows()));
+        for element in [0, 1, 3] {
+            assert!(!proves_visible_menu_container(&visual_tree(), 42, 7, &element, &visual_windows()));
+        }
+        for mutation in 0..5 {
+            let mut tree = visual_tree();
+            let mut windows = visual_windows();
+            match mutation {
+                0 => windows[1].is_on_screen = false,
+                1 => windows[1].pid = 99,
+                2 => tree.tree.focused = Some(8),
+                3 => tree.tree.nodes.get_mut(&1).unwrap().children.clear(),
+                _ => tree.frames.clear(),
+            }
+            assert!(!proves_visible_menu_container(&tree, 42, 7, &2, &windows));
+        }
     }
     #[test]
     fn menu_image_keeps_document_anchor_and_selects_only_proven_popup() {
