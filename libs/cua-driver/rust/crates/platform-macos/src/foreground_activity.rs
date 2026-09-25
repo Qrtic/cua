@@ -592,6 +592,25 @@ impl Tool for ActivityGuardedTool {
             .or(foreground_pid);
         let mut result = INVOCATION
             .scope(Arc::clone(&context), async {
+                if let Some(call) = context.segment_call.as_ref().filter(|call| {
+                    self.def().name == "get_window_state" && call.is_dialog()
+                }) {
+                    let call = Arc::clone(call);
+                    let checked = Arc::clone(&context);
+                    let prepared = spawn_blocking(move || {
+                        call.prepare_dialog_observation(|| checked.check_liveness())
+                    }).await;
+                    match prepared {
+                        Ok(Ok(Some(redirect))) => return redirect,
+                        Ok(Ok(None)) => {},
+                        _ => {
+                            context.mark_interrupted("dialog_observation_target_unproven");
+                            return cua_driver_core::protocol::ToolResult::error(
+                                "The held dialog could not be revalidated before observation; no input was sent."
+                            );
+                        }
+                    }
+                }
                 if let Err(error) = context.check() {
                     return cua_driver_core::protocol::ToolResult::error(error.to_string());
                 }

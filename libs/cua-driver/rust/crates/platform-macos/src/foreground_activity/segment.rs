@@ -497,6 +497,42 @@ impl Call {
         }
     }
 
+    /// A sheet can become focused after the preceding input RPC has finished.
+    /// This reserved observation may reconcile that delayed transition, but it
+    /// cannot read through the old target or grant input on the new surface.
+    pub(super) fn prepare_dialog_observation(
+        &self,
+        check_live: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<ToolResult>> {
+        if !self.settle_dialog_return(check_live)? {
+            anyhow::bail!("dialog observation could not prove the resulting window");
+        }
+        Ok(self.redirected_observation_result())
+    }
+
+    fn redirected_observation_result(&self) -> Option<ToolResult> {
+        if self.segment.dialog_closed() {
+            Some(failure(
+                "foreground_dialog_closed",
+                "The dialog closed onto its exact host; finish this segment before observing again",
+                true,
+            ))
+        } else if self
+            .dialog_transition
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            Some(failure(
+                "foreground_dialog_target_changed",
+                "A proven attached dialog appeared after the last call; observe its new exact target before input",
+                true,
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(super) fn settle_dialog_return(
         &self,
         mut check_live: impl FnMut() -> anyhow::Result<()>,
@@ -504,7 +540,8 @@ impl Call {
         if !self.is_dialog() {
             return Ok(false);
         }
-        // Post-dispatch read only. A nested sheet may change AX focus before
+        // Read only, after dispatch or at the next caller observation. A sheet
+        // may change AX focus after the preceding RPC or before
         // WindowServer finishes its animation. Preserve the ORIGINAL lease,
         // owner, panel and deadline. No input can use the new target until a
         // fresh observation; the current call's exact target never changes.
@@ -538,8 +575,7 @@ impl Call {
                     None
                 };
                 if stable_replacement(&mut replacement_candidate, replacement, Instant::now()) {
-                    let mut inner =
-                        self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut inner = self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if inner
                         .policy
                         .check(&self.segment.binding, clock_ms(), snapshot())
@@ -824,7 +860,15 @@ pub(super) fn admit_call(args: &Value, tool: &str) -> Result<Option<Arc<Call>>, 
     }
     let target = target_from_args(args)?;
     validate_element_target(args, target, tool)?;
-    segment.check().map_err(|_| {
+    // A reserved read is allowed to reconcile a delayed attached-sheet change
+    // before checking exact focus. Owner/activity/deadline and target binding
+    // remain mandatory. Mutations retain the strict focus check here.
+    let liveness = if tool == "get_window_state" && segment.dialog_host.is_some() {
+        segment.check_liveness()
+    } else {
+        segment.check()
+    };
+    liveness.map_err(|_| {
         failure(
             "foreground_activity_interrupted",
             "Segment activity or ownership ended; no new call admitted",
@@ -1391,9 +1435,18 @@ mod tests {
     #[test]
     fn replacement_waits_past_a_transient_old_document_and_ax_blackout() {
         let start = Instant::now();
-        let old = ExactWindowTarget { pid: 42, window_id: 700 };
-        let new = ExactWindowTarget { pid: 42, window_id: 800 };
-        let foreign = ExactWindowTarget { pid: 99, window_id: 800 };
+        let old = ExactWindowTarget {
+            pid: 42,
+            window_id: 700,
+        };
+        let new = ExactWindowTarget {
+            pid: 42,
+            window_id: 800,
+        };
+        let foreign = ExactWindowTarget {
+            pid: 99,
+            window_id: 800,
+        };
         let mut pending = None;
         for (millis, candidate, expected) in [
             (0, Some(old), false),
@@ -1409,7 +1462,11 @@ mod tests {
             (1120, Some(new), true),
         ] {
             assert_eq!(
-                stable_replacement(&mut pending, candidate, start + Duration::from_millis(millis)),
+                stable_replacement(
+                    &mut pending,
+                    candidate,
+                    start + Duration::from_millis(millis)
+                ),
                 expected,
                 "replacement at {millis} ms",
             );
@@ -1425,7 +1482,8 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(3));
                 true
             },
-        ).unwrap());
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1720,6 +1778,72 @@ mod tests {
         assert!(segment.validate_dialog_call("click", child).is_err());
         assert_eq!(segment.binding, binding);
         assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
+        ticket.settle();
+        segment.revoke();
+    }
+
+    #[tokio::test]
+    async fn delayed_dialog_observation_refuses_old_target_and_keeps_original_binding() {
+        use crate::ax::attached_sheet::DialogAttachment;
+        let (mut segment, _, _) = fixture().await;
+        Arc::get_mut(&mut segment).unwrap().dialog_host = Some(ExactWindowTarget {
+            pid: 42,
+            window_id: 99,
+        });
+        let ticket = call(&segment);
+        let binding = segment.binding.clone();
+        let deadline = segment.inner.lock().unwrap().policy.deadline_ms();
+        assert!(ticket.redirected_observation_result().is_none());
+        {
+            let mut inner = segment.inner.lock().unwrap();
+            inner.dialog_target = Some(DialogAttachment {
+                window_id: 72,
+                panel_id: 71,
+                host_id: 99,
+                path: vec![72, 71, 99],
+            });
+            inner.dialog_observation_required = true;
+        }
+        *ticket.dialog_transition.lock().unwrap() = Some(json!({
+            "phase":"transitioned", "foreground_segment_id":binding.id,
+            "pid":42, "window_id":71, "target_window_id":72,
+            "observation_required":true,
+        }));
+        let result = ticket.redirected_observation_result().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            "foreground_dialog_target_changed"
+        );
+        assert_eq!(ticket.target(), binding.target);
+        assert_eq!(segment.binding, binding);
+        assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
+        ticket.mark_dialog_observed();
+        assert!(segment
+            .validate_dialog_call(
+                "set_value",
+                ExactWindowTarget {
+                    pid: 42,
+                    window_id: 72
+                }
+            )
+            .is_err());
+        ticket.settle();
+        segment.revoke();
+    }
+
+    #[tokio::test]
+    async fn delayed_closed_dialog_observation_requires_normal_segment_finish() {
+        let (segment, _, _) = fixture().await;
+        let ticket = call(&segment);
+        segment.inner.lock().unwrap().dialog_closed = true;
+        let result = ticket.redirected_observation_result().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            "foreground_dialog_closed"
+        );
+        assert_eq!(ticket.dialog_closed_summary().unwrap()["phase"], "closed");
         ticket.settle();
         segment.revoke();
     }
