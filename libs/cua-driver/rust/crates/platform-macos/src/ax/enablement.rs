@@ -23,11 +23,11 @@ use crate::input::return_trace::TraceRequest;
 /// lifetime.
 const CHROMIUM_SETTLE_SECONDS: f64 = 0.5;
 
-type ProcessStartStamp = (u64, u64);
+pub(crate) type ProcessStartStamp = (u64, u64);
 
 /// Kernel start time of a process: `(pbi_start_tvsec, pbi_start_tvusec)`.
 /// `None` when the process is gone or proc info is unreadable.
-fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
+pub(crate) fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
     // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns
     // the number of bytes filled (<= size) or <= 0 on failure.
     unsafe {

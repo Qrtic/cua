@@ -214,7 +214,7 @@ impl Tool for LaunchAppTool {
         // the original foreground before reopening; a post-launch capture
         // would wrongly treat the already-raised window as the baseline.
         let reopen_ordering = capture_reopen_ordering(
-            &previously_running_pids, response_bundle_id.as_deref(), creates_new_instance,
+            &previously_running_pids, response_bundle_id.as_deref(), creates_new_instance, !urls.is_empty(),
         );
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
@@ -429,10 +429,11 @@ fn existing_reopen_pid(pids: &[i32], creates_new_instance: bool) -> Option<i32> 
 }
 
 /// Capture only an existing, uniquely identified process before the handoff.
-/// Cold launches and newly created windows need separate evidence; they must
-/// never inherit this guard's permission to restore the old foreground order.
+/// Cold launches remain outside this existing-process guard. An explicit file
+/// request can separately enroll newly created AX standard document windows,
+/// bound to this process lifetime and the unchanged original foreground.
 fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
-                          creates_new_instance: bool)
+                          creates_new_instance: bool, opens_file: bool)
     -> Option<(i32, crate::background_order::BackgroundOrderGuard)>
 {
     use objc2_app_kit::NSRunningApplication;
@@ -454,8 +455,9 @@ fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
             reason="window_enumeration_unavailable", "Reopen ordering capture unavailable");
         return None;
     }
-    let ordering = crate::background_order::BackgroundOrderGuard::capture_before_reopen(
-        pid, &before.windows, hidden,
+    let visible = crate::windows::visible_windows_with_space_snapshot();
+    let ordering = crate::background_order::BackgroundOrderGuard::capture_before_file_open(
+        pid, &before, &visible, hidden, opens_file,
     )?;
     Some((pid, ordering))
 }
