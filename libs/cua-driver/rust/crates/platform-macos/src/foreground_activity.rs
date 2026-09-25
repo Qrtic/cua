@@ -751,22 +751,42 @@ impl Episode {
             return result;
         }
         if let Some((pid, window)) = self.original {
+            // An activation can fail after making the app active but before
+            // its popup becomes key. A completed action can also close that
+            // popup. Return from the freshly proven same-app key window;
+            // this does not authorize any further input into that window.
+            let return_source = owned_return_source_window(self.lease.pid);
             if (pid, window) != (self.lease.pid, self.lease.window)
-                && exact_target_is_frontmost(self.lease)
+                && return_source.is_some()
                 && matches!(
                     crate::windows::resolve_window_owner(pid, window),
                     crate::windows::WindowOwner::SamePid
                 )
             {
+                let source_window = return_source.expect("checked above");
                 self.check()?;
                 if !crate::input::skylight::restore_exact_window_guarded(pid, window, || {
-                    self.check()
+                    self.check()?;
+                    // Before the first write we still own the source process;
+                    // during restoration only that source or the destination
+                    // may be frontmost. Never overwrite a third-app takeover.
+                    if crate::input::skylight::front_process_matches(self.lease.pid, source_window)
+                        != Some(true)
+                        && crate::input::skylight::front_process_matches(pid, window) != Some(true)
+                    {
+                        anyhow::bail!("foreground restoration source changed");
+                    }
+                    Ok(())
                 }) {
                     self.check()?;
                     anyhow::bail!(
                         "foreground input settled but exact original-window restoration failed"
                     );
                 }
+                tracing::debug!(target: "cua_focus_restore", source_pid = self.lease.pid,
+                    source_window, requested_window = self.lease.window,
+                    restore_pid = pid, restore_window = window,
+                    "Foreground episode returned from the proven owned window");
             }
         }
         if had_pressed_controls && result.is_ok() {
@@ -799,6 +819,76 @@ fn check_activity(lease: Lease) -> anyhow::Result<()> {
 fn exact_target_is_frontmost(lease: Lease) -> bool {
     crate::input::skylight::front_process_matches(lease.pid, lease.window) == Some(true)
         && crate::ax::bindings::focused_window_id_of_pid(lease.pid) == Some(lease.window)
+}
+
+fn return_source_window_with(
+    assisted_pid: i32,
+    front_pid: Option<i32>,
+    focused_window: Option<u32>,
+    mut owned_and_front: impl FnMut(u32) -> bool,
+) -> Option<u32> {
+    if front_pid != Some(assisted_pid) {
+        return None;
+    }
+    focused_window.filter(|window| *window != 0 && owned_and_front(*window))
+}
+
+fn owned_return_source_window(assisted_pid: i32) -> Option<u32> {
+    let front_pid = crate::apps::frontmost_pid();
+    if front_pid != Some(assisted_pid) {
+        return None;
+    }
+    return_source_window_with(
+        assisted_pid,
+        front_pid,
+        crate::ax::bindings::focused_window_id_of_pid(assisted_pid),
+        |window| {
+            matches!(
+                crate::windows::resolve_window_owner(assisted_pid, window),
+                crate::windows::WindowOwner::SamePid
+            ) && crate::input::skylight::front_process_matches(assisted_pid, window) == Some(true)
+        },
+    )
+}
+
+#[cfg(test)]
+mod owned_return_source_tests {
+    use super::return_source_window_with;
+
+    #[test]
+    fn failed_popup_activation_can_return_from_the_proven_document_window() {
+        // Requested popup 900 never becomes AX-focused; host 700 does. This
+        // permits restoration only, not sending the failed popup's input.
+        assert_eq!(
+            return_source_window_with(42, Some(42), Some(700), |w| w == 700),
+            Some(700)
+        );
+    }
+
+    #[test]
+    fn takeover_and_unknown_source_never_authorize_restoration() {
+        for front in [None, Some(99)] {
+            assert_eq!(
+                return_source_window_with(42, front, Some(700), |_| panic!(
+                    "other app must not be inspected for return"
+                )),
+                None
+            );
+        }
+        for window in [None, Some(0)] {
+            assert_eq!(
+                return_source_window_with(42, Some(42), window, |_| panic!(
+                    "missing source must not be used"
+                )),
+                None
+            );
+        }
+        // Owner mismatch, stale AX focus or missing WindowServer proof.
+        assert_eq!(
+            return_source_window_with(42, Some(42), Some(700), |_| false),
+            None
+        );
+    }
 }
 
 /// Cursor restoration is optional after completed input. A shortcut can open a
