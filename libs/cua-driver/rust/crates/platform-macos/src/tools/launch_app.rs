@@ -209,6 +209,14 @@ impl Tool for LaunchAppTool {
             )
         });
 
+        // A hidden application can order its old window above the user's
+        // foreground without activating. Capture those exact window IDs and
+        // the original foreground before reopening; a post-launch capture
+        // would wrongly treat the already-raised window as the baseline.
+        let reopen_ordering = capture_reopen_ordering(
+            &previously_running_pids, response_bundle_id.as_deref(), creates_new_instance,
+        );
+
         // Predicate captured BEFORE moving inputs into spawn_blocking.
         // Same condition that selects the `openURLs:withApplicationAtURL:`
         // chain over the simpler `openApplicationAtURL:` path. Used after
@@ -290,7 +298,7 @@ impl Tool for LaunchAppTool {
         if let Ok(Ok((pid, _, _, _))) = &launch_result {
             if let Some(prior) = prior_frontmost {
                 if *pid != prior {
-                    let targeted_lease = wildcard_lease
+                    let mut targeted_lease = wildcard_lease
                         .and_then(|lease| lease.narrow_to(*pid, "LaunchAppTool.post"))
                         .unwrap_or_else(|| {
                             crate::focus_steal::FocusStealPreventer::begin_suppression(
@@ -299,6 +307,13 @@ impl Tool for LaunchAppTool {
                                 "LaunchAppTool.post_fresh",
                             )
                         });
+                    if let Some((expected_pid, mut ordering)) = reopen_ordering {
+                        // Never transfer a prior process's window evidence to
+                        // a replacement instance returned by LaunchServices.
+                        if expected_pid == *pid {
+                            targeted_lease.start_polling(move |deadline| ordering.poll(deadline));
+                        }
+                    }
                     // Cold launches and file/argument delivery get a bounded
                     // 2.5s settle period. A simple reopen of the same running
                     // pid keeps the shorter 500ms period. This covers the
@@ -405,6 +420,38 @@ fn protected_host_launch_refusal() -> ToolResult {
 }
 
 // ── Blocking helpers ──────────────────────────────────────────────────────────
+
+fn existing_reopen_pid(pids: &[i32], creates_new_instance: bool) -> Option<i32> {
+    match pids {
+        [pid] if *pid > 0 && !creates_new_instance => Some(*pid),
+        _ => None,
+    }
+}
+
+/// Capture only an existing, uniquely identified process before the handoff.
+/// Cold launches and newly created windows need separate evidence; they must
+/// never inherit this guard's permission to restore the old foreground order.
+fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
+                          creates_new_instance: bool)
+    -> Option<(i32, crate::background_order::BackgroundOrderGuard)>
+{
+    use objc2_app_kit::NSRunningApplication;
+    let pid = existing_reopen_pid(pids, creates_new_instance)?;
+    let expected = expected_bundle_id?;
+    let hidden = unsafe {
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
+        if app.isTerminated()
+            || app.bundleIdentifier().map(|id| id.to_string()).as_deref() != Some(expected)
+        { return None; }
+        app.isHidden()
+    };
+    let before = crate::windows::all_windows_with_space_snapshot();
+    if !before.succeeded { return None; }
+    let ordering = crate::background_order::BackgroundOrderGuard::capture_before_reopen(
+        pid, &before.windows, hidden,
+    )?;
+    Some((pid, ordering))
+}
 
 /// Ask only the exact launched application to become visible, without activation.
 fn unhide_requested_application(pid: i32, expected_bundle_id: Option<&str>) -> Value {
@@ -638,13 +685,22 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_remote_debugging_flag, is_cua_driver_bundle_id, local_file_target,
+        contains_remote_debugging_flag, existing_reopen_pid, is_cua_driver_bundle_id, local_file_target,
         normalize_launch_url, preflight_file_urls, response_identity, structured_launch_failure,
         LaunchAppTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn reopen_ordering_requires_one_existing_process_and_no_new_instance_request() {
+        assert_eq!(existing_reopen_pid(&[42], false), Some(42));
+        for pids in [&[][..], &[0], &[-1], &[41, 42], &[42, 42]] {
+            assert_eq!(existing_reopen_pid(pids, false), None);
+        }
+        assert_eq!(existing_reopen_pid(&[42], true), None);
+    }
 
     #[test]
     fn local_file_target_treats_plain_paths_as_files() {

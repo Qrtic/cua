@@ -5,6 +5,8 @@
 //! NSWorkspace an application activation. The focus-steal observer cannot see
 //! that event. This guard considers only pre-existing, overlapping target
 //! windows which crossed the still-focused original window during one action.
+//! An explicit reopen can also admit an exact, previously hidden window on the
+//! current Space, using evidence captured before the launch request.
 //! Unmodified pointer motion does not prevent restoring that same window's
 //! order; every other external event and any monitoring gap still vetoes it.
 
@@ -57,6 +59,20 @@ fn eligible_below(windows: &[WindowInfo], front_pid: i32, front_id: u32, target:
         && overlaps(&w.bounds, &front.bounds)).map(|w| w.window_id).collect()
 }
 
+fn eligible_before_reopen(windows: &[WindowInfo], front_pid: i32, front_id: u32,
+                          target: i32, target_was_hidden: bool) -> HashSet<u32> {
+    let mut candidates = eligible_below(windows, front_pid, front_id, target);
+    if !target_was_hidden || target == front_pid { return candidates; }
+    let Some(front) = exact_visible(windows, front_pid, front_id) else { return candidates };
+    // Hidden is a separately verified application property. Off-screen alone
+    // never establishes permission to include a minimized or other-Space window.
+    // A candidate still has to become visible on this Space before any restore.
+    candidates.extend(windows.iter().filter(|w| w.pid == target && w.layer == 0
+        && !w.is_on_screen && w.on_current_space == Some(true)
+        && overlaps(&w.bounds, &front.bounds)).map(|w| w.window_id));
+    candidates
+}
+
 fn crossed(windows: &[WindowInfo], front_pid: i32, front_id: u32,
            target: i32, candidates: &HashSet<u32>) -> bool {
     let Some(front) = exact_visible(windows, front_pid, front_id) else { return false };
@@ -88,12 +104,17 @@ pub(crate) struct BackgroundOrderGuard {
 
 impl BackgroundOrderGuard {
     pub(crate) fn capture(target_pid: i32, windows: &[WindowInfo]) -> Option<Self> {
+        Self::capture_before_reopen(target_pid, windows, false)
+    }
+
+    pub(crate) fn capture_before_reopen(target_pid: i32, windows: &[WindowInfo],
+                                        target_was_hidden: bool) -> Option<Self> {
         let activity = crate::foreground_activity::ordering_snapshot();
         if !activity.activity.reliable { return None; }
         let pid = crate::apps::frontmost_pid()?;
         if pid <= 0 || pid == target_pid { return None; }
         let window = focused_window(pid)?;
-        let candidates = eligible_below(windows, pid, window, target_pid);
+        let candidates = eligible_before_reopen(windows, pid, window, target_pid, target_was_hidden);
         if candidates.is_empty() { return None; }
         let started = Instant::now();
         let result = Self { pid, window, target_pid, candidates,
@@ -252,6 +273,36 @@ mod tests {
         assert_eq!(ids, HashSet::from([20]));
         assert!(!crossed(&before, 1, 10, 2, &ids));
         assert!(crossed(&[window(2, 20, 40), window(1, 10, 30)], 1, 10, 2, &ids));
+    }
+
+    #[test]
+    fn exact_hidden_reopen_window_can_cross_without_app_activation() {
+        let front = window(1, 10, 30);
+        let mut hidden = window(2, 20, 10);
+        hidden.is_on_screen = false;
+        let before = vec![front.clone(), hidden];
+        let ids = eligible_before_reopen(&before, 1, 10, 2, true);
+        assert_eq!(ids, HashSet::from([20]));
+        assert!(eligible_before_reopen(&before, 1, 10, 2, false).is_empty());
+        assert!(!crossed(&before, 1, 10, 2, &ids));
+        assert!(crossed(&[window(2, 20, 40), front], 1, 10, 2, &ids));
+    }
+
+    #[test]
+    fn reopen_never_authorizes_new_other_space_or_other_process_windows() {
+        let front = window(1, 10, 30);
+        let mut hidden = window(2, 20, 10);
+        hidden.is_on_screen = false;
+        for space in [Some(false), None] {
+            hidden.on_current_space = space;
+            assert!(eligible_before_reopen(&[front.clone(), hidden.clone()], 1, 10, 2, true).is_empty());
+        }
+        hidden.on_current_space = Some(true);
+        let before = [front.clone(), hidden];
+        let ids = eligible_before_reopen(&before, 1, 10, 2, true);
+        assert!(!crossed(&[front.clone(), window(2, 21, 40)], 1, 10, 2, &ids));
+        assert!(!crossed(&[front, window(3, 20, 40)], 1, 10, 2, &ids));
+        assert!(eligible_before_reopen(&before, 1, 10, 1, true).is_empty());
     }
 
     #[test]
