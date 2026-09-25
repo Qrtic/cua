@@ -156,6 +156,12 @@ mod tests {
     use super::*;
     use objc2::msg_send;
     use objc2_foundation::NSData;
+    use std::sync::Mutex;
+
+    // Named boards isolate data, but AppKit's type-conversion cache is shared
+    // within this process. Keep each native test's entire board lifetime under
+    // one lock, as production paste is covered by the foreground input guard.
+    static NATIVE_PASTEBOARD_TEST: Mutex<()> = Mutex::new(());
 
     unsafe fn seed(board: &NSPasteboard) {
         let first = NSPasteboardItem::new();
@@ -174,6 +180,7 @@ mod tests {
 
     #[test]
     fn restores_every_representation_and_item_after_literal_paste() {
+        let _guard = NATIVE_PASTEBOARD_TEST.lock().expect("pasteboard test lock");
         unsafe {
             let board = NSPasteboard::pasteboardWithUniqueName();
             seed(&board);
@@ -225,6 +232,7 @@ mod tests {
 
     #[test]
     fn does_not_overwrite_a_newer_copy_during_the_action() {
+        let _guard = NATIVE_PASTEBOARD_TEST.lock().expect("pasteboard test lock");
         unsafe {
             let board = NSPasteboard::pasteboardWithUniqueName();
             seed(&board);
@@ -255,6 +263,7 @@ mod tests {
 
     #[test]
     fn interruption_before_paste_preserves_original_items() {
+        let _guard = NATIVE_PASTEBOARD_TEST.lock().expect("pasteboard test lock");
         unsafe {
             let board = NSPasteboard::pasteboardWithUniqueName();
             seed(&board);
