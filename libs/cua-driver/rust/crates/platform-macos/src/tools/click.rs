@@ -1173,6 +1173,8 @@ impl Tool for ClickTool {
                 Ok(Err(e)) => {
                     if let Some(unconfirmed) = e.downcast_ref::<AxActionResponseUnconfirmed>() {
                         unconfirmed.result()
+                    } else if let Some(disabled) = e.downcast_ref::<crate::input::ax_actions::AxActionDisabled>() {
+                        disabled_ax_action_result(disabled)
                     } else if let Some(refusal) = e.downcast_ref::<ApplicationMenuRefusal>() {
                         super::background_refusal_result(pid, wid, &refusal.0)
                     } else if let Some(refusal) = e.downcast_ref::<ElementPointerRefusal>() {
@@ -1434,6 +1436,9 @@ impl Tool for ClickTool {
                     Ok(Err(error)) => {
                         if let Some(unconfirmed) = error.downcast_ref::<AxActionResponseUnconfirmed>() {
                             return unconfirmed.result();
+                        }
+                        if let Some(disabled) = error.downcast_ref::<crate::input::ax_actions::AxActionDisabled>() {
+                            return disabled_ax_action_result(disabled);
                         }
                         if let Some(refusal) = error.downcast_ref::<ApplicationMenuRefusal>() {
                             return super::background_refusal_result(pid, hit_test_wid, &refusal.0);
@@ -1951,6 +1956,13 @@ impl std::fmt::Display for ApplicationMenuRefusal {
     }
 }
 impl std::error::Error for ApplicationMenuRefusal {}
+
+fn disabled_ax_action_result(error: &crate::input::ax_actions::AxActionDisabled) -> ToolResult {
+    ToolResult::error(error.to_string()).with_structured(serde_json::json!({
+        "code": "element_disabled", "effect": "refused",
+        "verified": false, "retryable": false,
+    }))
+}
 
 /// AppKit can finish the requested action after AX's response timeout. Neither
 /// success nor a no-effect refusal is justified, and a second actuator is unsafe.

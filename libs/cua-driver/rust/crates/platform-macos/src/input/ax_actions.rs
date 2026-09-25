@@ -221,12 +221,25 @@ pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<Selecti
     None
 }
 
+/// A live disabled control was rejected before its requested AX action. Keep
+/// this distinct from an AX response timeout, which may already have an effect.
+#[derive(Debug)]
+pub(crate) struct AxActionDisabled {
+    action: String,
+}
+
+impl std::fmt::Display for AxActionDisabled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter,
+            "Refusing {}: the target reports AXEnabled=false; the requested AX action was not sent. Observe the current window or menu state and retry only if the control becomes enabled.",
+            self.action)
+    }
+}
+impl std::error::Error for AxActionDisabled {}
+
 fn ensure_ax_enabled(enabled: Option<bool>, action: &str) -> anyhow::Result<()> {
     if enabled == Some(false) {
-        anyhow::bail!(
-            "refusing {action}: the target reports AXEnabled=false. \
-             Retry this action with delivery_mode:\"foreground\" or call bring_to_front first"
-        );
+        return Err(AxActionDisabled { action: action.to_owned() }.into());
     }
     Ok(())
 }
@@ -274,10 +287,12 @@ mod tests {
     #[test]
     fn disabled_elements_are_refused_before_dispatch() {
         let error = ensure_ax_enabled(Some(false), "AXPick").unwrap_err();
+        assert!(error.downcast_ref::<AxActionDisabled>().is_some());
         let message = error.to_string();
         assert!(message.contains("AXEnabled=false"));
-        assert!(message.contains("delivery_mode:\"foreground\""));
-        assert!(message.contains("bring_to_front"));
+        assert!(message.contains("requested AX action was not sent"));
+        assert!(!message.contains("foreground"));
+        assert!(!message.contains("bring_to_front"));
     }
 
     #[test]
