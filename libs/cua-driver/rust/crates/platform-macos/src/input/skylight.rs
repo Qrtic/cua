@@ -840,6 +840,16 @@ impl Drop for SyntheticTargetFocusContext {
             let front_psn = current_front_process_psn();
             if should_deactivate_synthetic_target(front_psn, command.psn) {
                 let _ = post_synthetic_focus_command(&command);
+            } else {
+                log_synthetic_focus_cleanup_skip(
+                    &command,
+                    "drop",
+                    if front_psn.is_none() {
+                        "foreground_unknown"
+                    } else {
+                        "target_is_real_foreground"
+                    },
+                );
             }
         }
     }
@@ -925,13 +935,56 @@ fn post_synthetic_focus_command(command: &SyntheticFocusCommand) -> anyhow::Resu
     )
 }
 
+// Buffer the post's existing identity/status until all original outcome checks
+// have finished. No synchronous log goes before the native post or into its
+// process-retirement polling interval. Times describe the post, not log order
+// or when the application consumes the event. Clock/log overhead is nonzero.
+struct SyntheticFocusPostDiagnostic {
+    window_id: u32,
+    focused: bool,
+    post_status: i32,
+    started_us: u64,
+    finished_us: u64,
+}
+
+impl Drop for SyntheticFocusPostDiagnostic {
+    fn drop(&mut self) {
+        tracing::debug!(target: "cua_focus_restore", window_id=self.window_id,
+            focused=self.focused, post_status=self.post_status,
+            monotonic_start_us=self.started_us, monotonic_end_us=self.finished_us,
+            elapsed_us=self.finished_us.saturating_sub(self.started_us),
+            "Synthetic focus native post completed");
+    }
+}
+
+fn log_synthetic_focus_cleanup_skip(
+    command: &SyntheticFocusCommand,
+    origin: &'static str,
+    reason: &'static str,
+) {
+    // All facts were read by the existing cleanup decision. Do not resolve a
+    // PID, inspect AX, or reread foreground state merely for diagnostics.
+    tracing::debug!(target: "cua_focus_restore", window_id=command.window_id,
+        focused=command.focused, origin, reason,
+        monotonic_us=crate::order_diagnostics::monotonic_us(),
+        "Synthetic focus cleanup post skipped");
+}
+
 fn post_synthetic_focus_command_with(
     command: &SyntheticFocusCommand,
     post: impl FnOnce(&[u8; 8], &[u8; 0xF8]) -> i32,
     mut process_status: impl FnMut(&[u8; 8]) -> Option<i32>,
 ) -> anyhow::Result<()> {
     let record = synthetic_focus_record(command.window_id, command.focused);
+    let started_us = crate::order_diagnostics::monotonic_us();
     let status = post(&command.psn, &record);
+    let _diagnostic = SyntheticFocusPostDiagnostic {
+        window_id: command.window_id,
+        focused: command.focused,
+        post_status: status,
+        started_us,
+        finished_us: crate::order_diagnostics::monotonic_us(),
+    };
     // A command such as Quit may finish before its synthetic-focus cleanup.
     // Only deactivation's procNotFound, corroborated for this exact PSN by a
     // separate read-only Process Manager lookup, proves no state remains to
@@ -1015,6 +1068,7 @@ pub fn end_synthetic_target_focus(mut context: SyntheticTargetFocusContext) -> a
         .ok_or_else(|| anyhow::anyhow!("target-only synthetic focus was already ended"))?;
     let front_psn = current_front_process_psn();
     if front_psn.is_none() {
+        log_synthetic_focus_cleanup_skip(&command, "explicit_end", "foreground_unknown");
         anyhow::bail!(
             "could not verify the real foreground during target-only synthetic focus cleanup; target state was left unchanged"
         );
@@ -1022,6 +1076,7 @@ pub fn end_synthetic_target_focus(mut context: SyntheticTargetFocusContext) -> a
     if !should_deactivate_synthetic_target(front_psn, command.psn) {
         // Real activation supersedes the synthetic belief. In particular, do
         // not undo a user takeover that happened while the click was in flight.
+        log_synthetic_focus_cleanup_skip(&command, "explicit_end", "target_is_real_foreground");
         return Ok(());
     }
     post_synthetic_focus_command(&command)?;
@@ -4799,6 +4854,97 @@ mod tests {
         assert_eq!(&activate[0x3C..0x40], &[0x12, 0x34, 0x56, 0x78]);
         assert_eq!(activate[0x8A], 0x01);
         assert_eq!(deactivate[0x8A], 0x02);
+    }
+
+    #[test]
+    fn synthetic_focus_post_diagnostics_follow_post_and_preserve_outcomes() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        #[derive(Clone, Default)]
+        struct Events(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+        struct Fields(BTreeMap<String, String>);
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+        impl Subscriber for Events {
+            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields(BTreeMap::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        for (focused, status, succeeds, expected_queries) in [
+            (true, 0, true, 0),
+            (false, 0, true, 0),
+            (true, -600, false, 0),
+            (false, -600, true, 1),
+            (false, -54, false, 0),
+        ] {
+            let command = super::SyntheticFocusCommand {
+                psn: [7; 8], window_id: 731, focused,
+            };
+            let events = Events::default();
+            let posts = Cell::new(0);
+            let queries = Cell::new(0);
+            let result = tracing::subscriber::with_default(events.clone(), || {
+                super::post_synthetic_focus_command_with(
+                    &command,
+                    |psn, record| {
+                        assert!(events.0.lock().unwrap().is_empty(),
+                            "diagnostics must not log before native dispatch");
+                        posts.set(posts.get() + 1);
+                        assert_eq!(*psn, command.psn);
+                        assert_eq!(*record, synthetic_focus_record(731, focused));
+                        status
+                    },
+                    |_| {
+                        assert!(events.0.lock().unwrap().is_empty(),
+                            "new post diagnostics must wait for original outcome checks");
+                        queries.set(queries.get() + 1);
+                        Some(-600)
+                    },
+                )
+            });
+            assert_eq!(posts.get(), 1);
+            assert_eq!(queries.get(), expected_queries);
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert_eq!(error.to_string(),
+                    format!("target-only synthetic focus event failed with OSStatus {status}"));
+            }
+            let rows = events.0.lock().unwrap();
+            let posts: Vec<_> = rows.iter().filter(|row| {
+                row.get("message").map(String::as_str) == Some("Synthetic focus native post completed")
+            }).collect();
+            assert_eq!(posts.len(), 1);
+            let row = posts[0];
+            assert_eq!(row["window_id"], "731");
+            assert_eq!(row["focused"], focused.to_string());
+            assert_eq!(row["post_status"], status.to_string());
+            let start: u64 = row["monotonic_start_us"].parse().unwrap();
+            let end: u64 = row["monotonic_end_us"].parse().unwrap();
+            assert!(end >= start);
+            assert_eq!(row["elapsed_us"], (end - start).to_string());
+            assert!(row.keys().all(|key| ["message", "window_id", "focused", "post_status",
+                "monotonic_start_us", "monotonic_end_us", "elapsed_us"].contains(&key.as_str())),
+                "diagnostics must not expose PSN or application content");
+        }
     }
 
     #[test]
