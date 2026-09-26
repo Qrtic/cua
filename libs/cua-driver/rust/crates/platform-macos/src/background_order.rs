@@ -7,9 +7,10 @@
 //! windows which crossed the still-focused original window during one action.
 //! An explicit reopen can also admit an exact, previously hidden window on the
 //! current Space, using evidence captured before the launch request.
-//! Explicit file-open requests may additionally admit newly created standard
-//! document windows from that same process lifetime. Menus, sheets and existing
-//! windows above the user's document are never enrolled by this extension.
+//! Targeted background input and explicit file-open requests may additionally
+//! admit newly created standard document windows from that same process
+//! lifetime. Menus, sheets and existing windows above the user's document are
+//! never enrolled by this extension.
 //! Unmodified pointer motion does not prevent restoring that same window's
 //! order; every other external event and any monitoring gap still vetoes it.
 
@@ -96,6 +97,21 @@ struct NewWindowEvidence {
     process_start: crate::ax::enablement::ProcessStartStamp,
 }
 
+impl NewWindowEvidence {
+    fn capture(target: i32, process_start: Option<crate::ax::enablement::ProcessStartStamp>,
+               complete: &WindowEnumeration, visible: &WindowEnumeration) -> Option<Self> {
+        // A visible-only snapshot cannot distinguish a new document from an
+        // existing hidden or minimized one. Failed membership enumeration must
+        // not turn every subsequently visible window into a new document.
+        if target <= 0 || !complete.succeeded || !visible.succeeded { return None; }
+        Some(Self {
+            process_start: process_start?,
+            known: complete.windows.iter().chain(visible.windows.iter())
+                .filter(|w| w.pid == target).map(|w| w.window_id).collect(),
+        })
+    }
+}
+
 fn newly_crossing_windows(windows: &[WindowInfo], front_pid: i32, front_id: u32,
                          target: i32, known: &HashSet<u32>) -> Vec<u32> {
     let Some(front) = exact_visible(windows, front_pid, front_id) else { return Vec::new() };
@@ -167,13 +183,16 @@ pub(crate) struct BackgroundOrderGuard {
 }
 
 impl BackgroundOrderGuard {
-    pub(crate) fn capture(target_pid: i32, windows: &[WindowInfo]) -> Option<Self> {
-        Self::capture_before_reopen(target_pid, windows, false)
-    }
-
-    pub(crate) fn capture_before_reopen(target_pid: i32, windows: &[WindowInfo],
-                                        target_was_hidden: bool) -> Option<Self> {
-        Self::capture_evidence(target_pid, windows, target_was_hidden, None)
+    pub(crate) fn capture_before_input(target_pid: i32,
+                                      process_start: Option<crate::ax::enablement::ProcessStartStamp>,
+                                      complete: &WindowEnumeration,
+                                      visible: &WindowEnumeration) -> Option<Self> {
+        if !visible.succeeded { return None; }
+        let new_windows = NewWindowEvidence::capture(target_pid, process_start, complete, visible);
+        // Ordinary input does not authorize unhiding an existing document.
+        // New-window membership is captured before dispatch; fresh AX ownership,
+        // standard-window role and unchanged context are still required later.
+        Self::capture_evidence(target_pid, &visible.windows, false, new_windows)
     }
 
     pub(crate) fn capture_before_file_open(target_pid: i32, complete: &WindowEnumeration,
@@ -181,11 +200,8 @@ impl BackgroundOrderGuard {
                                            opens_file: bool) -> Option<Self> {
         let evidence = reopen_window_evidence(complete, visible)?;
         let new_windows = if opens_file {
-            crate::ax::enablement::process_start_stamp(target_pid).map(|process_start| NewWindowEvidence {
-                process_start,
-                known: complete.windows.iter().chain(visible.windows.iter())
-                    .filter(|w| w.pid == target_pid).map(|w| w.window_id).collect(),
-            })
+            NewWindowEvidence::capture(target_pid,
+                crate::ax::enablement::process_start_stamp(target_pid), complete, visible)
         } else { None };
         Self::capture_evidence(target_pid, &evidence, target_was_hidden, new_windows)
     }
@@ -315,7 +331,7 @@ impl BackgroundOrderGuard {
                 let proven = proven_new_documents(self.target_pid, &proposed, self.expires_at);
                 if !proven.is_empty() && self.current() {
                     tracing::debug!(target: "cua_window_order", target_pid=self.target_pid,
-                        ?proven, "Enrolled new standard documents from the explicit file-open request");
+                        ?proven, "Enrolled new standard documents from the guarded target action");
                     self.candidates.extend(proven);
                 }
             }
@@ -448,6 +464,40 @@ mod tests {
         assert!(newly_crossing_windows(&windows, 1, 10, 1, &before).is_empty());
         assert!(newly_crossing_windows(&windows, 1, 99, 2, &before).is_empty());
         assert!(newly_crossing_windows(&windows, 9, 10, 2, &before).is_empty());
+    }
+
+    #[test]
+    fn input_created_document_is_distinct_from_preexisting_occluded_windows() {
+        let mut hidden = window(2, 21, 800);
+        hidden.is_on_screen = false;
+        let complete = WindowEnumeration { succeeded: true, current_space_id: Some(1),
+            windows: vec![window(2, 20, 900), hidden, window(1, 10, 2)] };
+        // A second existing window appears between the two before-snapshots.
+        // It must also remain known rather than being claimed by the action.
+        let visible = WindowEnumeration { succeeded: true, current_space_id: Some(1),
+            windows: vec![window(1, 10, 31), window(2, 20, 30), window(2, 23, 29)] };
+        let evidence = NewWindowEvidence::capture(2, Some((100, 200)), &complete, &visible).unwrap();
+        assert_eq!(evidence.process_start, (100, 200));
+        let after = vec![window(1, 10, 31), window(2, 20, 30), window(2, 21, 32),
+            window(2, 23, 33), window(2, 22, 34), window(3, 24, 35)];
+        // The vault manager/new document produced by this input is the only
+        // proposal. Neither a revealed old document nor another app qualifies.
+        assert_eq!(newly_crossing_windows(&after, 1, 10, 2, &evidence.known), vec![22]);
+    }
+
+    #[test]
+    fn new_input_document_membership_requires_complete_success_and_process_identity() {
+        for (all_ok, visible_ok, stamp) in [
+            (false, true, Some((100, 200))),
+            (true, false, Some((100, 200))),
+            (true, true, None),
+        ] {
+            let complete = WindowEnumeration { succeeded: all_ok, current_space_id: Some(1),
+                windows: vec![window(2, 20, 900)] };
+            let visible = WindowEnumeration { succeeded: visible_ok, current_space_id: Some(1),
+                windows: vec![window(1, 10, 31), window(2, 20, 30)] };
+            assert!(NewWindowEvidence::capture(2, stamp, &complete, &visible).is_none());
+        }
     }
 
     #[test]

@@ -274,13 +274,24 @@ impl WindowChangeDetector {
         // can be comparatively slow; arming first avoids a large gap in which
         // the user changes foreground and the later target activation restores
         // a stale app.
-        let visible = windows::visible_windows();
+        let target_start = match suppression_scope {
+            SuppressionScope::Target(pid) => crate::ax::enablement::process_start_stamp(pid),
+            _ => None,
+        };
+        let visible = windows::visible_windows_with_space_snapshot();
         let ordering = match (suppression_scope, lease.as_ref().and_then(SuppressionLease::targeted_deadline)) {
-            (SuppressionScope::Target(pid), Some(deadline)) =>
-                crate::background_order::BackgroundOrderGuard::capture(pid, &visible).map(|mut guard| {
+            (SuppressionScope::Target(pid), Some(deadline)) => {
+                // Input can create a document just as an explicit file-open
+                // can. Capture complete membership before dispatch so a new
+                // standard window can be protected during the same lease.
+                // Raw membership needs no Space queries or stack ordering;
+                // only the visible snapshot supplies relative order evidence.
+                let complete = windows::all_windows_including_accessory_layers_with_snapshot();
+                crate::background_order::BackgroundOrderGuard::capture_before_input(pid, target_start, &complete, &visible).map(|mut guard| {
                     guard.limit_deadline(deadline);
                     Arc::new(Mutex::new(guard))
-                }),
+                })
+            },
             _ => None,
         };
         // An AX call may raise the host before returning. Cover that interval
@@ -292,7 +303,7 @@ impl WindowChangeDetector {
                 ordering.lock().map(|mut guard| guard.poll(deadline)).unwrap_or(false)
             });
         }
-        let window_ids: HashSet<u32> = visible
+        let window_ids: HashSet<u32> = visible.windows
             .into_iter()
             .filter(|w| w.layer == 0)
             .map(|w| w.window_id)
