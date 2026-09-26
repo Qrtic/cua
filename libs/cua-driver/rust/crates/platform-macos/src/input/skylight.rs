@@ -1362,19 +1362,28 @@ fn complete_exact_ax_window_activation(
     if unsafe { copy_string_attr(target.0, "AXRole") }.as_deref() != Some("AXWindow") {
         anyhow::bail!("exact activation requires an AXWindow, not a child or delegated surface");
     }
+    let last_operation = std::cell::Cell::new("none");
     exact_ax_activation_steps(
         || {
             check_exact_activation_owner(pid, window_id, &mut check_activity)?;
             let mut ax_pid = 0;
-            if unsafe { AXUIElementGetPid(target.0, &mut ax_pid) } != kAXErrorSuccess
+            let pid_status = unsafe { AXUIElementGetPid(target.0, &mut ax_pid) };
+            let ax_window = (pid_status == kAXErrorSuccess)
+                .then(|| unsafe { ax_get_window_id(target.0) })
+                .flatten();
+            if pid_status != kAXErrorSuccess
                 || ax_pid != pid
-                || unsafe { ax_get_window_id(target.0) } != Some(window_id)
+                || ax_window != Some(window_id)
             {
-                anyhow::bail!("exact activation AX target identity changed");
+                anyhow::bail!(
+                    "exact activation AX target identity changed; pid_read_status={pid_status}, ax_pid={ax_pid}, ax_window={ax_window:?}, target_pid={pid}, target_window={window_id}, after_operation={}",
+                    last_operation.get()
+                );
             }
             check_activity()
         },
         |operation| unsafe {
+            last_operation.set(operation);
             if operation == "AXRaise" {
                 perform_action(target.0, operation)
             } else {

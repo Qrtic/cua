@@ -1522,20 +1522,23 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
                     }
                 }
                 let mut emergency = FailedRestore(Arc::clone(&worker_segment), false);
-                let live = finish
-                    && worker_segment.owner_live()
-                    && lease.permits(clock_ms(), snapshot())
-                    && worker_segment
-                        .inner
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .policy
-                        .state()
-                        == SegmentState::Closing;
+                let owner_live = worker_segment.owner_live();
+                let lease_live = lease.permits(clock_ms(), snapshot());
+                let closing = worker_segment
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .policy
+                    .state()
+                    == SegmentState::Closing;
+                let live = finish && owner_live && lease_live && closing;
                 let source = worker_segment.restoration_source();
+                let reason;
                 let restoration = if !live {
+                    reason = "ownership_not_live";
                     "skipped_interrupted"
                 } else if exact_front(worker_segment.original) {
+                    reason = "original_already_front";
                     "unchanged"
                 } else if worker_segment.original == worker_segment.binding.target
                     && (worker_segment.accept_dialog_return()
@@ -1545,8 +1548,10 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
                 {
                     // The task already owned the original foreground window.
                     // Keep its legitimate resulting host/popup in front.
+                    reason = "original_target_returned_to_host";
                     "unchanged"
                 } else if !exact_front(source) && !worker_segment.accept_dialog_return() {
+                    reason = "restoration_source_not_front";
                     worker_segment.revoke();
                     "skipped_interrupted"
                 } else if crate::input::skylight::restore_exact_window_guarded(
@@ -1571,16 +1576,27 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
                         Ok(())
                     },
                 ) {
+                    reason = "guarded_restore_completed";
                     "restored"
                 } else if !worker_segment.owner_live()
                     || !lease.permits(clock_ms(), snapshot())
                     || worker_context.cancelled.load(Ordering::Acquire)
                     || worker_context.interrupted.load(Ordering::Acquire)
                 {
+                    reason = "ownership_interrupted_during_restore";
                     "skipped_interrupted"
                 } else {
+                    reason = "guarded_restore_failed";
                     "failed"
                 };
+                tracing::debug!(
+                    target: "cua_foreground_segment",
+                    finish, owner_live, lease_live, closing, reason, restoration,
+                    source_pid = source.pid, source_window = source.window_id,
+                    original_pid = worker_segment.original.pid,
+                    original_window = worker_segment.original.window_id,
+                    "Settled exact foreground segment restoration"
+                );
                 if worker_context.cleanup_unconfirmed.load(Ordering::Acquire) {
                     worker_segment.mark_unknown();
                 }
