@@ -2,8 +2,8 @@
 //!
 //! Gathers the facts [`cua_driver_core::background_input`] needs about one
 //! requested `(pid, CGWindowID)` immediately before a background mutation:
-//! WindowServer ownership, fresh `AXWindows` membership (mapped through
-//! `_AXUIElementGetWindow`), minimized/hidden state, competing same-pid AX
+//! WindowServer ownership, fresh AX top-level membership (ordinary `AXWindows`
+//! or a separately proven focused native sheet/panel), minimized/hidden state, competing same-pid AX
 //! top-level keyboard destinations, and addressed-element ancestry. All reads are
 //! bounded and fail closed — an unreadable fact never unlocks a route.
 
@@ -14,7 +14,7 @@ use cua_driver_core::background_input::{
 use std::collections::{HashMap, HashSet};
 
 use super::bindings::{
-    ax_get_window_id, copy_ax_windows, copy_bool_attr, focused_element_of_pid,
+    ax_get_window_id, copy_bool_attr, focused_element_of_pid,
     kAXErrorAttributeUnsupported, kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr,
     AXError, AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
@@ -145,8 +145,10 @@ unsafe fn ax_window_records(
     app: AXUIElementRef,
     pid: i32,
     target_window_id: u32,
-) -> Vec<AxWindowRecord> {
-    let mut records: Vec<_> = copy_ax_windows(app)
+) -> (Vec<AxWindowRecord>, Option<u32>) {
+    let snapshot = try_copy_ax_windows(app).ok();
+    let complete = snapshot.as_ref().is_some_and(|snapshot| snapshot.complete);
+    let mut records: Vec<_> = snapshot.map(|snapshot| snapshot.windows).unwrap_or_default()
         .into_iter()
         .filter_map(|window| {
             let record = ax_get_window_id(window).map(|window_id| AxWindowRecord {
@@ -157,6 +159,22 @@ unsafe fn ax_window_records(
             record
         })
         .collect();
+    let mut focused_panel_id = None;
+    if let Some(panel) = super::focused_panel::copy_focused_panel(pid, None) {
+        if let Some(id) = ax_get_window_id(panel) {
+            focused_panel_id = Some(id);
+            if !records.iter().any(|record| record.window_id == id) {
+                records.push(AxWindowRecord {
+                    window_id: id,
+                    // A missing ordinary window inventory cannot grant new
+                    // pointer or PID-keyboard authority via this supplement.
+                    // Exact semantic AX remains available with its own proof.
+                    minimized: complete.then(|| background_window_minimized(pid, id, panel)).flatten(),
+                });
+            }
+        }
+        CFRelease(panel as CFTypeRef);
+    }
     if !records
         .iter()
         .any(|record| record.window_id == target_window_id)
@@ -171,7 +189,7 @@ unsafe fn ax_window_records(
             CFRelease(sheet as CFTypeRef);
         }
     }
-    records
+    (records, focused_panel_id)
 }
 
 fn classify_ax_window_lifecycle(
@@ -250,7 +268,7 @@ pub(crate) fn gather_ax_window_lifecycle_evidence(
             }
             super::enablement::ensure_chromium_ax_enabled(pid, app);
             let app_hidden = copy_bool_attr(app, "AXHidden");
-            let records = try_copy_ax_windows(app).ok().map(|ax_snapshot| {
+            let mut records = try_copy_ax_windows(app).ok().map(|ax_snapshot| {
                 let (scan_count, within_limit) = bounded_ax_window_count(ax_snapshot.windows.len());
                 let mut records = Vec::with_capacity(scan_count);
                 let mut complete = ax_snapshot.complete && within_limit;
@@ -280,6 +298,21 @@ pub(crate) fn gather_ax_window_lifecycle_evidence(
                 }
                 AxWindowSnapshot { records, complete }
             });
+            if let Some(snapshot) = records.as_mut() {
+                if window_ids.iter().any(|id| !snapshot.records.iter().any(|r| r.window_id == *id)) {
+                    if let Some(panel) = super::focused_panel::copy_focused_panel(pid, None) {
+                        if let Some(id) = ax_get_window_id(panel) {
+                            if window_ids.contains(&id) && !snapshot.records.iter().any(|r| r.window_id == id) {
+                                snapshot.records.push(AxWindowRecord {
+                                    window_id: id,
+                                    minimized: copy_bool_attr(panel, "AXMinimized"),
+                                });
+                            }
+                        }
+                        CFRelease(panel as CFTypeRef);
+                    }
+                }
+            }
             CFRelease(app as CFTypeRef);
             (records, app_hidden)
         }
@@ -301,8 +334,10 @@ pub(crate) fn gather_ax_window_lifecycle_evidence(
 /// WindowServer may expose several layer-0 compositor surfaces for one native
 /// Electron, Tauri, or WebKit window. A raw same-pid CGWindow row is therefore
 /// not enough to prove another process-scoped keyboard destination. Requiring a
-/// fresh `AXWindows` mapping preserves the fail-closed two-window guard while
+/// fresh exact AX mapping preserves the fail-closed two-window guard while
 /// ignoring render surfaces that cannot independently become the AX key window.
+/// The caller supplements its filtered inventory with the single proven
+/// focused panel. Unrelated capture-indicator and compositor rows stay filtered.
 fn count_competing_keyboard_destinations(
     pid: i32,
     target_window_id: u32,
@@ -318,7 +353,9 @@ fn count_competing_keyboard_destinations(
                     .iter()
                     .any(|record| record.window_id == *window_id && record.minimized != Some(true))
         })
-        .count()
+        .map(|(_, window_id)| window_id)
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Gather fresh background-input facts for one `(pid, window_id)` target.
@@ -343,11 +380,12 @@ pub fn gather_background_facts(
     // SAFETY: the application element is created and released here; window
     // elements are released inside ax_window_records; the caller guarantees
     // element_ptr stays retained.
-    let (records, app_hidden, element) = unsafe {
+    let (records, focused_panel_id, app_hidden, element) = unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             (
                 Vec::new(),
+                None,
                 None,
                 element_ptr.map(|_| ElementAncestry::Unproven),
             )
@@ -355,7 +393,7 @@ pub fn gather_background_facts(
             // Electron/Chromium apps may need per-process-lifetime enablement
             // before their AX windows and subtrees are materialized.
             super::enablement::ensure_chromium_ax_enabled(pid, app);
-            let records = ax_window_records(app, pid, window_id);
+            let (records, focused_panel_id) = ax_window_records(app, pid, window_id);
             let app_hidden = copy_bool_attr(app, "AXHidden");
             let element = element_ptr.map(|ptr| match element_window_id(ptr as AXUIElementRef) {
                 Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
@@ -380,7 +418,7 @@ pub fn gather_background_facts(
                 None => ElementAncestry::Unproven,
             });
             CFRelease(app as CFTypeRef);
-            (records, app_hidden, element)
+            (records, focused_panel_id, app_hidden, element)
         }
     };
 
@@ -390,7 +428,8 @@ pub fn gather_background_facts(
         window_id,
         all_automation_windows()
             .iter()
-            .map(|window| (window.pid, window.window_id)),
+            .map(|window| (window.pid, window.window_id))
+            .chain(focused_panel_id.map(|id| (pid, id))),
         &records,
     );
 
@@ -528,6 +567,16 @@ mod tests {
             count_competing_keyboard_destinations(42, 10, rows, &records),
             1
         );
+    }
+
+    #[test]
+    fn focused_accessory_supplement_counts_once_without_aliasing_the_host() {
+        // The panel can be both ordinarily enumerated and added by its focus
+        // proof. It remains a separate keyboard destination, never two copies.
+        let rows = [(42, 10), (42, 99), (42, 99)];
+        let records = [ax_window(10, Some(false)), ax_window(99, Some(false))];
+        assert_eq!(count_competing_keyboard_destinations(42, 10, rows, &records), 1);
+        assert_eq!(count_competing_keyboard_destinations(42, 99, rows, &records), 1);
     }
 
     #[test]

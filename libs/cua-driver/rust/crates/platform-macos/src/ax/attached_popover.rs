@@ -69,6 +69,7 @@ trait PopoverTree {
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn parent(&self, node: &Self::Node) -> Option<Self::Node>;
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
+    fn virtual_button_child(&self, _parent: &Self::Node, _child: &Self::Node) -> bool { false }
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn within_budget(&self) -> bool;
     fn visible_menu_window(&self, node: &Self::Node, pid: i32) -> Option<u32>;
@@ -177,7 +178,9 @@ fn containing_popover<T: PopoverTree>(
         let parent = tree
             .parent(&current)
             .ok_or("popover_lookup_parent_missing")?;
-        if !tree.contains_child(&parent, &current) {
+        if !tree.contains_child(&parent, &current)
+            && !(tree.same(&current, element) && tree.virtual_button_child(&parent, &current))
+        {
             return Err("popover_lookup_child_relation_missing");
         }
         visited.push(current);
@@ -329,7 +332,9 @@ fn prove_checked<T: PopoverTree>(
         let Some(parent) = tree.parent(&current) else {
             return Err("ancestor_parent_missing");
         };
-        if !tree.contains_child(&parent, &current) {
+        if !tree.contains_child(&parent, &current)
+            && !(tree.same(&current, element) && tree.virtual_button_child(&parent, &current))
+        {
             tracing::debug!(target: "cua_popover_proof", depth, role = ?role,
                 "popover ancestry lacks reciprocal child relation");
             return Err("ancestor_child_relation_missing");
@@ -443,6 +448,10 @@ impl PopoverTree for NativeTree {
     fn same(&self, left: &AxNode, right: &AxNode) -> bool {
         unsafe { CFEqual(left.0 as CFTypeRef, right.0 as CFTypeRef) != 0 }
     }
+    fn virtual_button_child(&self, parent: &AxNode, child: &AxNode) -> bool {
+        self.within_budget()
+            && unsafe { super::virtual_button::proves(parent.0, child.0, self.deadline) }
+    }
     fn within_budget(&self) -> bool {
         Instant::now() < self.deadline
     }
@@ -539,6 +548,26 @@ pub(crate) unsafe fn proves_attached_popover(
     )
 }
 
+/// Project a real hit-tested preview control, not the actionless outer tile.
+/// Only an exact displaced popover child is returned; caller must CFRelease.
+pub(crate) unsafe fn copy_virtual_popover_button(wrapper: AXUIElementRef) -> Option<AXUIElementRef> {
+    let mut pid = 0;
+    if AXUIElementGetPid(wrapper, &mut pid) != kAXErrorSuccess || pid <= 0 { return None; }
+    let host = AxNode::owned(copy_element_attr(wrapper, "AXWindow")?)?;
+    if !matches!(copy_string_attr(host.0, "AXRole").as_deref(), Some("AXWindow" | "AXSheet")) {
+        return None;
+    }
+    let host_id = ax_get_window_id(host.0)?;
+    if ax_get_window_id(wrapper)? == host_id { return None; }
+    let child = super::virtual_button::copy_child(wrapper, Instant::now() + Duration::from_millis(750))?;
+    if proves_attached_popover(pid, host_id, child) {
+        Some(child)
+    } else {
+        CFRelease(child as CFTypeRef);
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +591,7 @@ mod tests {
         menu_windows: HashMap<u32, u32>,
         menu_window_reads: Cell<usize>,
         replace_menu_window: bool,
+        virtual_edges: Vec<(u32, u32)>,
     }
     impl PopoverTree for Tree {
         type Node = u32;
@@ -591,6 +621,9 @@ mod tests {
             self.nodes
                 .get(parent)
                 .is_some_and(|n| n.children.iter().any(|c| self.same(c, child)))
+        }
+        fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
+            self.virtual_edges.contains(&(*parent, *child))
         }
         fn same(&self, a: &u32, b: &u32) -> bool {
             self.nodes
@@ -654,11 +687,38 @@ mod tests {
             menu_windows: HashMap::new(),
             menu_window_reads: Cell::new(0),
             replace_menu_window: false,
+            virtual_edges: Vec::new(),
         }
     }
     #[test]
     fn pages_swatch_crosses_its_attached_popover_to_exact_host() {
         assert!(prove(&pages(), 42, 700, &0));
+    }
+
+    fn virtual_preview() -> Tree {
+        let mut tree = pages();
+        tree.nodes.get_mut(&0).unwrap().window = Some(6);
+        tree.nodes.get_mut(&1).unwrap().role = "AXButton";
+        tree.nodes.get_mut(&1).unwrap().children.clear();
+        tree.virtual_edges.push((1, 0));
+        tree
+    }
+
+    #[test]
+    fn h101_virtual_preview_still_requires_complete_outer_popover_attachment() {
+        assert!(prove(&virtual_preview(), 42, 700, &0));
+        for kind in 0..6 {
+            let mut tree = virtual_preview();
+            match kind {
+                0 => tree.virtual_edges.clear(),
+                1 => tree.nodes.get_mut(&1).unwrap().owner = 99,
+                2 => tree.nodes.get_mut(&3).unwrap().children.clear(),
+                3 => tree.nodes.get_mut(&0).unwrap().id = Some(700),
+                4 => tree.reattach = true,
+                _ => tree.budget.set(0),
+            }
+            assert!(!prove(&tree, 42, 700, &0), "case {kind}");
+        }
     }
 
     #[test]

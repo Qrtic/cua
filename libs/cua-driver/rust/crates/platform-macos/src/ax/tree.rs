@@ -290,9 +290,9 @@ fn walk_tree_bounded_with_projection(
         // the now-materialized (potentially large) tree bounded.
         super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
 
-        // Union AXChildren + AXWindows — the only way to see background windows.
-        // AXChildren omits windows when the app isn't frontmost (AppKit limitation).
-        // AXWindows returns the window list regardless of activation state.
+        // Union the ordinary AXChildren/AXWindows surfaces. AppKit can omit
+        // inactive attached sheets and floating panels from both; narrowly
+        // proven exact supplementary roots are added below.
         let from_children = copy_children(app_elem);
         let from_windows = copy_ax_windows(app_elem);
 
@@ -327,6 +327,13 @@ fn walk_tree_bounded_with_projection(
             } else {
                 top_level.push(sheet);
             }
+        }
+
+        if let Some(panel) = window_id
+            .filter(|wid| !top_level.iter().any(|&node| ax_get_window_id(node) == Some(*wid)))
+            .and_then(|wid| super::focused_panel::copy_focused_panel(pid, Some(wid)))
+        {
+            top_level.push(panel);
         }
 
         // Scope: keep permitted native menu/sheet projections + the target window —
@@ -447,6 +454,7 @@ struct WalkLimits {
     visited: usize,
     nodes_omitted: bool,
     depth_omitted: bool,
+    virtual_button_probes: usize,
 }
 
 impl WalkLimits {
@@ -457,6 +465,7 @@ impl WalkLimits {
             visited: 0,
             nodes_omitted: false,
             depth_omitted: false,
+            virtual_button_probes: 0,
         }
     }
 
@@ -566,6 +575,22 @@ unsafe fn walk_element(
     let identifier = copy_string_attr(element, "AXIdentifier");
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
     let actions = copy_action_names(element);
+
+    // A native popover can enumerate an actionless tile while hit testing
+    // returns its real AXPress button. Use that actual retained element only
+    // after bounded virtual-child and complete host-attachment proofs. Never
+    // manufacture actions/bounds on the wrapper or inspect web button grids.
+    if role == "AXButton" && !in_web_content && actions.is_empty()
+        && limits.virtual_button_probes < 32
+    {
+        limits.virtual_button_probes += 1;
+        if let Some(button) = super::attached_popover::copy_virtual_popover_button(element) {
+            walk_element(button, depth, parent_index, in_web_content,
+                         nodes, lines, counter, limits);
+            CFRelease(button as CFTypeRef);
+            return;
+        }
+    }
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
