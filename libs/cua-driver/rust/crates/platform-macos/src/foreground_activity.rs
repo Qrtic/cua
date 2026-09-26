@@ -73,6 +73,7 @@ struct InvocationContext {
     interrupted: AtomicBool,
     interruption_cause: Mutex<Option<&'static str>>,
     cleanup_unconfirmed: AtomicBool,
+    restoration_unconfirmed: AtomicBool,
     session_id: Option<String>,
     runtime_scope: Option<String>,
     foreground_admission: Option<EpisodeLease>,
@@ -214,7 +215,9 @@ impl InvocationContext {
             meta["ai.cua/foreground"]["segment"] = summary;
         }
         let cleanup_unconfirmed = self.cleanup_unconfirmed.load(Ordering::Acquire);
-        if !cleanup_unconfirmed && !self.interrupted.load(Ordering::Acquire) {
+        let interrupted = self.interrupted.load(Ordering::Acquire);
+        let restoration_unconfirmed = self.restoration_unconfirmed.load(Ordering::Acquire);
+        if !cleanup_unconfirmed && !interrupted && !restoration_unconfirmed {
             return;
         }
         // A normal ToolResult is otherwise a transport settlement signal. Do
@@ -225,11 +228,17 @@ impl InvocationContext {
                 "native_cleanup_unconfirmed",
                 "Native cleanup could not be confirmed; an effect is possible. Stop this Computer Use flow; do not replay or reconnect automatically.",
             )
-        } else {
+        } else if interrupted {
             (
                 "foreground_activity_interrupted",
                 "native_interruption",
                 "Native input was interrupted; an effect is possible. Stop this Computer Use flow and observe before continuing; do not replay.",
+            )
+        } else {
+            (
+                "foreground_restore_unconfirmed",
+                "original_window_restoration_unconfirmed",
+                "Owned input has settled, but return to the exact original window was not confirmed. Input may already have taken effect. Observe the result before continuing; do not replay or infer user activity.",
             )
         };
         result.is_error = Some(true);
@@ -243,7 +252,7 @@ impl InvocationContext {
         structured["verified"] = serde_json::json!(false);
         structured["retryable"] = serde_json::json!(false);
         structured["foreground_failure"] = serde_json::json!({"reason": reason});
-        if !cleanup_unconfirmed {
+        if !cleanup_unconfirmed && interrupted {
             if let Some(cause) = *self
                 .interruption_cause
                 .lock()
@@ -571,6 +580,7 @@ impl Tool for ActivityGuardedTool {
             interrupted: AtomicBool::new(false),
             interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
+            restoration_unconfirmed: AtomicBool::new(false),
             // _session_id is injected by the canonical registry, unlike the
             // caller's optional public `session` display label.
             session_id,
@@ -777,15 +787,30 @@ impl Episode {
             // its popup becomes key. A completed action can also close that
             // popup. Return from the freshly proven same-app key window;
             // this does not authorize any further input into that window.
-            let return_source = owned_return_source_window(self.lease.pid);
             if (pid, window) != (self.lease.pid, self.lease.window)
-                && return_source.is_some()
-                && matches!(
-                    crate::windows::resolve_window_owner(pid, window),
-                    crate::windows::WindowOwner::SamePid
-                )
+                && !(crate::input::skylight::front_process_matches(pid, window) == Some(true)
+                    && crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window)
+                    && matches!(
+                        crate::windows::resolve_window_owner(pid, window),
+                        crate::windows::WindowOwner::SamePid
+                    ))
             {
-                let source_window = return_source.expect("checked above");
+                let source_window = owned_return_source_window_with_retained(
+                    self.lease.pid,
+                    self.lease.window,
+                );
+                let Some(source_window) = source_window.filter(|_| {
+                    matches!(
+                        crate::windows::resolve_window_owner(pid, window),
+                        crate::windows::WindowOwner::SamePid
+                    )
+                }) else {
+                    self.check()?;
+                    return unconfirmed_episode_restoration(
+                        result,
+                        "return source or original owner unavailable",
+                    );
+                };
                 self.check()?;
                 if !crate::input::skylight::restore_exact_window_guarded(pid, window, || {
                     self.check()?;
@@ -801,8 +826,9 @@ impl Episode {
                     Ok(())
                 }) {
                     self.check()?;
-                    anyhow::bail!(
-                        "foreground input settled but exact original-window restoration failed"
+                    return unconfirmed_episode_restoration(
+                        result,
+                        "exact original-window restoration failed",
                     );
                 }
                 tracing::debug!(target: "cua_focus_restore", source_pid = self.lease.pid,
@@ -815,6 +841,20 @@ impl Episode {
             anyhow::bail!("foreground input left held controls; owned cleanup completed");
         }
         result
+    }
+}
+
+fn unconfirmed_episode_restoration<T>(
+    result: anyhow::Result<T>,
+    reason: &'static str,
+) -> anyhow::Result<T> {
+    if let Some(context) = current_invocation() {
+        context.restoration_unconfirmed.store(true, Ordering::Release);
+    }
+    let message = format!("foreground_restore_unconfirmed: owned input settled; {reason}");
+    match result {
+        Ok(_) => Err(anyhow::anyhow!(message)),
+        Err(error) => Err(error.context(message)),
     }
 }
 
@@ -846,31 +886,51 @@ fn exact_target_is_frontmost(lease: Lease) -> bool {
 fn return_source_window_with(
     assisted_pid: i32,
     front_pid: Option<i32>,
+    retained_window: u32,
     focused_window: Option<u32>,
     mut owned_and_front: impl FnMut(u32) -> bool,
 ) -> Option<u32> {
     if front_pid != Some(assisted_pid) {
         return None;
     }
-    focused_window.filter(|window| *window != 0 && owned_and_front(*window))
+    // A closed popup may clear AXFocusedWindow. The already-retained episode
+    // window can prove the owned return process, but only with fresh owner and
+    // WindowServer evidence. A conflicting AX identity never uses this fallback.
+    focused_window
+        .or_else(|| (retained_window != 0).then_some(retained_window))
+        .filter(|window| *window != 0 && owned_and_front(*window))
 }
 
+// Segment handoffs still require a fresh focused-window identity. They must
+// not inherit an episode's restoration-only retained-window fallback.
 fn owned_return_source_window(assisted_pid: i32) -> Option<u32> {
+    owned_return_source_window_with_retained(assisted_pid, 0)
+}
+
+fn owned_return_source_window_with_retained(assisted_pid: i32, retained_window: u32) -> Option<u32> {
     let front_pid = crate::apps::frontmost_pid();
     if front_pid != Some(assisted_pid) {
+        tracing::debug!(target: "cua_focus_restore", assisted_pid, ?front_pid,
+            "Episode return source is not the assisted application");
         return None;
     }
-    return_source_window_with(
+    let focused_window = crate::ax::bindings::focused_window_id_of_pid(assisted_pid);
+    let source = return_source_window_with(
         assisted_pid,
         front_pid,
-        crate::ax::bindings::focused_window_id_of_pid(assisted_pid),
+        retained_window,
+        focused_window,
         |window| {
             matches!(
                 crate::windows::resolve_window_owner(assisted_pid, window),
                 crate::windows::WindowOwner::SamePid
             ) && crate::input::skylight::front_process_matches(assisted_pid, window) == Some(true)
         },
-    )
+    );
+    tracing::debug!(target: "cua_focus_restore", assisted_pid, retained_window,
+        ?focused_window, ?source, retained_source = focused_window.is_none() && source.is_some(),
+        "Episode return source evidence");
+    source
 }
 
 #[cfg(test)]
@@ -882,7 +942,7 @@ mod owned_return_source_tests {
         // Requested popup 900 never becomes AX-focused; host 700 does. This
         // permits restoration only, not sending the failed popup's input.
         assert_eq!(
-            return_source_window_with(42, Some(42), Some(700), |w| w == 700),
+            return_source_window_with(42, Some(42), 900, Some(700), |w| w == 700),
             Some(700)
         );
     }
@@ -891,7 +951,7 @@ mod owned_return_source_tests {
     fn takeover_and_unknown_source_never_authorize_restoration() {
         for front in [None, Some(99)] {
             assert_eq!(
-                return_source_window_with(42, front, Some(700), |_| panic!(
+                return_source_window_with(42, front, 900, Some(700), |_| panic!(
                     "other app must not be inspected for return"
                 )),
                 None
@@ -899,7 +959,7 @@ mod owned_return_source_tests {
         }
         for window in [None, Some(0)] {
             assert_eq!(
-                return_source_window_with(42, Some(42), window, |_| panic!(
+                return_source_window_with(42, Some(42), 0, window, |_| panic!(
                     "missing source must not be used"
                 )),
                 None
@@ -907,9 +967,49 @@ mod owned_return_source_tests {
         }
         // Owner mismatch, stale AX focus or missing WindowServer proof.
         assert_eq!(
-            return_source_window_with(42, Some(42), Some(700), |_| false),
+            return_source_window_with(42, Some(42), 900, Some(700), |_| false),
             None
         );
+    }
+
+    #[test]
+    fn closed_popup_with_missing_ax_focus_can_return_from_the_retained_owned_window() {
+        // The input episode already owns document 700. Closing its popup can
+        // clear AXFocusedWindow while WindowServer still proves that process.
+        // This proof authorizes returning to the prior app, never new input.
+        assert_eq!(
+            return_source_window_with(42, Some(42), 700, None, |window| window == 700),
+            Some(700)
+        );
+    }
+
+    #[test]
+    fn missing_ax_focus_does_not_return_from_a_closed_foreign_or_nonfront_window() {
+        assert_eq!(
+            return_source_window_with(42, Some(42), 700, None, |_| false),
+            None
+        );
+        for front in [None, Some(99)] {
+            assert_eq!(
+                return_source_window_with(42, front, 700, None, |_| {
+                    panic!("a takeover cannot use the retained return source")
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_ax_focus_does_not_fall_back_to_the_retained_window() {
+        let mut inspected = Vec::new();
+        assert_eq!(
+            return_source_window_with(42, Some(42), 700, Some(900), |window| {
+                inspected.push(window);
+                window == 700
+            }),
+            None
+        );
+        assert_eq!(inspected, [900]);
     }
 }
 
@@ -1880,6 +1980,7 @@ mod episode_lifecycle_tests {
             interrupted: AtomicBool::new(false),
             interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
+            restoration_unconfirmed: AtomicBool::new(false),
             session_id: Some("foreground-lifecycle-unit-session".into()),
             runtime_scope: Some("foreground-lifecycle-unit-runtime".into()),
             foreground_admission: None,
@@ -1889,6 +1990,59 @@ mod episode_lifecycle_tests {
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         })
+    }
+
+    #[test]
+    fn settled_input_with_unconfirmed_return_is_not_reported_as_dispatch_success() {
+        let context = context();
+        context.restoration_unconfirmed.store(true, Ordering::Release);
+        let mut result = cua_driver_core::protocol::ToolResult::text("input completed")
+            .with_structured(serde_json::json!({"effect": "confirmed", "verified": true}));
+        context.project_native_result(&mut result);
+        assert_eq!(result.is_error, Some(true));
+        let detail = result.structured_content.unwrap();
+        assert_eq!(detail["code"], "foreground_restore_unconfirmed");
+        assert_eq!(detail["effect"], "unverifiable");
+        assert_eq!(detail["retryable"], false);
+        assert_eq!(
+            detail["foreground_failure"]["reason"],
+            "original_window_restoration_unconfirmed"
+        );
+        assert!(detail.get("foreground_interruption").is_none());
+        assert!(!context.interrupted.load(Ordering::Acquire));
+        assert!(!context.cleanup_unconfirmed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn restoration_diagnostic_does_not_mask_unsettled_input_or_interruption() {
+        for cleanup in [false, true] {
+            let context = context();
+            context.restoration_unconfirmed.store(true, Ordering::Release);
+            context.interrupted.store(true, Ordering::Release);
+            context.cleanup_unconfirmed.store(cleanup, Ordering::Release);
+            let mut result = cua_driver_core::protocol::ToolResult::text("input completed");
+            context.project_native_result(&mut result);
+            assert_eq!(
+                result.structured_content.unwrap()["code"],
+                if cleanup {
+                    "native_cleanup_unconfirmed"
+                } else {
+                    "foreground_activity_interrupted"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_restoration_preserves_the_original_action_error() {
+        let error = unconfirmed_episode_restoration::<()>(
+            Err(anyhow::anyhow!("original input failure")),
+            "original window unavailable",
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(chain.contains("foreground_restore_unconfirmed"));
+        assert!(chain.contains("original input failure"));
     }
 
     #[test]
@@ -2166,6 +2320,7 @@ mod episode_lifecycle_tests {
             interrupted: AtomicBool::new(false),
             interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
+            restoration_unconfirmed: AtomicBool::new(false),
             session_id: None,
             runtime_scope: Some("unit-runtime".into()),
             foreground_admission: None,
@@ -2185,6 +2340,7 @@ mod episode_lifecycle_tests {
             interrupted: AtomicBool::new(false),
             interruption_cause: Mutex::new(None),
             cleanup_unconfirmed: AtomicBool::new(false),
+            restoration_unconfirmed: AtomicBool::new(false),
             session_id: Some("unit-session".into()),
             runtime_scope: None,
             foreground_admission: None,
