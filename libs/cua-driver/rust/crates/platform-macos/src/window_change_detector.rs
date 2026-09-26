@@ -84,6 +84,7 @@ pub struct Snapshot {
     hold_targeted_lease_until_deadline: bool,
     suppression_scope: SuppressionScope,
     ordering: Option<Arc<Mutex<crate::background_order::BackgroundOrderGuard>>>,
+    ordering_trace: Option<crate::order_diagnostics::Trace>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,6 +280,7 @@ impl WindowChangeDetector {
             _ => None,
         };
         let visible = windows::visible_windows_with_space_snapshot();
+        let mut ordering_trace = None;
         let ordering = match (suppression_scope, lease.as_ref().and_then(SuppressionLease::targeted_deadline)) {
             (SuppressionScope::Target(pid), Some(deadline)) => {
                 // Input can create a document just as an explicit file-open
@@ -289,6 +291,7 @@ impl WindowChangeDetector {
                 let complete = windows::all_windows_including_accessory_layers_with_snapshot();
                 crate::background_order::BackgroundOrderGuard::capture_before_input(pid, target_start, &complete, &visible).map(|mut guard| {
                     guard.limit_deadline(deadline);
+                    ordering_trace = Some(guard.diagnostic_trace());
                     Arc::new(Mutex::new(guard))
                 })
             },
@@ -299,8 +302,8 @@ impl WindowChangeDetector {
         // The lease owns cancellation, deadline and one polling task throughout.
         if let (Some(lease), Some(ordering)) = (lease.as_mut(), ordering.as_ref()) {
             let ordering = Arc::clone(ordering);
-            lease.start_polling(move |deadline| {
-                ordering.lock().map(|mut guard| guard.poll(deadline)).unwrap_or(false)
+            lease.start_polling(move |deadline, diagnostics| {
+                ordering.lock().map(|mut guard| guard.poll(deadline, diagnostics)).unwrap_or(false)
             });
         }
         let window_ids: HashSet<u32> = visible.windows
@@ -318,11 +321,16 @@ impl WindowChangeDetector {
             hold_targeted_lease_until_deadline,
             suppression_scope,
             ordering,
+            ordering_trace,
         }
     }
 }
 
 impl Snapshot {
+    pub(crate) fn diagnostic_trace(&self) -> Option<crate::order_diagnostics::Trace> {
+        self.ordering_trace
+    }
+
     /// Frontmost pid at snapshot time, if any.
     pub fn front_pid(&self) -> Option<i32> {
         self.front_pid
@@ -377,8 +385,8 @@ impl Snapshot {
             let ordering = snapshot.ordering.take();
             if let Some(lease) = lease {
                 if let Some(ordering) = ordering {
-                    lease.defer_release_with_poll(protection_deadline, move |deadline| {
-                        ordering.lock().map(|mut guard| guard.poll(deadline)).unwrap_or(false)
+                    lease.defer_release_with_poll(protection_deadline, move |deadline, diagnostics| {
+                        ordering.lock().map(|mut guard| guard.poll(deadline, diagnostics)).unwrap_or(false)
                     });
                 } else {
                     lease.defer_release(protection_deadline);
@@ -408,6 +416,7 @@ impl Snapshot {
     ) -> Changes {
         let deadline = Instant::now() + timeout;
         let mut first_change = None;
+        let mut diagnostic_source = crate::order_diagnostics::CheckSource::ImmediateReport;
         loop {
             // The action has completed before entering this loop. Inspect and
             // restore an already-raised background window immediately; wait
@@ -419,7 +428,7 @@ impl Snapshot {
             let current_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
             if let Some(ordering) = self.ordering.as_ref() {
                 if let Ok(mut guard) = ordering.lock() {
-                    guard.restore_if_crossed(&current);
+                    guard.restore_if_crossed(&current, diagnostic_source);
                 }
             }
 
@@ -472,6 +481,7 @@ impl Snapshot {
                 return first_change.unwrap_or_else(Changes::no_change);
             }
             wait(poll_interval);
+            diagnostic_source = crate::order_diagnostics::CheckSource::ReportPoll;
         }
     }
 
@@ -557,6 +567,7 @@ mod tests {
             _lease: None,
             hold_targeted_lease_until_deadline: false,
             suppression_scope: SuppressionScope::Target(-2),
+            ordering_trace: None,
             ordering: Some(Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(
                 Arc::clone(&checks),
             )))),
@@ -577,6 +588,7 @@ mod tests {
             _lease: None,
             hold_targeted_lease_until_deadline: false,
             suppression_scope: SuppressionScope::Target(-2),
+            ordering_trace: None,
             ordering: Some(Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(
                 Arc::clone(&checks),
             )))),

@@ -311,7 +311,7 @@ impl Tool for LaunchAppTool {
                         // Never transfer a prior process's window evidence to
                         // a replacement instance returned by LaunchServices.
                         if expected_pid == *pid {
-                            targeted_lease.start_polling(move |deadline| ordering.poll(deadline));
+                            targeted_lease.start_polling(move |deadline, diagnostics| ordering.poll(deadline, diagnostics));
                         }
                     }
                     // Cold launches and file/argument delivery get a bounded

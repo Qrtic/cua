@@ -1019,6 +1019,7 @@ impl Tool for ClickTool {
             } else {
                 WindowChangeDetector::snapshot_targeted(prior_front, pid)
             };
+            let order_trace = snapshot.diagnostic_trace().unwrap_or_else(crate::order_diagnostics::Trace::new);
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -1080,6 +1081,7 @@ impl Tool for ClickTool {
                                     &selection_modifiers,
                                     foreground,
                                     !async_click_feedback,
+                                    order_trace,
                                 )?);
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
@@ -1137,6 +1139,7 @@ impl Tool for ClickTool {
                                 &selection_modifiers,
                                 false,
                                 !async_click_feedback,
+                                order_trace,
                             )
                             .map(|outcome| (outcome, false))
                         }
@@ -2278,6 +2281,7 @@ fn perform_ax_click(
     modifiers: &[String],
     foreground: bool,
     emit_click_pulse: bool,
+    order_trace: crate::order_diagnostics::Trace,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
@@ -2430,7 +2434,9 @@ fn perform_ax_click(
     }
 
     crate::foreground_activity::check_request()?;
-    let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
+    let err = order_trace.measure(crate::order_diagnostics::Phase::AxDispatch, None, || unsafe {
+        crate::ax::bindings::perform_action(element, ax_action)
+    });
     check_ax_action_response(err)?;
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Preserve the existing selection path for other dispatch errors, but
@@ -2514,7 +2520,9 @@ fn perform_ax_click(
     let needs_text_input_settle = needs_text_input_focus_settle(&role, ax_action);
 
     // Show focus-rect highlight around the element (matches Swift showFocusRect).
-    if let Some(rect) = unsafe { element_screen_rect(element) } {
+    if let Some(rect) = order_trace.measure(crate::order_diagnostics::Phase::CosmeticGeometry, None, || unsafe {
+        element_screen_rect(element)
+    }) {
         crate::cursor::overlay::send_command(
             cursor_key.to_owned(),
             cursor_overlay::OverlayCommand::ShowFocusRect(Some(rect)),

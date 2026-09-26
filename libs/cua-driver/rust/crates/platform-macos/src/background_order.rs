@@ -22,6 +22,7 @@ use cua_driver_core::foreground_activity::OrderingSnapshot;
 
 use crate::ax::bindings::{self as ax, AXUIElementRef};
 use crate::windows::{WindowBounds, WindowEnumeration, WindowInfo};
+use crate::order_diagnostics::{CheckSource, Phase, PollDiagnostics, Trace};
 
 const MAX_AGE: Duration = Duration::from_secs(5);
 const AX_TIMEOUT: f32 = 0.1;
@@ -178,6 +179,7 @@ pub(crate) struct BackgroundOrderGuard {
     started: Instant,
     expires_at: Instant,
     attempted: bool,
+    trace: Trace,
     #[cfg(test)]
     observed_checks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -242,11 +244,13 @@ impl BackgroundOrderGuard {
         let result = Self { pid, window, target_pid, candidates, new_windows,
             generation: activity.activity.generation, non_motion_generation: activity.non_motion_generation,
             started, expires_at: started + MAX_AGE, attempted: false,
+            trace: Trace::new(),
             #[cfg(test)]
             observed_checks: None,
         };
         if !result.current() { return None; }
         tracing::debug!(target: "cua_window_order", pid, window, target_pid,
+            order_trace_id=result.trace.id(),
             candidates=result.candidates.len(), protect_new_documents=result.new_windows.is_some(),
             "Captured background window-order protection");
         Some(result)
@@ -259,6 +263,7 @@ impl BackgroundOrderGuard {
         // path without authorizing any accessibility mutation on the desktop.
         Self { pid: -1, window: 0, target_pid: -2, candidates: HashSet::new(), new_windows: None,
             generation: 0, non_motion_generation: 0, started, expires_at: started + MAX_AGE, attempted: false,
+            trace: Trace::new(),
             observed_checks: Some(checks) }
     }
 
@@ -266,15 +271,19 @@ impl BackgroundOrderGuard {
         self.expires_at = self.expires_at.min(deadline);
     }
 
+    pub(crate) fn diagnostic_trace(&self) -> Trace { self.trace }
+
     /// AppKit may raise its document during a blocking AX call or after the
     /// action returns. Check only within the owning suppression lease; neither
     /// this guard nor its polling callback creates or extends that lease.
-    pub(crate) fn poll(&mut self, deadline: Instant) -> bool {
+    pub(crate) fn poll(&mut self, deadline: Instant, diagnostics: PollDiagnostics) -> bool {
+        self.trace.record_poll(diagnostics);
+        let _timing = self.trace.span(Phase::OrderingPoll, Some(diagnostics.source));
         self.limit_deadline(deadline);
         if self.attempted || Instant::now() >= self.expires_at { return false; }
         let latest = crate::windows::visible_windows_with_space_snapshot();
         if !latest.succeeded { return false; }
-        self.restore_if_crossed(&latest.windows);
+        self.restore_if_crossed(&latest.windows, diagnostics.source);
         !self.attempted
     }
 
@@ -289,6 +298,7 @@ impl BackgroundOrderGuard {
         }) { return None; }
         if Instant::now() >= self.expires_at {
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
+                order_trace_id=self.trace.id(),
                 target_pid=self.target_pid, "Window ordering guard deadline expired");
             return None;
         }
@@ -303,6 +313,7 @@ impl BackgroundOrderGuard {
             // is not proof of human input, and a second observation must not
             // replace the generation or window identity used for admission.
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
+                order_trace_id=self.trace.id(),
                 target_pid=self.target_pid, monitor_reliable=activity.activity.reliable,
                 original_generation=self.generation, current_generation=activity.activity.generation,
                 original_non_motion_generation=self.non_motion_generation,
@@ -317,7 +328,8 @@ impl BackgroundOrderGuard {
 
     /// One cleanup attempt at most. Unlike focus restoration this must never
     /// activate an app or select a different window: a changed focus vetoes it.
-    pub(crate) fn restore_if_crossed(&mut self, windows: &[WindowInfo]) {
+    pub(crate) fn restore_if_crossed(&mut self, windows: &[WindowInfo], source: CheckSource) {
+        let _timing = self.trace.span(Phase::OrderingCheck, Some(source));
         #[cfg(test)]
         if let Some(checks) = &self.observed_checks {
             checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -342,6 +354,7 @@ impl BackgroundOrderGuard {
         self.attempted = true;
         if !self.current() {
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
+                order_trace_id=self.trace.id(), check_source=source.label(),
                 "Window ordering restore skipped after context or activity changed");
             return;
         }
@@ -363,8 +376,11 @@ impl BackgroundOrderGuard {
             return;
         }
         let Some(admission) = self.current_evidence() else { return; };
-        let status = unsafe { ax::perform_action(window.0, "AXRaise") };
+        let status = self.trace.measure(Phase::OrderingRaise, Some(source), || unsafe {
+            ax::perform_action(window.0, "AXRaise")
+        });
         tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
+            order_trace_id=self.trace.id(), check_source=source.label(),
             target_pid=self.target_pid, ax_status=status,
             original_generation=self.generation, current_generation=admission.activity.generation,
             original_non_motion_generation=self.non_motion_generation,
@@ -403,7 +419,12 @@ mod tests {
         guard.limit_deadline(original);
         assert_eq!(guard.expires_at, expired);
         assert!(!guard.current());
-        assert!(!guard.poll(original));
+        assert!(!guard.poll(original, PollDiagnostics {
+            source: CheckSource::ActivePoll,
+            timing: crate::order_diagnostics::PollTiming {
+                wait_started: expired, scheduled_wake: expired, woke: expired,
+            },
+        }));
     }
 
     #[test]

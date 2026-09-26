@@ -310,7 +310,7 @@ impl SuppressionLease {
     /// not stop a spawn_blocking callback which had already begun.
     pub(crate) fn start_polling(
         &mut self,
-        mut poll: impl FnMut(Instant) -> bool + Send + 'static,
+        mut poll: impl FnMut(Instant, crate::order_diagnostics::PollDiagnostics) -> bool + Send + 'static,
     ) -> bool {
         if self.poll_task.is_some() { return false; }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else { return false };
@@ -324,12 +324,21 @@ impl SuppressionLease {
             "Started ordering protection during the active action");
         self.poll_task = Some(runtime.spawn(async move {
             loop {
-                let next = (Instant::now() + Duration::from_millis(100)).min(deadline);
+                let wait_started = Instant::now();
+                let next = (wait_started + Duration::from_millis(100)).min(deadline);
                 tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
                 if Instant::now() >= deadline { break; }
+                let timing = crate::order_diagnostics::PollTiming {
+                    wait_started, scheduled_wake: next, woke: Instant::now(),
+                };
                 let result = tokio::task::spawn_blocking(move || {
-                    let keep_polling = dispatcher.with_current_targeted(handle, |current_deadline| {
-                        (poll(current_deadline), current_deadline)
+                    let keep_polling = dispatcher.with_current_targeted_state(handle, |current_deadline, returned_tail| {
+                        let source = if returned_tail {
+                            crate::order_diagnostics::CheckSource::DeferredPoll
+                        } else {
+                            crate::order_diagnostics::CheckSource::ActivePoll
+                        };
+                        (poll(current_deadline, crate::order_diagnostics::PollDiagnostics { source, timing }), current_deadline)
                     });
                     (dispatcher, poll, keep_polling)
                 }).await;
@@ -352,7 +361,7 @@ impl SuppressionLease {
     pub(crate) fn defer_release_with_poll(
         mut self,
         deadline: Instant,
-        poll: impl FnMut(Instant) -> bool + Send + 'static,
+        poll: impl FnMut(Instant, crate::order_diagnostics::PollDiagnostics) -> bool + Send + 'static,
     ) {
         self.start_polling(poll);
         self.defer_release(deadline);
@@ -388,12 +397,16 @@ pub(crate) struct Dispatcher {
 
 impl Dispatcher {
     fn with_current_targeted<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant) -> T) -> Option<T> {
+        self.with_current_targeted_state(handle, |deadline, _| poll(deadline))
+    }
+
+    fn with_current_targeted_state<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant, bool) -> T) -> Option<T> {
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(&handle.0)?;
         if entry.target_pid.is_none() || entry.deadline <= Instant::now() {
             return None;
         }
-        Some(poll(entry.deadline))
+        Some(poll(entry.deadline, entry.returned_tail))
     }
 
     fn attach_activity_restore(&self, handle: SuppressionHandle, pid: i32) {
@@ -1635,7 +1648,7 @@ mod tests {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut sender = Some(sender);
         private_lease(&d, h).defer_release_with_poll(
-            Instant::now() + Duration::from_secs(3), move |_| {
+            Instant::now() + Duration::from_secs(3), move |_, _diagnostics| {
                 assert!(dispatcher.entries.try_lock().is_err(), "poll must serialize with cancellation");
                 let count = called.fetch_add(1, Ordering::SeqCst) + 1;
                 if count < 3 { return true; }
@@ -1658,7 +1671,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let submitted = Arc::clone(&calls);
         private_lease(&d, h).defer_release_with_poll(
-            Instant::now() + Duration::from_secs(1), move |_| {
+            Instant::now() + Duration::from_secs(1), move |_, _diagnostics| {
                 submitted.fetch_add(1, Ordering::SeqCst);
                 true
             });
@@ -1690,11 +1703,17 @@ mod tests {
         let (third_tx, third_rx) = tokio::sync::oneshot::channel();
         let mut first_tx = Some(first_tx);
         let mut third_tx = Some(third_tx);
-        assert!(lease.start_polling(move |observed_deadline| {
+        assert!(lease.start_polling(move |observed_deadline, diagnostics| {
             assert_eq!(observed_deadline, deadline);
             match submitted.fetch_add(1, Ordering::SeqCst) + 1 {
-                1 => { first_tx.take().unwrap().send(()).unwrap(); },
-                3 => { third_tx.take().unwrap().send(()).unwrap(); return false; },
+                1 => {
+                    assert_eq!(diagnostics.source, crate::order_diagnostics::CheckSource::ActivePoll);
+                    first_tx.take().unwrap().send(()).unwrap();
+                },
+                3 => {
+                    assert_eq!(diagnostics.source, crate::order_diagnostics::CheckSource::DeferredPoll);
+                    third_tx.take().unwrap().send(()).unwrap(); return false;
+                },
                 _ => {},
             }
             true
@@ -1702,7 +1721,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), first_rx).await.unwrap().unwrap();
         assert!(!d.entries.lock().unwrap()[&h.0].returned_tail,
             "the first ordering check must precede the response handoff");
-        lease.defer_release_with_poll(deadline + Duration::from_secs(30), |_| {
+        lease.defer_release_with_poll(deadline + Duration::from_secs(30), |_, _| {
             panic!("handoff must not replace or duplicate the existing guard")
         });
         tokio::time::timeout(Duration::from_secs(2), third_rx).await.unwrap().unwrap();
@@ -1710,6 +1729,20 @@ mod tests {
         assert_eq!(d.entries.lock().unwrap()[&h.0].deadline, deadline);
         assert!(d.entries.lock().unwrap()[&h.0].returned_tail);
         d.cancel_deferred(42);
+    }
+
+    #[test]
+    fn diagnostic_poll_state_tracks_handoff_without_extending_authority() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.diagnostic_handoff");
+        let deadline = d.entries.lock().unwrap()[&h.0].deadline;
+        assert_eq!(d.with_current_targeted_state(h, |deadline, tail| (deadline, tail)),
+            Some((deadline, false)));
+        assert_eq!(d.mark_deferred(h, deadline + Duration::from_secs(30)), Some(deadline));
+        assert_eq!(d.with_current_targeted_state(h, |deadline, tail| (deadline, tail)),
+            Some((deadline, true)));
+        d.cancel_deferred(42);
+        assert_eq!(d.with_current_targeted_state(h, |_, _| panic!("cancelled lease")), None::<()>);
     }
 
     #[tokio::test]
@@ -1720,7 +1753,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let submitted = Arc::clone(&calls);
         let mut lease = private_lease(&d, h);
-        assert!(lease.start_polling(move |_| {
+        assert!(lease.start_polling(move |_, _diagnostics| {
             submitted.fetch_add(1, Ordering::SeqCst);
             true
         }));
@@ -1739,7 +1772,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut entered_tx = Some(entered_tx);
         let dispatcher = Arc::clone(&d);
-        assert!(lease.start_polling(move |_| {
+        assert!(lease.start_polling(move |_, _diagnostics| {
             assert!(dispatcher.entries.try_lock().is_err());
             entered_tx.take().unwrap().send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1767,7 +1800,7 @@ mod tests {
         d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline =
             Instant::now() + Duration::from_millis(20);
         let mut lease = private_lease(&d, h);
-        assert!(lease.start_polling(|_| panic!("first poll would exceed original deadline")));
+        assert!(lease.start_polling(|_, _| panic!("first poll would exceed original deadline")));
         tokio::time::sleep(Duration::from_millis(130)).await;
         assert!(lease.poll_task.as_ref().unwrap().is_finished());
         assert!(lease.targeted_deadline().is_none());
@@ -1780,7 +1813,7 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.active_no_runtime");
         let mut lease = private_lease(&d, h);
-        assert!(!lease.start_polling(|_| panic!("no runtime")));
+        assert!(!lease.start_polling(|_, _| panic!("no runtime")));
         assert_eq!(d.len(), 1);
         assert!(!d.entries.lock().unwrap()[&h.0].returned_tail);
         drop(lease);
