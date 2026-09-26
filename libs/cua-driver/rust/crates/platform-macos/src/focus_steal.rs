@@ -73,6 +73,12 @@ pub(crate) const ENTRY_DEADLINE: Duration = Duration::from_secs(5);
 /// dispatcher is non-empty and prunes expired entries.
 const JANITOR_TICK: Duration = Duration::from_secs(1);
 
+// The activation notification can overtake NSWorkspace.frontmostApplication.
+// Recheck that specific notification briefly; never turn it into a renewable
+// focus lock or a new suppression entry.
+const ACTIVATION_RECHECK_INTERVAL: Duration = Duration::from_millis(25);
+const ACTIVATION_RECHECK_LIMIT: usize = 10;
+
 /// Identifier for a suppression. `with_suppression` and `begin_suppression`
 /// hand one of these back; `end_suppression` consumes it.
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -113,6 +119,13 @@ struct RestoreCandidate {
     handle: SuppressionHandle,
     activated_pid: i32,
     restore_to: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationRecheck {
+    Waiting,
+    Ready,
+    Revoked,
 }
 
 /// Singleton focus-steal preventer.
@@ -589,6 +602,54 @@ impl Dispatcher {
             .collect()
     }
 
+    fn early_activation_candidates(
+        &self,
+        activated_pid: i32,
+        current_front: Option<i32>,
+    ) -> Vec<RestoreCandidate> {
+        let entries = self.entries.lock().unwrap();
+        let now = Instant::now();
+        entries.iter().filter_map(|(id, entry)| {
+            // Only a known target and the exact prior foreground may wait.
+            // Unknown/newer foreground, wildcard launch scopes and intentional
+            // activations do not acquire delayed restoration authority.
+            (entry.deadline > now
+                && entry.target_pid == Some(activated_pid)
+                && entry.allowed_pid != Some(activated_pid)
+                && entry.restore_to != activated_pid
+                && current_front == Some(entry.restore_to))
+                .then_some(RestoreCandidate {
+                    handle: SuppressionHandle(*id),
+                    activated_pid,
+                    restore_to: entry.restore_to,
+                })
+        }).collect()
+    }
+
+    fn recheck_activation_candidate(
+        &self,
+        candidate: RestoreCandidate,
+        current_front: Option<i32>,
+    ) -> ActivationRecheck {
+        let entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get(&candidate.handle.0) else {
+            return ActivationRecheck::Revoked;
+        };
+        if entry.deadline <= Instant::now()
+            || entry.target_pid != Some(candidate.activated_pid)
+            || entry.allowed_pid == Some(candidate.activated_pid)
+            || entry.restore_to != candidate.restore_to
+            || entry.restore_to == candidate.activated_pid
+        {
+            return ActivationRecheck::Revoked;
+        }
+        match current_front {
+            Some(pid) if pid == candidate.activated_pid => ActivationRecheck::Ready,
+            Some(pid) if pid == candidate.restore_to => ActivationRecheck::Waiting,
+            _ => ActivationRecheck::Revoked,
+        }
+    }
+
     fn submit_restore_if_current(
         &self,
         candidate: RestoreCandidate,
@@ -786,7 +847,23 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let current_front = crate::apps::frontmost_pid();
+    reconcile_activation(
+        dispatcher,
+        activated_pid,
+        crate::apps::frontmost_pid,
+        std::thread::sleep,
+        |candidate| restore_activation_candidate(dispatcher, candidate),
+    );
+}
+
+fn reconcile_activation(
+    dispatcher: &Arc<Dispatcher>,
+    activated_pid: i32,
+    mut read_front: impl FnMut() -> Option<i32>,
+    mut pause: impl FnMut(Duration),
+    mut restore: impl FnMut(RestoreCandidate),
+) {
+    let current_front = read_front();
     let entry_count = dispatcher.len();
     let candidates = dispatcher.snapshot_restore_candidates(activated_pid, current_front);
     if entry_count > 0 {
@@ -795,29 +872,62 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
             "Received activation during restoration protection");
     }
     for candidate in candidates {
-        // Notification delivery and restoration are asynchronous. If another
-        // application is already frontmost, the user (or an unrelated system
-        // event) won the race; restoring the stale pid would steal focus from
-        // that newer foreground. Compare immediately before each restore and
-        // fail safe by leaving the newer foreground alone.
-        let evidence = dispatcher
-            .entries
-            .lock()
-            .unwrap()
-            .get(&candidate.handle.0)
-            .and_then(|entry| entry.activity_restore);
-        if let Some(evidence) = evidence {
-            let admitted = dispatcher.submit_restore_if_current(candidate, crate::apps::frontmost_pid, |pid| {
-                crate::foreground_activity::restore_background_focus(evidence, pid)
-            });
-            tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
-                activated_pid, restore_pid = candidate.restore_to, admitted,
-                "Evaluated activation restoration candidate");
-        } else {
-            tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
-                activated_pid, restore_pid = candidate.restore_to,
-                "Activation candidate has no current restoration evidence");
-        }
+        restore(candidate);
+    }
+
+    // A stale notification and an early notification can both disagree with
+    // the first foreground query. Retain only the original matching targeted
+    // entries while that query still reports their prior foreground. A newer
+    // application or unavailable identity ends the recheck immediately.
+    let mut pending = dispatcher.early_activation_candidates(activated_pid, current_front);
+    if pending.is_empty() { return; }
+    tracing::debug!(target: "cua_focus_restore", activated_pid,
+        pending_count=pending.len(), "Rechecking activation notification ahead of foreground state");
+    let until = Instant::now() + ACTIVATION_RECHECK_INTERVAL * ACTIVATION_RECHECK_LIMIT as u32;
+    for _ in 0..ACTIVATION_RECHECK_LIMIT {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if pending.is_empty() || remaining.is_zero() { break; }
+        pause(ACTIVATION_RECHECK_INTERVAL.min(remaining));
+        if Instant::now() >= until { break; }
+        let current_front = read_front();
+        pending.retain(|candidate| match dispatcher.recheck_activation_candidate(*candidate, current_front) {
+            ActivationRecheck::Waiting => true,
+            ActivationRecheck::Ready => {
+                // Submission still revalidates this exact entry, foreground,
+                // original activity generation and prior window ownership.
+                // A refused submission is never replayed by this recheck.
+                restore(*candidate);
+                false
+            }
+            ActivationRecheck::Revoked => false,
+        });
+    }
+}
+
+fn restore_activation_candidate(dispatcher: &Arc<Dispatcher>, candidate: RestoreCandidate) {
+    let activated_pid = candidate.activated_pid;
+    // Notification delivery and restoration are asynchronous. If another
+    // application is already frontmost, the user (or an unrelated system
+    // event) won the race; restoring the stale pid would steal focus from
+    // that newer foreground. Compare immediately before each restore and
+    // fail safe by leaving the newer foreground alone.
+    let evidence = dispatcher
+        .entries
+        .lock()
+        .unwrap()
+        .get(&candidate.handle.0)
+        .and_then(|entry| entry.activity_restore);
+    if let Some(evidence) = evidence {
+        let admitted = dispatcher.submit_restore_if_current(candidate, crate::apps::frontmost_pid, |pid| {
+            crate::foreground_activity::restore_background_focus(evidence, pid)
+        });
+        tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
+            activated_pid, restore_pid = candidate.restore_to, admitted,
+            "Evaluated activation restoration candidate");
+    } else {
+        tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
+            activated_pid, restore_pid = candidate.restore_to,
+            "Activation candidate has no current restoration evidence");
     }
 }
 
@@ -909,6 +1019,109 @@ mod tests {
         assert!(should_restore_after_activation(Some(42), 42));
         assert!(!should_restore_after_activation(Some(99), 42));
         assert!(!should_restore_after_activation(None, 42));
+    }
+
+    #[test]
+    fn early_notification_is_rechecked_before_target_focus_settles() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.early_activation");
+        let original_deadline = d.entries.lock().unwrap()[&handle.0].deadline;
+        let mut reads = [Some(7), Some(7), Some(42)].into_iter();
+        let mut submitted = Vec::new();
+        reconcile_activation(&d, 42, || reads.next().expect("bounded recheck"), |_| {}, |candidate| {
+            assert_eq!(candidate.handle, handle);
+            d.submit_restore_if_current(candidate, || Some(42), |pid| submitted.push(pid));
+        });
+        assert_eq!(submitted, vec![7], "an early notification must not strand the target in front");
+        assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, original_deadline);
+    }
+
+    #[test]
+    fn early_activation_recheck_preserves_newer_or_unknown_foreground() {
+        for newer in [Some(99), None] {
+            let d = Arc::new(Dispatcher::new());
+            let _handle = d.add(Some(42), 7, "test.early_newer_front");
+            let mut reads = [Some(7), newer].into_iter();
+            let mut pauses = 0;
+            reconcile_activation(&d, 42, || reads.next().expect("stop after newer foreground"),
+                |_| pauses += 1, |_| panic!("newer foreground must be preserved"));
+            assert_eq!(pauses, 1);
+        }
+    }
+
+    #[test]
+    fn early_activation_recheck_cannot_adopt_a_replacement_lease() {
+        let d = Arc::new(Dispatcher::new());
+        let old = d.add(Some(42), 7, "test.early_old");
+        d.mark_deferred(old, Instant::now() + Duration::from_secs(1));
+        let mut replacement = None;
+        let mut reads = [Some(7), Some(42)].into_iter();
+        reconcile_activation(&d, 42, || reads.next().expect("cancelled notification"), |_| {
+            d.cancel_deferred(42);
+            replacement = Some(d.add(Some(42), 7, "test.early_new"));
+        }, |_| panic!("a new lease must not inherit an old notification"));
+        assert!(!d.entries.lock().unwrap().contains_key(&old.0));
+        assert!(d.entries.lock().unwrap().contains_key(&replacement.unwrap().0));
+    }
+
+    #[test]
+    fn early_activation_recheck_cannot_extend_an_expired_entry() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.early_expires");
+        let mut reads = [Some(7), Some(42)].into_iter();
+        reconcile_activation(&d, 42, || reads.next().expect("expired notification"), |_| {
+            d.entries.lock().unwrap().get_mut(&handle.0).unwrap().deadline = Instant::now();
+        }, |_| panic!("expired authority must not be renewed"));
+    }
+
+    #[test]
+    fn early_activation_recheck_uses_original_target_and_restore_destination() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.early_anchor");
+        let pending = d.early_activation_candidates(42, Some(7))[0];
+        assert_eq!(d.recheck_activation_candidate(pending, Some(7)), ActivationRecheck::Waiting);
+        assert!(d.snapshot_restore_candidates(99, Some(99)).is_empty());
+        assert_eq!(d.recheck_activation_candidate(pending, Some(42)), ActivationRecheck::Revoked);
+        let fresh = d.early_activation_candidates(42, Some(99))[0];
+        d.entries.lock().unwrap().get_mut(&handle.0).unwrap().target_pid = Some(123);
+        assert_eq!(d.recheck_activation_candidate(fresh, Some(42)), ActivationRecheck::Revoked);
+    }
+
+    #[test]
+    fn early_activation_recheck_does_not_expand_wildcard_or_foreground_scopes() {
+        for target in [None, Some(7), Some(99)] {
+            let d = Arc::new(Dispatcher::new());
+            let _handle = d.add(target, 7, "test.early_scope");
+            reconcile_activation(&d, 42, || Some(7), |_| panic!("no matching target scope"),
+                |_| panic!("no matching target scope"));
+        }
+        let d = Arc::new(Dispatcher::new());
+        let _allowed = d.add_allowing(42, 7, "test.early_allowed");
+        reconcile_activation(&d, 42, || Some(7), |_| panic!("intentional activation"),
+            |_| panic!("intentional activation"));
+    }
+
+    #[test]
+    fn early_activation_recheck_is_bounded_and_does_not_restore_an_unchanged_front() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.early_no_activation");
+        let deadline = d.entries.lock().unwrap()[&handle.0].deadline;
+        let mut pauses = Vec::new();
+        reconcile_activation(&d, 42, || Some(7), |duration| pauses.push(duration),
+            |_| panic!("no target activation occurred"));
+        assert!(!pauses.is_empty() && pauses.len() <= ACTIVATION_RECHECK_LIMIT);
+        assert!(pauses.iter().all(|&d| d <= ACTIVATION_RECHECK_INTERVAL));
+        assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, deadline);
+    }
+
+    #[test]
+    fn settled_activation_keeps_the_immediate_path() {
+        let d = Arc::new(Dispatcher::new());
+        let _handle = d.add(Some(42), 7, "test.already_settled");
+        let mut submitted = Vec::new();
+        reconcile_activation(&d, 42, || Some(42), |_| panic!("settled event must not wait"),
+            |candidate| { d.submit_restore_if_current(candidate, || Some(42), |pid| submitted.push(pid)); });
+        assert_eq!(submitted, vec![7]);
     }
 
     /// Wildcard entries (`target_pid = None`) match every activation
