@@ -47,6 +47,7 @@ pub(crate) fn guard_tool(inner: Box<dyn Tool>) -> Box<dyn Tool> {
             | "invoke_menu"
             | "launch_app"
             | "bring_to_front"
+            | "present_window"
             | "set_window_frame"
             | "get_window_state"
             | "prepare_dialog"
@@ -839,6 +840,21 @@ impl Episode {
         }
         if had_pressed_controls && result.is_ok() {
             anyhow::bail!("foreground input left held controls; owned cleanup completed");
+        }
+        result
+    }
+
+    /// Explicit presentation is a standalone user-requested handoff. Only a
+    /// verified successful presentation may retain focus; failures use the
+    /// existing guarded restoration path, and interruption never restores.
+    pub(crate) fn finish_presenting<T>(self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        if result.is_err() { return self.finish(result); }
+        if self.segment.is_some() || !PRESSED.with(|held| held.borrow().is_empty()) {
+            return self.finish(Err(anyhow::anyhow!("presentation cannot retain a segment or held input")));
+        }
+        self.check()?;
+        if !exact_target_is_frontmost(self.lease) {
+            return self.finish(Err(anyhow::anyhow!("presentation target lost exact foreground ownership")));
         }
         result
     }

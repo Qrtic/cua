@@ -1,6 +1,7 @@
 //! MCP tool implementations for macOS.
 
 mod bring_to_front;
+mod present_window;
 mod click;
 mod clipboard;
 mod double_click;
@@ -2301,6 +2302,12 @@ pub fn register_all(
         AppContextDelegationPolicy::RejectPanelTarget,
     )));
     let pid_window_candidates: WindowTargetCandidates = Arc::new(pid_window_target_candidates);
+    registry.register(crate::foreground_activity::guard_tool(pid_window_guarded(
+        present_window::PresentWindowTool::new(state.clone()),
+        &pid_window_candidates,
+        &state.app_context_delegation_registry,
+        AppContextDelegationPolicy::RejectPanelTarget,
+    )));
     registry.register(crate::foreground_activity::guard_tool(pid_window_guarded(
         bring_to_front::BringToFrontTool,
         &pid_window_candidates,

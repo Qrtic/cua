@@ -1066,6 +1066,24 @@ pub fn set_front_process_persistently(target_pid: libc::pid_t, target_wid: u32) 
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) == 0 }
 }
 
+/// Exact-window presentation does not use Cocoa activation or the
+/// kCPSUserGenerated all-window ordering path. Every native write retains the
+/// caller's original ownership, activity and deadline checks.
+pub(crate) fn present_exact_window_guarded(
+    pid: i32, window: u32, mut check: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let set_front = set_front_process_fn().ok_or_else(|| anyhow::anyhow!("exact front-process API unavailable"))?;
+    anyhow::ensure!(post_event_record_to_fn().is_some(), "exact key-window API unavailable");
+    let mut psn = [0u8; 8];
+    anyhow::ensure!(get_process_psn_for_window(window, pid, &mut psn), "exact presentation owner unavailable");
+    check_exact_activation_owner(pid, window, &mut check)?;
+    crate::focus_steal::cancel_deferred_suppression(pid);
+    check_exact_activation_owner(pid, window, &mut check)?;
+    let status = unsafe { set_front(psn.as_ptr() as *const c_void, window, 0x400) };
+    anyhow::ensure!(status == 0, "exact front-process request failed with OSStatus {status}");
+    post_exact_key_window_records_guarded(psn, window, || check_exact_activation_owner(pid, window, &mut check))
+}
+
 /// Called only by the successful bounded episode finalizer, after activity
 /// and exact original-window identity have both been revalidated.
 pub(crate) fn restore_exact_window_guarded(
