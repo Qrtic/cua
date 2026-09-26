@@ -1173,6 +1173,7 @@ impl std::error::Error for ExactActivationWindowUnavailable {}
 /// once, without ActivateAllWindows, then wait only for the exact AX window.
 /// A failed/uncertain AX write is terminal: this loop never repeats one.
 fn complete_activation_with_bounded_cocoa_request(
+    cocoa_already_requested: bool,
     mut complete: impl FnMut() -> anyhow::Result<[i32; 3]>,
     mut activate: impl FnMut() -> anyhow::Result<()>,
     mut check: impl FnMut() -> anyhow::Result<()>,
@@ -1195,7 +1196,9 @@ fn complete_activation_with_bounded_cocoa_request(
     if elapsed() >= ACTIVATION_WAIT_TIMEOUT {
         anyhow::bail!("exact AX window publication timed out before Cocoa activation");
     }
-    activate()?;
+    if !cocoa_already_requested {
+        activate()?;
+    }
     loop {
         check()?;
         if elapsed() >= ACTIVATION_WAIT_TIMEOUT {
@@ -2966,6 +2969,25 @@ fn with_foreground_hid_activation_inner(
             pip_activation = Some(crate::pip::begin_temporary_activation(
                 target_pid, target_wid, None,
             ));
+            // Decide from the pre-activation facts. SLS can put an ordered-out
+            // AppKit panel on screen without delivering its Cocoa activation;
+            // checking visibility only after SLS skips that necessary step.
+            let publication_started = std::time::Instant::now();
+            let hidden_panel = crate::windows::window_info_by_id(target_wid)
+                .is_some_and(|window| {
+                    window.layer != 0
+                        && !window.is_on_screen
+                        && cocoa_publication_target_allowed(
+                            &window,
+                            target_pid,
+                            has_exact_focused_native_panel(target_pid, target_wid),
+                        )
+                });
+            if hidden_panel {
+                request_cocoa_activation_without_all_windows(target_pid, target_wid, || {
+                    episode.check()
+                })?;
+            }
             check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
             if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) } != 0 {
                 anyhow::bail!("WindowServer rejected foreground HID activation");
@@ -2979,8 +3001,8 @@ fn with_foreground_hid_activation_inner(
             post_exact_key_window_records_guarded(target_psn, target_wid, || {
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())
             })?;
-            let publication_started = std::time::Instant::now();
             let ax_statuses = complete_activation_with_bounded_cocoa_request(
+                hidden_panel,
                 || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
                 || {
                     request_cocoa_activation_without_all_windows(target_pid, target_wid, || {
@@ -4099,6 +4121,7 @@ mod tests {
         let activations = Cell::new(0);
         let millis = Cell::new(0);
         let result = complete_activation_with_bounded_cocoa_request(
+            false,
             || {
                 reads.set(reads.get() + 1);
                 if reads.get() < 3 {
@@ -4123,8 +4146,50 @@ mod tests {
     }
 
     #[test]
+    fn foreground_panel_prepublication_does_not_reactivate_while_ax_catches_up() {
+        let reads = Cell::new(0);
+        let millis = Cell::new(0);
+        let result = complete_activation_with_bounded_cocoa_request(
+            true,
+            || {
+                reads.set(reads.get() + 1);
+                if reads.get() < 3 {
+                    Err(ExactActivationWindowUnavailable.into())
+                } else {
+                    Ok([0; 3])
+                }
+            },
+            || panic!("Cocoa publication was already requested before WindowServer activation"),
+            || Ok(()),
+            || Duration::from_millis(millis.get()),
+            || millis.set(millis.get() + 10),
+        );
+        assert_eq!(result.unwrap(), [0; 3]);
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn foreground_panel_prepublication_never_replays_an_uncertain_ax_mutation() {
+        let attempts = Cell::new(0);
+        let result = complete_activation_with_bounded_cocoa_request(
+            true,
+            || {
+                attempts.set(attempts.get() + 1);
+                anyhow::bail!("AXCannotComplete after a possible focus mutation")
+            },
+            || panic!("No second application activation after an uncertain mutation"),
+            || Ok(()),
+            || Duration::ZERO,
+            || panic!("No retry after an uncertain AX mutation"),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
     fn foreground_ax_publication_known_window_skips_cocoa() {
         let result = complete_activation_with_bounded_cocoa_request(
+            false,
             || Ok([0; 3]),
             || panic!("an available exact AX window must not activate Cocoa again"),
             || Ok(()),
@@ -4140,6 +4205,7 @@ mod tests {
             let attempts = Cell::new(0);
             let activations = Cell::new(0);
             let result = complete_activation_with_bounded_cocoa_request(
+                false,
                 || {
                     attempts.set(attempts.get() + 1);
                     if initially_missing && attempts.get() == 1 {
@@ -4168,6 +4234,7 @@ mod tests {
         let reads = Cell::new(0);
         let hid = Cell::new(false);
         let result = complete_activation_with_bounded_cocoa_request(
+            false,
             || {
                 reads.set(reads.get() + 1);
                 Err(ExactActivationWindowUnavailable.into())
@@ -4195,6 +4262,7 @@ mod tests {
         let elapsed = Cell::new(std::time::Duration::ZERO);
         let hid = Cell::new(false);
         let result = complete_activation_with_bounded_cocoa_request(
+            false,
             || Err(ExactActivationWindowUnavailable.into()),
             || {
                 activations.set(activations.get() + 1);
