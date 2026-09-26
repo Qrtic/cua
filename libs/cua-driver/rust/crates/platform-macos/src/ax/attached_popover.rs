@@ -589,6 +589,31 @@ pub(crate) unsafe fn proves_attached_popover(
     )
 }
 
+/// Capture-only variant sharing its caller's discovery deadline. Existing
+/// action callers retain the separate two-second wrapper above. AX messaging
+/// is synchronous: an already-started message may overrun this deadline by its
+/// existing 0.2s timeout; an expired proof never authorizes an attachment.
+///
+/// # Safety
+/// `element` must remain a retained, live AX reference for this read-only proof.
+pub(crate) unsafe fn proves_attached_popover_before(
+    pid: i32,
+    host_id: u32,
+    element: AXUIElementRef,
+    deadline: Instant,
+) -> bool {
+    if element.is_null() || Instant::now() >= deadline {
+        return false;
+    }
+    CFRetain(element as CFTypeRef);
+    let Some(element) = AxNode::owned(element) else {
+        return false;
+    };
+    Instant::now() < deadline
+        && prove(&NativeTree { deadline }, pid, host_id, &element)
+        && Instant::now() < deadline
+}
+
 /// Project a real hit-tested preview control, not the actionless outer tile.
 /// Only an exact displaced popover child is returned; caller must CFRelease.
 pub(crate) unsafe fn copy_virtual_popover_button(wrapper: AXUIElementRef) -> Option<AXUIElementRef> {
