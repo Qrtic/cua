@@ -464,6 +464,7 @@ impl NativeSegment {
     }
 
     fn mark_unknown(&self) {
+        poison_current_desktop_authority();
         cleanup_latch().store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.cleanup_unknown = true;
@@ -486,6 +487,7 @@ impl NativeSegment {
         } else {
             if inner.policy.finish_cleanup(Cleanup::Confirmed).is_err() {
                 inner.cleanup_unknown = true;
+                poison_current_desktop_authority();
                 cleanup_latch().store(true, Ordering::Release);
                 return;
             }
@@ -1588,6 +1590,8 @@ pub(crate) async fn end_segment(args: Value) -> ToolResult {
         background_leases: Mutex::new(Vec::new()),
         transport_owner: Some(Arc::clone(&segment.owner)),
         segment_call: None,
+        desktop: None,
+        _desktop_authority: cua_driver_core::desktop_authority::current(),
         workers: AtomicUsize::new(0),
         invocation_done: AtomicBool::new(false),
     });
@@ -1951,6 +1955,8 @@ mod tests {
             background_leases: Mutex::new(Vec::new()),
             transport_owner: None,
             segment_call: Some(call),
+            desktop: None,
+            _desktop_authority: None,
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         })

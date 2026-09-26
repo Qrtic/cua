@@ -96,9 +96,9 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
-    static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
+#[cfg(test)]
+fn desktop_action_coordinator() -> &'static Arc<tokio::sync::Mutex<()>> {
+    crate::desktop_authority::coordinator()
 }
 
 fn active_text_input_pids() -> &'static Mutex<HashSet<i64>> {
@@ -1513,7 +1513,8 @@ impl ToolRegistry {
             None
         };
         let start_ms = now_ms();
-        let cursor_event = crate::cursor_events::begin_tool(resolved_name, &args);
+        let cursor_event = if resolved_name == "get_desktop_state" { None }
+            else { crate::cursor_events::begin_tool(resolved_name, &args) };
         let pending_history = self.history.as_ref().and_then(|history| {
             history.begin_action(resolved_name, &public_args, runtime_session.as_deref())
         });
@@ -1526,31 +1527,22 @@ impl ToolRegistry {
                 "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let _desktop_action = if is_physical_desktop_action(resolved_name) {
-            let coordinator = desktop_action_coordinator();
-            // Avoid yielding the dispatch task when the process-wide input
-            // lane is uncontended. On Windows, that yield creates a window in
-            // which the foreground target can lose keyboard eligibility
-            // between the fixture's focus proof and SendInput. Contended
-            // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => coordinator.lock().await,
-            })
+        let _desktop_action = if needs_desktop_authority(resolved_name) {
+            match crate::desktop_authority::global().acquire(resolved_name != "get_desktop_state").await {
+                Ok(guard) => Some(guard),
+                Err(code) => return ToolResult::error("Native cleanup is unconfirmed; stop input without reconnecting or replaying")
+                    .with_structured(serde_json::json!({"code":code, "effect":"refused", "retryable":false})),
+            }
         } else {
             None
         };
-        let pip_input_passthrough = if _desktop_action.is_some() {
-            match pip_hook::begin_pip_input_passthrough() {
+        let pip_input_passthrough = match begin_input_passthrough(resolved_name, pip_hook::begin_pip_input_passthrough) {
                 Ok(guard) => guard,
                 Err(error) => {
                     return ToolResult::error(format!(
                         "PiP preview could not yield pointer input before {resolved_name}: {error}"
                     ));
                 }
-            }
-        } else {
-            None
         };
         let pending_turn = should_record
             .then(|| {
@@ -1564,7 +1556,7 @@ impl ToolRegistry {
             })
             .flatten();
 
-        let mut result = tool.invoke(args.clone()).await;
+        let mut result = crate::desktop_authority::scope(_desktop_action.clone(), tool.invoke(args.clone())).await;
         drop(pip_input_passthrough);
         // The platform worker has exited, so another text operation for this
         // pid may now start even while result projection and evidence capture
@@ -2650,6 +2642,15 @@ fn is_physical_desktop_action(tool: &str) -> bool {
     )
 }
 
+fn needs_desktop_authority(tool: &str) -> bool {
+    is_physical_desktop_action(tool)
+        || matches!(tool, "get_desktop_state" | "launch_app" | "kill_app" | "perform_secondary_action" | "invoke_menu")
+}
+
+fn begin_input_passthrough<T>(tool: &str, begin: impl FnOnce() -> Result<Option<T>, String>) -> Result<Option<T>, String> {
+    if is_physical_desktop_action(tool) { begin() } else { Ok(None) }
+}
+
 /// Resolve the exact native window target accepted by both the canonical
 /// `target:{kind:"window", ...}` envelope and the legacy flat arguments.
 /// PiP never falls back to an ambient desktop capture.
@@ -3292,8 +3293,23 @@ resources:
 
         async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
             self.hits.fetch_add(1, Ordering::SeqCst);
-            crate::protocol::ToolResult::text("private state")
-                .with_structured(serde_json::json!({"snapshot_id": 1}))
+            let state = if self.def.name == "get_desktop_state" {
+                serde_json::json!({
+                    "platform": "macos",
+                    "display": "primary",
+                    "screenshot_width": 2880,
+                    "screenshot_height": 1800,
+                    "screen_width": 1440,
+                    "screen_height": 900,
+                    "scale_factor": 2.0,
+                    "screenshot_mime_type": "image/png",
+                    "desktop_binding_version": 1,
+                    "desktop_observation_id": "synthetic-desktop-observation"
+                })
+            } else {
+                serde_json::json!({"snapshot_id": 1})
+            };
+            crate::protocol::ToolResult::text("private state").with_structured(state)
         }
     }
 
@@ -4036,6 +4052,27 @@ resources:
             .unwrap();
         assert_ne!(result.is_error, Some(true), "{result:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_waits_for_native_mutation_without_input_hooks() {
+        let guard = desktop_action_coordinator().lock().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = observation_registry_for("get_desktop_state", None, hits.clone());
+        let call = registry.invoke_with_context("get_desktop_state", serde_json::json!({}), standard_context());
+        tokio::pin!(call);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut call).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        drop(guard);
+        let result = tokio::time::timeout(Duration::from_secs(5), call).await.unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let hook = super::begin_input_passthrough::<()>("get_desktop_state", || panic!("capture entered input hook"));
+        assert!(hook.unwrap().is_none());
+        assert_eq!(super::pip_update_kind("get_desktop_state", false, false, true, true), super::PipUpdateKind::Skip);
+        for mutation in ["click", "set_value", "launch_app", "kill_app", "perform_secondary_action", "invoke_menu"] {
+            assert!(super::needs_desktop_authority(mutation), "{mutation}");
+        }
     }
 
     #[tokio::test]

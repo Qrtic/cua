@@ -19,8 +19,6 @@ use cua_driver_core::{
 };
 use serde_json::Value;
 
-use super::get_screen_size::main_screen_size;
-
 pub struct GetDesktopStateTool;
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -31,7 +29,9 @@ fn def() -> &'static ToolDef {
         description: "Capture the full display in true screen pixels with no downscale. \
             Use its native-size PNG as the coordinate source for actions whose target is \
             {kind:\"desktop\",display_id:\"primary\"}. Returns the true screen size and \
-            backing scale factor. Vision-only: no AX tree walk."
+            backing scale factor and a one-use desktop_observation_id, valid for 30 seconds \
+            under this native transport/session. Desktop input requires that fresh binding. \
+            Vision-only: no AX tree walk."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -55,7 +55,7 @@ impl Tool for GetDesktopStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let input = match parse_typed_input::<GetDesktopStateInput>("get_desktop_state", args) {
+        let input = match parse_typed_input::<GetDesktopStateInput>("get_desktop_state", args.clone()) {
             Ok(input) => input,
             Err(result) => return result,
         };
@@ -69,33 +69,44 @@ impl Tool for GetDesktopStateTool {
             }
         });
 
-        // True screen geometry (points + backing scale). Safe off the main thread.
-        let (screen_width, screen_height, scale_factor) = match main_screen_size() {
-            Some(t) => t,
-            None => return ToolResult::error("No main display detected."),
+        // Capture and bind the same stable display under native ownership. A
+        // screenshot never grants a caller-supplied process or desktop lease.
+        let capture = match crate::foreground_activity::desktop::Capture::begin(&args) {
+            Ok(capture) => capture,
+            Err(refusal) => return refusal,
         };
+        let screen_width = capture.geometry.width as u64;
+        let screen_height = capture.geometry.height as u64;
+        let scale_factor = capture.geometry.scale();
+        let _cancel_capture = capture.cancellation_guard();
 
         // Capture the FULL display at native size — no resize. Run the
         // blocking screencapture subprocess off the async runtime.
         let out_file = screenshot_out_file.clone();
         let res = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(Option<String>, Option<String>, u32, u32)> {
+            move || -> Result<(Option<String>, Option<String>, u32, u32, String), ToolResult> {
                 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-                let png = crate::capture::screenshot_display_bytes()?;
-                let (w, h) = crate::capture::png_dimensions(&png)?;
-                if let Some(ref path) = out_file {
-                    std::fs::write(path, &png)?;
-                    Ok((None, Some(path.clone()), w, h))
+                // The worker owns both capture leases through child settlement,
+                // even if this async request is cancelled and drops its handle.
+                let (png, capture) = crate::capture::desktop::capture_owned(capture)?;
+                let (w, h) = crate::capture::png_dimensions(&png)
+                    .map_err(|_| ToolResult::error("Desktop screenshot has invalid PNG geometry"))?;
+                capture.check()?;
+                let (b64, file) = if let Some(ref path) = out_file {
+                    crate::capture::desktop::write_output(std::path::Path::new(path), &png, || capture.check())?;
+                    (None, Some(path.clone()))
                 } else {
-                    Ok((Some(BASE64.encode(&png)), None, w, h))
-                }
+                    (Some(BASE64.encode(&png)), None)
+                };
+                let token = capture.finish(w, h)?;
+                Ok((b64, file, w, h, token))
             },
         )
         .await;
 
-        let (b64_opt, file_path, screenshot_width, screenshot_height) = match res {
+        let (b64_opt, file_path, screenshot_width, screenshot_height, desktop_observation_id) = match res {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return ToolResult::error(format!("Desktop screenshot failed: {e}")),
+            Ok(Err(refusal)) => return refusal,
             Err(e) => return ToolResult::error(format!("Desktop screenshot task error: {e}")),
         };
 
@@ -118,6 +129,8 @@ impl Tool for GetDesktopStateTool {
             "screen_height": screen_height,
             "scale_factor": scale_factor,
             "screenshot_mime_type": "image/png",
+            "desktop_binding_version": 1,
+            "desktop_observation_id": desktop_observation_id,
         });
         if let Some(ref fp) = file_path {
             structured["screenshot_file_path"] = serde_json::json!(fp);

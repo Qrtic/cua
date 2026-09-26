@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+pub(crate) mod desktop;
+
 /// Bounded TTL map keyed by insertion time. Std-only; used for the warm SCK
 /// window filter/config cache and unit-tested independently of ScreenCaptureKit.
 struct TimedCache<K, V> {

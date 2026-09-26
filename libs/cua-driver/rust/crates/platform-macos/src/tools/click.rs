@@ -492,37 +492,11 @@ impl Tool for ClickTool {
             };
             let sx_shot = input.x;
             let sy_shot = input.y;
-            // ── Desktop-screenshot pixels → logical screen points ──────────────
-            // The vision invariant: the pixel an agent reads off the screenshot it
-            // was handed is the pixel that gets clicked. `get_desktop_state`
-            // returns the display at NATIVE pixels (e.g. 3024×1964 on a 2× Retina
-            // display whose logical size is 1512×982), but everything below — the
-            // window-under-point hit test (logical CGWindow bounds), the cursor
-            // warp, and the CGEvent post — operates in LOGICAL screen points. So
-            // x,y arrive in desktop-SCREENSHOT space (what the agent reads off the
-            // PNG) and must be divided by the screenshot↔logical ratio, or a
-            // center-pixel pick warps to the corner (off by the backing scale).
-            //
-            // Derive the ratio the same way `get_desktop_state` reports it: native
-            // screenshot width / logical screen width. This is robust even when
-            // CGDisplayPixelsWide under-reports the backing scale (it returns the
-            // scaled-mode point width on some Retina configs → a bogus 1.0).
-            let desktop_ratio = crate::foreground_activity::spawn_blocking(|| {
-                let logical_w =
-                    super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
-                let shot_w = crate::capture::screenshot_display_bytes()
-                    .ok()
-                    .and_then(|png| crate::capture::png_dimensions(&png).ok())
-                    .map(|(w, _)| w as f64);
-                match (shot_w, logical_w) {
-                    (Some(sw), Some(lw)) if lw > 0.0 && sw > lw => sw / lw,
-                    _ => 1.0,
-                }
-            })
-            .await
-            .unwrap_or(1.0);
-            let sx = sx_shot / desktop_ratio;
-            let sy = sy_shot / desktop_ratio;
+            let (sx, sy) = match crate::foreground_activity::desktop::screenshot_point(sx_shot, sy_shot) {
+                Ok(point) => point,
+                Err(error) => return ToolResult::error(error.to_string()).with_structured(
+                    serde_json::json!({"code":"invalid_arguments", "effect":"refused"})),
+            };
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => "left",
                 ClickButton::Right => "right",
@@ -530,8 +504,8 @@ impl Tool for ClickTool {
             }
             .to_owned();
             let count = input.count.unwrap_or(1) as usize;
-            if count == 0 {
-                return ToolResult::error("click.count must be at least 1.")
+            if !(1..=3).contains(&count) {
+                return ToolResult::error("desktop click.count must be between 1 and 3.")
                     .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
             }
             // Keep decorative cursor feedback off the input critical path when
@@ -552,13 +526,11 @@ impl Tool for ClickTool {
                     // turn the foreground contract back into background delivery.
                     let modifier_refs: Vec<&str> =
                         desktop_modifiers.iter().map(String::as_str).collect();
-                    crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                        sx,
-                        sy,
-                        count,
-                        &btn,
-                        &modifier_refs,
-                    )
+                    crate::foreground_activity::desktop::run(|| {
+                        crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                            sx, sy, count, &btn, &modifier_refs,
+                        )
+                    })
                 })
                 .await;
             let button_label = match button.as_str() {

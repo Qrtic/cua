@@ -18,6 +18,7 @@ use foreign_types::ForeignType;
 use std::cell::{Cell, RefCell};
 
 mod segment;
+pub(crate) mod desktop;
 pub(crate) use segment::{
     begin_segment, end_segment, prepare_dialog, prepare_observation, stop_runtime_segments, stop_session_segments,
 };
@@ -58,6 +59,12 @@ pub(crate) fn guard_tool(inner: Box<dyn Tool>) -> Box<dyn Tool> {
             "type": "string", "minLength": 1, "maxLength": 128,
             "description": "Private native foreground segment token; requires the same canonical transport, session, runtime and exact PID/window that began it."
         });
+        if matches!(inner.def().name.as_str(), "click" | "drag" | "press_key" | "hotkey") {
+            def.input_schema["properties"]["desktop_observation_id"] = serde_json::json!({
+                "type": "string", "minLength": 1, "maxLength": 128,
+                "description": "One-use native desktop observation binding; required for explicit desktop input with the same canonical owner."
+            });
+        }
         Box::new(ActivityGuardedTool { inner, def })
     } else {
         inner
@@ -81,11 +88,19 @@ struct InvocationContext {
     background_leases: Mutex<Vec<Arc<tokio::sync::OwnedMutexGuard<()>>>>,
     transport_owner: Option<Arc<cua_driver_core::session::TransportOwner>>,
     segment_call: Option<Arc<segment::Call>>,
+    desktop: Option<desktop::Admission>,
+    _desktop_authority: Option<Arc<cua_driver_core::desktop_authority::Lease>>,
     workers: AtomicUsize,
     invocation_done: AtomicBool,
 }
 
 impl InvocationContext {
+    fn mark_cleanup_unknown(&self) {
+        self.cleanup_unconfirmed.store(true, Ordering::Release);
+        if let Some(authority) = &self._desktop_authority { authority.cleanup_unknown(); }
+        if let Some(call) = &self.segment_call { call.cleanup_unknown(); }
+    }
+
     fn mark_interrupted(&self, cause: &'static str) {
         let mut first_cause = self
             .interruption_cause
@@ -148,10 +163,16 @@ impl InvocationContext {
 
     fn check(&self) -> anyhow::Result<()> {
         self.check_liveness()?;
+        if let Some(desktop) = &self.desktop {
+            if let Err(error) = desktop.check() {
+                self.mark_interrupted("desktop_binding_changed");
+                return Err(error);
+            }
+        }
         if let Some(call) = &self.segment_call {
             if let Err(error) = call.check() {
                 if call.cleanup_is_unknown() {
-                    self.cleanup_unconfirmed.store(true, Ordering::Release);
+                    self.mark_cleanup_unknown();
                 }
                 self.mark_interrupted("segment_invalidated");
                 call.revoke();
@@ -171,6 +192,7 @@ impl InvocationContext {
         {
             if let Some(call) = &self.segment_call {
                 call.settle();
+                if call.cleanup_is_unknown() { self.mark_cleanup_unknown(); }
             }
         }
     }
@@ -380,10 +402,16 @@ fn record_interruption(cause: &'static str) {
 /// the operation's ordinary error response or automatically reconnect/replay.
 pub(crate) fn mark_native_cleanup_unconfirmed() {
     if let Some(context) = current_invocation() {
-        context.cleanup_unconfirmed.store(true, Ordering::Release);
-        if let Some(call) = &context.segment_call {
-            call.cleanup_unknown();
-        }
+        context.mark_cleanup_unknown();
+    } else {
+        poison_current_desktop_authority();
+    }
+}
+
+fn poison_current_desktop_authority() {
+    if let Some(authority) = current_invocation().and_then(|context| context._desktop_authority.clone())
+        .or_else(cua_driver_core::desktop_authority::current) {
+        authority.cleanup_unknown();
     }
 }
 
@@ -471,6 +499,17 @@ impl Tool for ActivityGuardedTool {
             .await
     }
     async fn invoke(&self, args: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
+        let desktop_requested = args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop");
+        if !desktop_requested && args.get("desktop_observation_id").is_some() {
+            return cua_driver_core::protocol::ToolResult::error("A desktop binding cannot authorize app input")
+                .with_structured(serde_json::json!({"code":"desktop_target_invalid", "effect":"refused", "retryable":false}));
+        }
+        let desktop = if desktop_requested && matches!(self.def().name.as_str(), "click" | "drag" | "press_key" | "hotkey") {
+            match desktop::admit(&args, &self.def().name) {
+                Ok(admission) => Some(admission),
+                Err(refusal) => return refusal,
+            }
+        } else { None };
         let segment_call = match segment::admit_call(&args, &self.def().name) {
             Ok(call) => call,
             Err(result) => return result,
@@ -490,11 +529,11 @@ impl Tool for ActivityGuardedTool {
             return self.inner.invoke(args).await;
         }
         let unsupported = matches!(self.def().name.as_str(), "bring_to_front" | "invoke_menu")
-            || args
+            || (desktop.is_none() && args
                 .get("scope")
                 .or_else(|| args.get("capture_scope"))
                 .and_then(serde_json::Value::as_str)
-                == Some("desktop");
+                == Some("desktop"));
         let activity = snapshot();
         if unsupported || !activity.reliable {
             if let Some(call) = &segment_call {
@@ -507,7 +546,7 @@ impl Tool for ActivityGuardedTool {
                 "Native activity coverage or a bounded foreground episode is unavailable; no input was dispatched.",
             );
         }
-        let foreground = crate::tools::DeliveryMode::parse(
+        let foreground = desktop.is_some() || crate::tools::DeliveryMode::parse(
             args.get("delivery_mode")
                 .and_then(serde_json::Value::as_str),
         )
@@ -521,7 +560,7 @@ impl Tool for ActivityGuardedTool {
             .get("_transport_session_id")
             .and_then(serde_json::Value::as_str)
             .and_then(cua_driver_core::session::current_transport_owner_for);
-        let foreground_pid = if foreground {
+        let foreground_pid = if foreground && desktop.is_none() {
             let pid = args
                 .get("pid")
                 .and_then(serde_json::Value::as_i64)
@@ -552,7 +591,9 @@ impl Tool for ActivityGuardedTool {
         } else {
             None
         };
-        let foreground_admission = if let Some(call) = &segment_call {
+        let foreground_admission = if let Some(desktop) = &desktop {
+            Some(desktop.lease)
+        } else if let Some(call) = &segment_call {
             Some(call.activity_lease())
         } else if foreground {
             let activity = snapshot();
@@ -590,6 +631,8 @@ impl Tool for ActivityGuardedTool {
             background_leases: Mutex::new(retained_leases),
             transport_owner,
             segment_call,
+            desktop,
+            _desktop_authority: cua_driver_core::desktop_authority::current(),
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         });
@@ -654,10 +697,7 @@ impl Tool for ActivityGuardedTool {
         cancel_on_exit.completed = true;
         context.finish_invocation();
         if context.workers.load(Ordering::Acquire) != 0 {
-            context.cleanup_unconfirmed.store(true, Ordering::Release);
-            if let Some(call) = &context.segment_call {
-                call.cleanup_unknown();
-            }
+            context.mark_cleanup_unknown();
         }
         context.project_native_result(&mut result);
         result
@@ -672,6 +712,7 @@ struct Lease {
 }
 thread_local! {
     static LEASE: Cell<Option<Lease>> = const { Cell::new(None) };
+    static DESKTOP_EPISODE: Cell<bool> = const { Cell::new(false) };
     static PRESSED: RefCell<PressedInputs<CGEvent>> = RefCell::new(PressedInputs::default());
 }
 
@@ -1069,6 +1110,9 @@ fn restore_cursor_with(
 }
 
 pub(crate) fn check_input() -> anyhow::Result<()> {
+    if DESKTOP_EPISODE.with(Cell::get) {
+        return check_invocation(true);
+    }
     let lease = LEASE
         .with(Cell::get)
         .ok_or_else(|| anyhow::anyhow!("bounded foreground episode is required"))?;
@@ -2029,9 +2073,51 @@ mod episode_lifecycle_tests {
             background_leases: Mutex::new(Vec::new()),
             transport_owner: None,
             segment_call: None,
+            desktop: None,
+            _desktop_authority: None,
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         })
+    }
+
+    #[tokio::test]
+    async fn cancelled_background_worker_retains_canonical_desktop_serialization() {
+        let authority = cua_driver_core::desktop_authority::global();
+        let lease = authority.acquire(true).await.unwrap();
+        let mut context = context();
+        Arc::get_mut(&mut context).unwrap()._desktop_authority = Some(lease);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dispatch = tokio::spawn(async move {
+            let _cancel = CancelInvocation { context: Arc::clone(&context), completed: false };
+            INVOCATION.scope(context, async move {
+                spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }).await.unwrap();
+            }).await;
+        });
+        started_rx.await.unwrap();
+        dispatch.abort();
+        let _ = dispatch.await;
+        let capture = authority.acquire(false);
+        tokio::pin!(capture);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut capture).await.is_err());
+        release_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), capture).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_cleanup_failure_retires_authority_after_worker_and_context_drop() {
+        let authority = Arc::new(cua_driver_core::desktop_authority::Authority::default());
+        let lease = authority.acquire(true).await.unwrap();
+        let mut context = context();
+        Arc::get_mut(&mut context).unwrap()._desktop_authority = Some(lease);
+        INVOCATION.scope(context, async {
+            spawn_blocking(mark_native_cleanup_unconfirmed).await.unwrap();
+        }).await;
+        assert!(authority.acquire(false).await.is_err());
+        assert!(authority.acquire(true).await.is_err());
     }
 
     #[test]
@@ -2369,6 +2455,8 @@ mod episode_lifecycle_tests {
             background_leases: Mutex::new(Vec::new()),
             transport_owner: None,
             segment_call: None,
+            desktop: None,
+            _desktop_authority: None,
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         };
@@ -2389,6 +2477,8 @@ mod episode_lifecycle_tests {
             background_leases: Mutex::new(Vec::new()),
             transport_owner: None,
             segment_call: None,
+            desktop: None,
+            _desktop_authority: None,
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         };

@@ -58,6 +58,7 @@ pub mod consent;
 pub mod cursor_events;
 pub mod cursor_sampler;
 pub mod daemon;
+pub mod desktop_authority;
 pub mod element_cache;
 pub mod element_query;
 pub mod element_token;

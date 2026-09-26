@@ -27,6 +27,16 @@ pub struct DragTool {
     pub state: Arc<ToolState>,
 }
 
+// Decoration follows the worker's actual pressed lifetime. Dropping the async
+// request cannot skip the matching release or outlive native HID cleanup.
+struct PressedCursor<F: FnMut(bool)>(F);
+impl<F: FnMut(bool)> PressedCursor<F> {
+    fn new(mut send: F) -> Self { send(true); Self(send) }
+}
+impl<F: FnMut(bool)> Drop for PressedCursor<F> {
+    fn drop(&mut self) { (self.0)(false); }
+}
+
 #[cfg(test)]
 fn prior_pid_to_restore_after_foreground_action(
     prior_front: Option<i32>,
@@ -132,8 +142,13 @@ impl Tool for DragTool {
                 Err(result) => return result,
             };
             let (from_x, from_y, to_x, to_y) = (input.from_x, input.from_y, input.to_x, input.to_y);
-            let (from_x, from_y) = super::desktop_screenshot_point(from_x, from_y).await;
-            let (to_x, to_y) = super::desktop_screenshot_point(to_x, to_y).await;
+            let points = crate::foreground_activity::desktop::screenshot_point(from_x, from_y)
+                .and_then(|from| crate::foreground_activity::desktop::screenshot_point(to_x, to_y).map(|to| (from, to)));
+            let ((from_x, from_y), (to_x, to_y)) = match points {
+                Ok(points) => points,
+                Err(error) => return ToolResult::error(error.to_string()).with_structured(
+                    serde_json::json!({"code":"invalid_arguments", "effect":"refused"})),
+            };
             let duration_ms = input.duration_ms.unwrap_or(500).min(10_000);
             let steps = input.steps.unwrap_or(20).clamp(1, 200) as usize;
             let modifiers = input.modifier.unwrap_or_default();
@@ -143,12 +158,14 @@ impl Tool for DragTool {
                 ClickButton::Middle => DragButton::Middle,
             };
             let cursor_for_drag = cursor_key.clone();
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(true),
-            );
+            let pressed_cursor_key = cursor_key.clone();
             let result = crate::foreground_activity::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                crate::foreground_activity::desktop::run(|| {
+                let _pressed = PressedCursor::new(move |pressed| {
+                    crate::cursor::overlay::send_command(pressed_cursor_key.clone(),
+                        cursor_overlay::OverlayCommand::SetPressed(pressed));
+                });
                 crate::input::mouse::drag_at_xy_foreground_observed(
                     from_x,
                     from_y,
@@ -165,12 +182,9 @@ impl Tool for DragTool {
                         );
                     },
                 )
+                })
             })
             .await;
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(false),
-            );
             if matches!(&result, Ok(Ok(()))) {
                 self.state
                     .cursor_registry
@@ -472,6 +486,49 @@ impl Tool for DragTool {
 #[cfg(test)]
 mod tests {
     use super::prior_pid_to_restore_after_foreground_action;
+
+    #[test]
+    fn pressed_cursor_releases_on_worker_error_and_unwind() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result: Result<(), ()> = (|| {
+            let _pressed = super::PressedCursor::new(|pressed| events.borrow_mut().push(pressed));
+            Err(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(*events.borrow(), vec![true, false]);
+        events.borrow_mut().clear();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pressed = super::PressedCursor::new(|pressed| events.borrow_mut().push(pressed));
+            panic!("worker unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(*events.borrow(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn pressed_cursor_release_survives_outer_request_cancellation() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = events.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let request = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                {
+                    let _pressed = super::PressedCursor::new(move |pressed| output.lock().unwrap().push(pressed));
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                }
+                done_tx.send(()).unwrap();
+            }).await.unwrap();
+        });
+        started_rx.await.unwrap();
+        request.abort();
+        let _ = request.await;
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+        assert_eq!(*events.lock().unwrap(), vec![true, false]);
+    }
 
     #[test]
     fn foreground_drag_restore_preserves_user_takeover() {

@@ -585,6 +585,10 @@ impl ToolInput for MoveCursorInput {
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 #[serde(deny_unknown_fields)]
 pub struct ClickInput {
+    /// One-use native desktop observation binding, required by guarded macOS desktop input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    pub desktop_observation_id: Option<String>,
     #[schemars(schema_with = "number_schema")]
     pub x: f64,
     #[schemars(schema_with = "number_schema")]
@@ -616,6 +620,10 @@ impl ToolInput for ClickInput {
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 #[serde(deny_unknown_fields)]
 pub struct DragInput {
+    /// One-use native desktop observation binding, required by guarded macOS desktop input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    pub desktop_observation_id: Option<String>,
     #[schemars(schema_with = "number_schema")]
     pub from_x: f64,
     #[schemars(schema_with = "number_schema")]
@@ -757,6 +765,10 @@ impl ToolInput for ClipboardWriteInput {
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 #[serde(deny_unknown_fields)]
 pub struct PressKeyInput {
+    /// One-use native desktop observation binding, required by guarded macOS desktop input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    pub desktop_observation_id: Option<String>,
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ActionTarget>,
@@ -782,6 +794,10 @@ impl ToolInput for PressKeyInput {
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 #[serde(deny_unknown_fields)]
 pub struct HotkeyInput {
+    /// One-use native desktop observation binding, required by guarded macOS desktop input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    pub desktop_observation_id: Option<String>,
     #[schemars(length(min = 2))]
     pub keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -806,6 +822,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn desktop_observation_binding_round_trips_without_changing_app_defaults() {
+        let key: PressKeyInput = serde_json::from_value(json!({"key":"Escape"})).unwrap();
+        assert!(key.desktop_observation_id.is_none());
+        assert!(serde_json::to_value(key).unwrap().get("desktop_observation_id").is_none());
+        let click: ClickInput = serde_json::from_value(json!({"x":4,"y":8,"scope":"desktop","desktop_observation_id":"opaque"})).unwrap();
+        let drag: DragInput = serde_json::from_value(json!({"from_x":4,"from_y":8,"to_x":20,"to_y":40,"scope":"desktop","desktop_observation_id":"opaque"})).unwrap();
+        let hotkey: HotkeyInput = serde_json::from_value(json!({"keys":["cmd","space"],"scope":"desktop","desktop_observation_id":"opaque"})).unwrap();
+        for value in [serde_json::to_value(click).unwrap(), serde_json::to_value(drag).unwrap(), serde_json::to_value(hotkey).unwrap()] {
+            assert_eq!(value["desktop_observation_id"], "opaque");
+        }
+        assert!(serde_json::from_value::<PressKeyInput>(json!({"key":"Escape","desktop_observation_id":42})).is_err());
+    }
 
     #[test]
     fn generated_click_schema_matches_driver_dialect() {
