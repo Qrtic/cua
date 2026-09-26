@@ -275,8 +275,6 @@ impl NativeSegment {
         if !inner.activated
             || !inner.policy.in_flight()
             || inner.dialog_target.as_ref() != Some(before)
-            || inner.completed_return_source.is_some()
-            || inner.dialog_closed
             || inner.cleanup_unknown
             || inner.ending
             || inner.restoring
@@ -284,10 +282,23 @@ impl NativeSegment {
         {
             return false;
         }
-        inner.completed_return_source = Some(ExactWindowTarget {
+        let source = ExactWindowTarget {
             pid: host.pid,
             window_id: successor.window_id,
-        });
+        };
+        if let Some(retained) = inner.completed_return_source {
+            // Episode::finish and the outer invocation both settle this call.
+            // The caller freshly proves attachment and exact focus each time;
+            // confirming that same result must not reject the completed Save.
+            // No source, reservation, activity lease or deadline is changed.
+            return retained == source
+                && inner.dialog_closed
+                && inner.dialog_closed_destination == Some(host);
+        }
+        if inner.dialog_closed {
+            return false;
+        }
+        inner.completed_return_source = Some(source);
         inner.dialog_closed = true;
         inner.dialog_closed_destination = Some(host);
         // Keep dialog_target, the current Call, its lease, and deadline intact.
@@ -2440,11 +2451,98 @@ mod tests {
             assert!(segment.validate_dialog_call(tool, binding.target).is_err());
         }
         assert!(!binding_matches(&segment, &binding.owner, segment.restoration_source(), &segment.owner));
-        assert!(!segment.record_completed_dialog_result(&before, &successor, 5_002, idle()));
+        assert!(segment.record_completed_dialog_result(&before, &successor, 5_002, idle()));
         ticket.settle();
         assert!(segment.inner.lock().unwrap().resources.is_some(), "A normal end still owns cleanup");
         ticket.revoke();
         assert!(segment.cleanup_is_settled());
+    }
+
+    #[tokio::test]
+    async fn completed_dialog_result_reconciles_inner_and_outer_settlement() {
+        use crate::ax::attached_sheet::{AttachedSheetSuccessor, DialogAttachment};
+        let (mut segment, _, _) = fixture().await;
+        let before = DialogAttachment {
+            window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+        };
+        let successor = AttachedSheetSuccessor {
+            window_id: 99, host_id: 70, path: vec![99, 70],
+        };
+        let mutable = Arc::get_mut(&mut segment).unwrap();
+        mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+        mutable.dialog_panel = Some(71);
+        mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
+        let ticket = call(&segment);
+        ticket.mark_activated();
+        let binding = segment.binding.clone();
+        let deadline = segment.inner.lock().unwrap().policy.deadline_ms();
+
+        // Episode::finish and the outer tool invocation both reconcile the
+        // same successful Save before this call releases its reservation.
+        for phase in ["inner native episode", "outer tool completion"] {
+            assert!(settle_dialog_condition(
+                Duration::from_millis(100),
+                || Ok(()),
+                || segment.record_completed_dialog_result(&before, &successor, 5_001, idle()),
+            ).unwrap(), "same proven result was rejected by {phase}");
+            assert_eq!(segment.binding, binding);
+            assert_eq!(segment.current_target(), binding.target);
+            assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
+            assert_eq!(ticket.dialog_closed_summary().unwrap()["phase"], "closed");
+            assert!(segment.validate_dialog_call("click", binding.target).is_err());
+        }
+        ticket.settle();
+        assert!(!segment.record_completed_dialog_result(&before, &successor, 5_002, idle()),
+            "a completed call cannot gain another reservation by reusing the proof");
+        ticket.revoke();
+        assert!(segment.cleanup_is_settled());
+    }
+
+    #[tokio::test]
+    async fn completed_dialog_result_reconfirmation_cannot_replace_or_revive_the_call() {
+        use crate::ax::attached_sheet::{AttachedSheetSuccessor, DialogAttachment};
+        for scenario in 0..9 {
+            let (mut segment, _, _) = fixture().await;
+            let before = DialogAttachment {
+                window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+            };
+            let mut successor = AttachedSheetSuccessor {
+                window_id: 99, host_id: 70, path: vec![99, 70],
+            };
+            let mutable = Arc::get_mut(&mut segment).unwrap();
+            mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+            mutable.dialog_panel = Some(71);
+            mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
+            let ticket = call(&segment);
+            ticket.mark_activated();
+            assert!(segment.record_completed_dialog_result(&before, &successor, 5_001, idle()));
+            let retained = segment.restoration_source();
+            let mut activity = idle();
+            let mut now = 5_002;
+            match scenario {
+                0 => { successor.window_id = 98; successor.path[0] = 98; },
+                1 => activity.generation += 1,
+                2 => now = u64::MAX,
+                3 => ticket.revoke(),
+                4 => ticket.settle(),
+                5 => segment.inner.lock().unwrap().ending = true,
+                6 => segment.inner.lock().unwrap().restoring = true,
+                7 => segment.inner.lock().unwrap().cleanup_unknown = true,
+                8 => { segment.owner.close(cua_driver_core::session::SessionEndReason::ProcessExit); },
+                _ => unreachable!(),
+            }
+            assert!(!segment.record_completed_dialog_result(&before, &successor, now, activity),
+                "completed proof incorrectly accepted scenario {scenario}");
+            assert_eq!(segment.restoration_source(), retained, "return source must stay frozen");
+            {
+                let mut inner = segment.inner.lock().unwrap();
+                inner.ending = false;
+                inner.restoring = false;
+                inner.cleanup_unknown = false;
+            }
+            ticket.revoke();
+            ticket.settle();
+        }
     }
 
     #[tokio::test]
