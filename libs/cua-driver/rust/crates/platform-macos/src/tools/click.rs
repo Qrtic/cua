@@ -312,7 +312,12 @@ fn background_pixel_ax_press_eligible(
 ) -> bool {
     let is_concrete_press_control = matches!(
         role,
-        "AXButton" | "AXCheckBox" | "AXRadioButton" | "AXLink" | "AXDisclosureTriangle"
+        "AXButton"
+            | "AXCheckBox"
+            | "AXRadioButton"
+            | "AXLink"
+            | "AXDisclosureTriangle"
+            | "AXMenuItem"
     );
     press_action
         && enabled == Some(true)
@@ -3195,6 +3200,43 @@ mod tests {
             PixelActivationPolicy::ForegroundAssist
         );
     }
+    #[test]
+    fn background_pixel_ax_bridge_accepts_enabled_native_menu_command() {
+        // Freeform's visible context menu belongs to the exact host window,
+        // but its commands do not receive the synthetic background click.
+        // Its native Rename item advertises these concrete actions instead.
+        assert!(
+            background_pixel_ax_press_eligible(
+                true,
+                "AXMenuItem",
+                &["AXCancel".to_owned(), "AXPress".to_owned(), "AXPick".to_owned()],
+                Some(true),
+            ),
+            "enabled native menu command was excluded from the background AX bridge"
+        );
+    }
+
+    #[test]
+    fn background_pixel_ax_bridge_keeps_menu_command_capability_guards() {
+        let press = ["AXPress".to_owned()];
+        for enabled in [None, Some(false)] {
+            assert!(!background_pixel_ax_press_eligible(
+                true, "AXMenuItem", &press, enabled,
+            ));
+        }
+        assert!(!background_pixel_ax_press_eligible(
+            false, "AXMenuItem", &press, Some(true),
+        ));
+        for actions in [vec![], vec!["AXPick".to_owned()], vec!["AXShowMenu".to_owned()]] {
+            assert!(!background_pixel_ax_press_eligible(
+                true, "AXMenuItem", &actions, Some(true),
+            ));
+        }
+        assert!(!background_pixel_ax_press_eligible(
+            true, "AXMenu", &press, Some(true),
+        ));
+    }
+
     #[test]
     fn background_pixel_ax_bridge_requires_advertised_press() {
         assert!(background_pixel_ax_press_eligible(
