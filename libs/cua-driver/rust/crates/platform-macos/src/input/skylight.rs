@@ -914,8 +914,39 @@ fn should_deactivate_synthetic_target(
 fn post_synthetic_focus_command(command: &SyntheticFocusCommand) -> anyhow::Result<()> {
     let post = post_event_record_to_fn()
         .ok_or_else(|| anyhow::anyhow!("target-only synthetic focus is unavailable"))?;
+    post_synthetic_focus_command_with(
+        command,
+        |psn, record| unsafe { post(psn.as_ptr().cast(), record.as_ptr()) },
+        |psn| {
+            let get_pid = get_process_pid_fn()?;
+            let mut pid = 0;
+            Some(unsafe { get_pid(psn.as_ptr().cast(), &mut pid) })
+        },
+    )
+}
+
+fn post_synthetic_focus_command_with(
+    command: &SyntheticFocusCommand,
+    post: impl FnOnce(&[u8; 8], &[u8; 0xF8]) -> i32,
+    process_status: impl FnOnce(&[u8; 8]) -> Option<i32>,
+) -> anyhow::Result<()> {
     let record = synthetic_focus_record(command.window_id, command.focused);
-    let status = unsafe { post(command.psn.as_ptr() as *const c_void, record.as_ptr()) };
+    let status = post(&command.psn, &record);
+    // A command such as Quit may finish before its synthetic-focus cleanup.
+    // Only deactivation's procNotFound, corroborated for this exact PSN by a
+    // separate read-only Process Manager lookup, proves no state remains to
+    // remove. Activation errors and uncertain cleanup still fail. This does
+    // not verify the preceding action and never posts a replacement event.
+    const PROC_NOT_FOUND: i32 = -600;
+    if !command.focused
+        && status == PROC_NOT_FOUND
+        && process_status(&command.psn) == Some(PROC_NOT_FOUND)
+    {
+        tracing::debug!(target: "cua_focus_restore", window_id=command.window_id,
+            post_status=status, process_status=PROC_NOT_FOUND,
+            "Synthetic focus cleanup has no remaining target process");
+        return Ok(());
+    }
     if status != 0 {
         anyhow::bail!("target-only synthetic focus event failed with OSStatus {status}");
     }
@@ -4750,6 +4781,61 @@ mod tests {
         assert_eq!(&activate[0x3C..0x40], &[0x12, 0x34, 0x56, 0x78]);
         assert_eq!(activate[0x8A], 0x01);
         assert_eq!(deactivate[0x8A], 0x02);
+    }
+
+    #[test]
+    fn synthetic_focus_cleanup_accepts_confirmed_process_exit() {
+        // Recorded after a successful Quit AXPress: deactivation addressed the
+        // exact old PSN and returned procNotFound. A second, read-only lookup
+        // can prove there is no remaining process-local state to clean up.
+        let target = [1, 2, 3, 4, 5, 6, 7, 8];
+        let plan = synthetic_target_focus_plan(target, 731);
+        let posts = Cell::new(0);
+        let lookups = Cell::new(0);
+        let result = super::post_synthetic_focus_command_with(
+            &plan.deactivate_target,
+            |psn, record| {
+                posts.set(posts.get() + 1);
+                assert_eq!(*psn, target);
+                assert_eq!(*record, synthetic_focus_record(731, false));
+                -600
+            },
+            |psn| {
+                lookups.set(lookups.get() + 1);
+                assert_eq!(*psn, target);
+                Some(-600)
+            },
+        );
+        assert!(result.is_ok(), "confirmed process exit must not turn completed AX dispatch into a cleanup failure");
+        assert_eq!(posts.get(), 1, "cleanup never reposts or changes the actuator");
+        assert_eq!(lookups.get(), 1);
+    }
+
+    #[test]
+    fn synthetic_focus_cleanup_keeps_uncertain_or_live_process_errors() {
+        let plan = synthetic_target_focus_plan([1; 8], 731);
+        for lookup in [None, Some(0), Some(-50), Some(-54)] {
+            assert!(super::post_synthetic_focus_command_with(
+                &plan.deactivate_target, |_, _| -600, |_| lookup,
+            ).is_err(), "process absence was not proven: {lookup:?}");
+        }
+    }
+
+    #[test]
+    fn synthetic_focus_activation_and_other_post_errors_are_not_exit_cleanup() {
+        let plan = synthetic_target_focus_plan([1; 8], 731);
+        for (command, status) in [(&plan.activate_target, -600),
+                                  (&plan.deactivate_target, -50),
+                                  (&plan.deactivate_target, -54)] {
+            assert!(super::post_synthetic_focus_command_with(
+                command, |_, _| status,
+                |_| panic!("non-cleanup failure must not be reclassified by a process lookup"),
+            ).is_err());
+        }
+        assert!(super::post_synthetic_focus_command_with(
+            &plan.deactivate_target, |_, _| 0,
+            |_| panic!("successful post needs no process lookup"),
+        ).is_ok());
     }
 
     #[test]
