@@ -9,6 +9,9 @@
 //! ExtensionKit may vend a control from a different process than its containing
 //! sheet. Such an embedding needs a live, reciprocal parent chain and a verified
 //! WindowServer owner; a foreign AXWindow attribute alone is never sufficient.
+//! AppKit file-panel accessories can instead start in the host, traverse one
+//! remote service, then return to the host's sheet. That bounded round trip has
+//! its own reciprocal proof; it does not authorize arbitrary provider chains.
 
 use super::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess,
@@ -111,7 +114,15 @@ fn resolve_embedded_control<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u3
         }
         if let Some((_, previous_owner, _)) = nodes.last() {
             if owner != *previous_owner {
-                if crossed_provider_boundary || *previous_owner != provider || owner == provider {
+                if crossed_provider_boundary {
+                    // Only the observed return to the original process may
+                    // enter the accessory proof. A failed reciprocal link or
+                    // a detached one-way embedding must not trigger a retry.
+                    return (owner == provider)
+                        .then(|| resolve_accessory_sheet(tree, start))
+                        .flatten();
+                }
+                if *previous_owner != provider || owner == provider {
                     return None;
                 }
                 crossed_provider_boundary = true;
@@ -158,22 +169,95 @@ fn resolve_embedded_control<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u3
     None
 }
 
+/// AppKit can expose host-owned accessory controls below a remote file-panel
+/// split group. Prove exactly host -> one service -> the same host's AXSheet.
+/// No other physical surface, web subtree, extra provider, AXWindow shortcut or
+/// cached downward traversal can supply this relationship. Revalidate every
+/// live link before returning, just as for the one-way provider embedding.
+fn resolve_accessory_sheet<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
+    let host = tree.owner(start)?;
+    if host <= 0 {
+        return None;
+    }
+    let mut remote = None;
+    let mut returned_to_host = false;
+    let mut current = start.clone();
+    let mut nodes: Vec<(T::Node, i32, String)> = Vec::new();
+    for _ in 0..MAX_DEPTH {
+        if !tree.within_budget() || nodes.iter().any(|(node, _, _)| tree.same(node, &current)) {
+            return None;
+        }
+        let owner = tree.owner(&current)?;
+        let role = tree.role(&current)?;
+        if owner <= 0 || matches!(role.as_str(), "" | "AXWebArea" | "AXApplication" | "AXWindow" | "AXPopover") {
+            return None;
+        }
+        if owner == host {
+            returned_to_host |= remote.is_some();
+        } else {
+            if returned_to_host || remote.is_some_and(|pid| pid != owner) {
+                return None;
+            }
+            remote = Some(owner);
+        }
+        nodes.push((current.clone(), owner, role.clone()));
+        if role == "AXSheet" {
+            let id = tree.window_id(&current)?;
+            if remote.is_none() || !returned_to_host || owner != host || id == 0
+                || !tree.owns_window(host, id)
+            {
+                return None;
+            }
+            for (index, (node, observed_owner, observed_role)) in nodes.iter().enumerate() {
+                if !tree.within_budget() || tree.owner(node) != Some(*observed_owner)
+                    || tree.role(node).as_deref() != Some(observed_role.as_str())
+                {
+                    return None;
+                }
+                if let Some((parent, _, _)) = nodes.get(index + 1) {
+                    if !tree.relation(node, "AXParent").is_some_and(|live| tree.same(&live, parent))
+                        || !tree.contains_child(parent, node)
+                    {
+                        return None;
+                    }
+                }
+            }
+            return (tree.within_budget() && tree.window_id(&current) == Some(id)
+                && tree.owns_window(host, id)).then_some(id);
+        }
+        let parent = tree.relation(&current, "AXParent")?;
+        if !tree.contains_child(&parent, &current) {
+            return None;
+        }
+        current = parent;
+    }
+    None
+}
+
 /// A native text editor must have a complete reciprocal chain to the exact
 /// physical surface. An AXWindow attribute alone cannot distinguish a native
 /// field from a detached or incompletely exposed web input. This stricter
 /// proof authorizes editor focus preparation, not a new pointer/keyboard route.
 fn prove_native_text<T: Ancestry>(tree: &T, start: &T::Node, pid: i32, window_id: u32) -> bool {
-    if !matches!(tree.role(start).as_deref(), Some("AXTextField" | "AXTextArea")) {
+    if tree.owner(start) != Some(pid)
+        || !matches!(tree.role(start).as_deref(), Some("AXTextField" | "AXTextArea"))
+    {
         return false;
     }
     let mut node = start.clone();
     let mut visited: Vec<(T::Node, String)> = Vec::new();
     for _ in 0..MAX_DEPTH {
         if !tree.within_budget()
-            || tree.owner(&node) != Some(pid)
             || visited.iter().any(|(prior, _)| tree.same(prior, &node))
         {
             return false;
+        }
+        if tree.owner(&node) != Some(pid) {
+            // This may be the file-panel service on a host-owned accessory's
+            // ancestry. The complete separate proof still requires the same
+            // host, exact sheet and live reciprocal links, and rejects web
+            // content. Ordinary same-process editors keep their fast path.
+            return resolve_accessory_sheet(tree, start) == Some(window_id);
         }
         let Some(role) = tree.role(&node).filter(|role| !role.is_empty()) else {
             return false;
@@ -519,6 +603,81 @@ mod tests {
         assert_eq!(resolve(&t, &0), Some(8));
         assert_eq!(resolve_with_window_fallback(&t, &0, false), Some(8));
         assert_ne!(resolve(&t, &0), Some(7));
+    }
+
+    fn save_panel_accessory() -> Tree {
+        let mut tree = sheet();
+        // AppKit vends the app-owned accessory through the remote file-panel
+        // service's split group, then returns to the app-owned AXSheet. The
+        // field itself has no native window or AXWindow attribute.
+        tree.nodes.insert(0, ("AXTextField", Some(4), None, None, 42));
+        tree.nodes.insert(4, ("AXSplitGroup", Some(1), None, Some(9), 99));
+        tree.children.insert(4, vec![0]);
+        tree.children.insert(1, vec![4]);
+        tree.window_owners.insert(9, 42);
+        tree
+    }
+
+    #[test]
+    fn save_panel_accessory_resolves_reciprocal_return_to_its_own_sheet() {
+        let tree = save_panel_accessory();
+        assert_eq!(resolve(&tree, &0), Some(8));
+        assert_eq!(resolve_with_window_fallback(&tree, &0, false), Some(8));
+        assert_ne!(resolve(&tree, &0), Some(7));
+        assert!(prove_native_text(&tree, &0, 42, 8));
+        assert!(!prove_native_text(&tree, &0, 42, 7));
+        assert!(!prove_native_text(&tree, &0, 99, 8));
+    }
+
+    #[test]
+    fn save_panel_accessory_rejects_unproven_or_different_surfaces() {
+        for kind in 0..10 {
+            let mut tree = save_panel_accessory();
+            match kind {
+                0 => { tree.children.insert(4, vec![]); }
+                1 => { tree.children.insert(1, vec![]); }
+                2 => tree.nodes.get_mut(&1).unwrap().3 = None,
+                3 => tree.nodes.get_mut(&1).unwrap().0 = "AXPopover",
+                4 => tree.nodes.get_mut(&1).unwrap().0 = "AXWindow",
+                5 => tree.nodes.get_mut(&4).unwrap().0 = "AXWebArea",
+                6 => tree.nodes.get_mut(&4).unwrap().1 = Some(0),
+                7 => tree.expired = true,
+                8 => { tree.window_owners.insert(8, 99); }
+                _ => tree.nodes.get_mut(&0).unwrap().1 = None,
+            }
+            assert_eq!(resolve(&tree, &0), None, "case {kind}");
+            assert!(!prove_native_text(&tree, &0, 42, 8), "case {kind}");
+        }
+        let mut sibling = save_panel_accessory();
+        sibling.nodes.get_mut(&1).unwrap().3 = Some(10);
+        sibling.window_owners.insert(10, 42);
+        assert_eq!(resolve(&sibling, &0), Some(10));
+        assert!(!prove_native_text(&sibling, &0, 42, 8));
+    }
+
+    #[test]
+    fn save_panel_accessory_requires_a_stable_single_remote_service() {
+        let mut tree = save_panel_accessory();
+        tree.nodes.get_mut(&4).unwrap().1 = Some(5);
+        tree.nodes.insert(5, ("AXGroup", Some(1), None, None, 100));
+        tree.children.insert(5, vec![4]);
+        tree.children.insert(1, vec![5]);
+        assert_eq!(resolve(&tree, &0), None);
+        assert!(!prove_native_text(&tree, &0, 42, 8));
+        // A return to the host followed by another remote segment is not the
+        // single AppKit accessory bridge that this route proves.
+        tree.nodes.insert(5, ("AXGroup", Some(6), None, None, 42));
+        tree.nodes.insert(6, ("AXGroup", Some(1), None, None, 99));
+        tree.children.insert(6, vec![5]);
+        tree.children.insert(1, vec![6]);
+        assert_eq!(resolve(&tree, &0), None);
+        assert!(!prove_native_text(&tree, &0, 42, 8));
+        // Even when both directions initially agree, a later detach is not
+        // authority to retain the original sheet ID.
+        let mut detached = save_panel_accessory();
+        detached.fail_child_check_after = Some(2);
+        assert_eq!(resolve_accessory_sheet(&detached, &0), None);
+        assert_eq!(detached.child_checks.get(), 3);
     }
 
     #[test]
