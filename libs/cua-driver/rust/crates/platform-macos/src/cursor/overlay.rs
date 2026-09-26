@@ -47,6 +47,7 @@ use indexmap::IndexMap;
 mod displays;
 mod surfaces;
 mod visibility;
+pub(crate) use surfaces::is_owned_cursor_window;
 use displays::{DisplayGeometry, DisplayLayout};
 use visibility::{Rect, WindowClips};
 

@@ -79,9 +79,9 @@ pub(crate) fn all_windows_with_space_snapshot() -> WindowEnumeration {
 
 /// Enumerate layer-0 windows that are meaningful automation targets.
 ///
-/// Unlike [`all_windows`], this performs a narrowly-gated AX check for macOS
-/// capture-indicator helpers. Keep hot compositor/PiP polling on the raw
-/// enumeration functions above.
+/// Unlike [`all_windows`], this excludes exact live cursor surfaces owned by
+/// this Driver and performs a narrowly-gated AX check for macOS capture
+/// indicators. Keep hot compositor/PiP polling on the raw enumeration functions.
 pub(crate) fn all_automation_windows() -> Vec<WindowInfo> {
     all_automation_windows_with_space_snapshot().windows
 }
@@ -336,15 +336,19 @@ fn filter_automation_enumeration_with_evidence(
     mut enumeration: WindowEnumeration,
     evidence: &[WindowInfo],
 ) -> WindowEnumeration {
-    enumeration.windows =
-        filter_automation_windows_with_evidence(enumeration.windows, evidence, |window| {
+    enumeration.windows = filter_automation_windows_with_evidence(
+        enumeration.windows,
+        evidence,
+        |window| {
             use crate::ax::window_classification::{
                 classify_automation_window, AutomationWindowClass,
             };
 
             classify_automation_window(window.pid, window.window_id)
                 .map(|class| class == AutomationWindowClass::SystemCaptureIndicator)
-        });
+        },
+        |window| crate::cursor::overlay::is_owned_cursor_window(window.pid, window.window_id),
+    );
     enumeration
 }
 
@@ -414,20 +418,27 @@ where
     F: FnMut(&WindowInfo) -> Option<bool>,
 {
     let evidence = windows.clone();
-    filter_automation_windows_with_evidence(windows, &evidence, is_system_capture_indicator)
+    filter_automation_windows_with_evidence(windows, &evidence, is_system_capture_indicator, |_| {
+        false
+    })
 }
 
-fn filter_automation_windows_with_evidence<F>(
+fn filter_automation_windows_with_evidence<F, C>(
     windows: Vec<WindowInfo>,
     evidence: &[WindowInfo],
     mut is_system_capture_indicator: F,
+    mut is_owned_cursor: C,
 ) -> Vec<WindowInfo>
 where
     F: FnMut(&WindowInfo) -> Option<bool>,
+    C: FnMut(&WindowInfo) -> bool,
 {
     windows
         .into_iter()
         .filter(|window| {
+            if is_owned_cursor(window) {
+                return false;
+            }
             if has_capture_indicator_twin(window, evidence) {
                 return false;
             }
@@ -721,7 +732,8 @@ mod tests {
 
         let visible = vec![helper, main];
         let evidence = [visible[0].clone(), visible[1].clone(), twin];
-        let filtered = filter_automation_windows_with_evidence(visible, &evidence, |_| None);
+        let filtered =
+            filter_automation_windows_with_evidence(visible, &evidence, |_| None, |_| false);
 
         assert_eq!(
             filtered
@@ -756,6 +768,59 @@ mod tests {
 
         let ax_unavailable = filter_automation_windows_with(vec![compact], |_| None);
         assert_eq!(ax_unavailable.len(), 1, "AX failure must fail open");
+    }
+
+    #[test]
+    fn live_driver_cursor_surface_does_not_occlude_presented_window() {
+        let mut cursor = window(11, 7, "cua-driver");
+        cursor.bounds.width = 1728.0;
+        cursor.bounds.height = 1117.0;
+        cursor.z_index = 4;
+        let mut target = window(12, 8, "Stickies");
+        target.z_index = 3;
+        let mut previous = window(13, 9, "Terminal");
+        previous.z_index = 2;
+        let mut sibling = window(14, 8, "Stickies");
+        sibling.z_index = 1;
+        let visible = vec![cursor, target, previous, sibling];
+        let filtered = filter_automation_windows_with_evidence(
+            visible.clone(),
+            &visible,
+            |_| None,
+            |candidate| candidate.pid == 7 && candidate.window_id == 11,
+        );
+        assert_eq!(
+            filtered.iter().map(|w| w.window_id).collect::<Vec<_>>(),
+            vec![12, 13, 14]
+        );
+        assert_eq!(
+            filtered.iter().max_by_key(|w| w.z_index).unwrap().window_id,
+            12
+        );
+    }
+
+    #[test]
+    fn unknown_driver_and_foreign_windows_are_not_cursor_surfaces() {
+        let mut driver_dialog = window(15, 7, "cua-driver");
+        driver_dialog.z_index = 5;
+        let mut foreign = driver_dialog.clone();
+        foreign.pid = 8;
+        foreign.window_id = 11;
+        foreign.z_index = 4;
+        let visible = vec![driver_dialog, foreign];
+        let filtered = filter_automation_windows_with_evidence(
+            visible.clone(),
+            &visible,
+            |_| None,
+            |candidate| candidate.pid == 7 && candidate.window_id == 11,
+        );
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|w| (w.pid, w.window_id))
+                .collect::<Vec<_>>(),
+            vec![(7, 15), (8, 11)]
+        );
     }
 
     #[test]

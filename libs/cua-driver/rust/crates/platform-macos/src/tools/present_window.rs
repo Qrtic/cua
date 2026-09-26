@@ -150,7 +150,9 @@ unsafe fn validate_root(element: AXUIElementRef, pid: i32, target: u32) -> anyho
 }
 
 fn window_snapshot() -> anyhow::Result<Vec<WindowInfo>> {
-    let snapshot = crate::windows::all_automation_windows_with_space_snapshot();
+    // Visual order requires the on-screen snapshot. Filtering an all-window
+    // inventory after enumeration can retain a different WindowServer order.
+    let snapshot = crate::windows::visible_automation_windows_with_space_snapshot();
     anyhow::ensure!(
         snapshot.succeeded,
         "presentation window inventory is unavailable"

@@ -7,7 +7,7 @@ use objc2::{class, msg_send, rc::Retained, runtime::AnyObject};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::c_void,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,11 +18,19 @@ use std::{
 struct Surface {
     window: Retained<AnyObject>,
     layer: Retained<AnyObject>,
+    window_id: u32,
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
         debug_assert!(MainThreadMarker::new().is_some());
+        SURFACE_WINDOW_IDS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .0
+            .remove(&self.window_id);
+        tracing::debug!(target: "cua_window_order", window_id = self.window_id,
+            "Retired owned transparent cursor surface");
         unsafe {
             let nil = std::ptr::null_mut::<AnyObject>();
             let _: () = msg_send![&*self.layer, setContents: nil];
@@ -43,6 +51,26 @@ thread_local! {
 }
 
 static REFRESH_QUEUED: AtomicBool = AtomicBool::new(false);
+
+// Only windows created here are transparent, non-interactive cursor surfaces.
+// Never infer this identity from the Driver PID, a title or screen-sized bounds:
+// a different Driver window can be a real dialog that must remain observable.
+struct SurfaceWindowIds(BTreeSet<u32>);
+
+impl SurfaceWindowIds {
+    fn contains(&self, driver_pid: i32, pid: i32, window_id: u32) -> bool {
+        pid == driver_pid && window_id != 0 && self.0.contains(&window_id)
+    }
+}
+
+static SURFACE_WINDOW_IDS: Mutex<SurfaceWindowIds> = Mutex::new(SurfaceWindowIds(BTreeSet::new()));
+
+pub(crate) fn is_owned_cursor_window(pid: i32, window_id: u32) -> bool {
+    SURFACE_WINDOW_IDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(std::process::id() as i32, pid, window_id)
+}
 
 unsafe fn enumerate_displays() -> Vec<DisplayGeometry> {
     use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
@@ -129,7 +157,23 @@ unsafe fn create_surface(display: &DisplayGeometry) -> Option<Surface> {
     let _: () = msg_send![&*layer, setContentsScale: display.scale];
     // Empty, click-through, normal-level windows never activate the Driver.
     let _: () = msg_send![&*window, orderFrontRegardless];
-    Some(Surface { window, layer })
+    let number: isize = msg_send![&*window, windowNumber];
+    let window_id = u32::try_from(number).unwrap_or(0);
+    if window_id != 0 {
+        SURFACE_WINDOW_IDS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .0
+            .insert(window_id);
+        let display_id = display.id;
+        tracing::debug!(target: "cua_window_order", window_id, display_id,
+            "Registered owned transparent cursor surface");
+    }
+    Some(Surface {
+        window,
+        layer,
+        window_id,
+    })
 }
 
 unsafe fn refresh_surfaces() {
@@ -366,8 +410,21 @@ fn dispatch_main(context: *mut c_void, callback: unsafe extern "C" fn(*mut c_voi
 
 #[cfg(test)]
 mod tests {
-    use super::LatestFrame;
+    use super::{LatestFrame, SurfaceWindowIds};
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn cursor_identity_covers_multiple_displays_and_retires_closed_windows() {
+        let mut ids = SurfaceWindowIds([11, 12].into_iter().collect());
+        assert!(ids.contains(7, 7, 11));
+        assert!(ids.contains(7, 7, 12));
+        assert!(!ids.contains(7, 8, 11));
+        assert!(!ids.contains(7, 7, 13));
+        assert!(!ids.contains(7, 7, 0));
+        ids.0.remove(&11);
+        assert!(!ids.contains(7, 7, 11), "a retired ID grants no exclusion");
+        assert!(ids.contains(7, 7, 12), "the other display remains owned");
+    }
 
     #[test]
     fn slow_main_queue_keeps_only_the_latest_batch_and_drops_replaced_frames() {
