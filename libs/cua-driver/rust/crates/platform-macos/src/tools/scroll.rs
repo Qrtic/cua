@@ -940,6 +940,7 @@ mod tests {
             window_id: 7,
         };
         let facts = BackgroundTargetFacts {
+            target_on_screen: Some(true),
             window_server: WindowServerOwnership::SamePid,
             ax_window_present: true,
             target_minimized: Some(false),

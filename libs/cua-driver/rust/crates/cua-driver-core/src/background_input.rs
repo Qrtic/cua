@@ -70,6 +70,11 @@ pub struct BackgroundTargetFacts {
     /// could not be read — an unproven fact, which fails closed for pointer
     /// and keyboard routes (it never unlocks them).
     pub target_minimized: Option<bool>,
+    /// Whether WindowServer currently publishes this exact window on screen.
+    /// Occluded windows remain on screen. A retained floating panel may be
+    /// neither minimized nor in a hidden app, yet still be ordered out.
+    /// `None` is unknown and cannot authorize pointer or keyboard input.
+    pub target_on_screen: Option<bool>,
     /// `AXHidden` on the owning application. `None` fails closed like
     /// `target_minimized`.
     pub app_hidden: Option<bool>,
@@ -264,8 +269,9 @@ pub fn decide_background_input(
     // Pointer/keyboard require PROVEN not-minimized and not-hidden: an
     // unreadable attribute (`None`) is an unknown fact and unknown facts
     // never unlock a route. Semantic AX stays available either way.
-    let visibility_disproven =
-        !(facts.target_minimized == Some(false) && facts.app_hidden == Some(false));
+    let visibility_disproven = !(facts.target_minimized == Some(false)
+        && facts.app_hidden == Some(false)
+        && facts.target_on_screen == Some(true));
     match action {
         BackgroundAction::AxSemantic
         | BackgroundAction::ApplicationMenuSemantic
@@ -279,8 +285,8 @@ pub fn decide_background_input(
                 return refuse(
                     refusal_codes::MINIMIZED_OR_HIDDEN,
                     format!(
-                        "window {} is minimized or its application is hidden (or that \
-                         state could not be proven); the routed pointer is refused in \
+                        "window {} is minimized, ordered out, or its application is hidden \
+                         (or that state could not be proven); the routed pointer is refused in \
                          v1. Use an exact element action (click/set_value by element) \
                          instead",
                         target.window_id
@@ -307,8 +313,8 @@ pub fn decide_background_input(
                 return refuse(
                     refusal_codes::MINIMIZED_OR_HIDDEN,
                     format!(
-                        "window {} is minimized or its application is hidden (or that \
-                         state could not be proven); raw key input is refused in v1. \
+                        "window {} is minimized, ordered out, or its application is hidden \
+                         (or that state could not be proven); raw key input is refused in v1. \
                          Use an exact element action (set_value, click \
                          action:\"confirm\"/\"press\") instead",
                         target.window_id
@@ -381,6 +387,7 @@ pub fn background_input_capability_report(
         "visibility": {
             "app_hidden": facts.app_hidden,
             "window_minimized": facts.target_minimized,
+            "window_on_screen": facts.target_on_screen,
         },
         "routes": [
             route_entry("accessibility", BackgroundAction::AxSemantic),
@@ -412,6 +419,7 @@ mod tests {
             window_server: WindowServerOwnership::SamePid,
             ax_window_present: true,
             target_minimized: Some(false),
+            target_on_screen: Some(true),
             app_hidden: Some(false),
             competing_keyboard_destinations: 0,
             element: ElementAncestry::NotAddressed,
@@ -766,6 +774,7 @@ mod tests {
             ax_window_present: false,
             target_minimized: Some(true),
             app_hidden: Some(true),
+            target_on_screen: Some(false),
             competing_keyboard_destinations: 3,
             element: ElementAncestry::OutsideTargetWindow,
         };
@@ -878,5 +887,37 @@ mod tests {
                 assert_eq!(route["reason"], refusal_codes::MINIMIZED_OR_HIDDEN);
             }
         }
+    }
+
+    #[test]
+    fn retained_panel_without_display_publication_only_allows_semantic_input() {
+        for on_screen in [Some(false), None] {
+            let facts = BackgroundTargetFacts {
+                target_on_screen: on_screen,
+                element: ElementAncestry::ProvenDescendant,
+                ..matched_facts()
+            };
+            assert!(
+                decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic).is_execute()
+            );
+            for action in [
+                BackgroundAction::WindowPointer,
+                BackgroundAction::GenericKey,
+                BackgroundAction::InsertText,
+            ] {
+                assert_eq!(
+                    code_of(decide_background_input(TARGET, &facts, action)),
+                    refusal_codes::MINIMIZED_OR_HIDDEN
+                );
+            }
+            let report = background_input_capability_report(TARGET, &facts, None);
+            assert_eq!(report["visibility"]["window_on_screen"], json!(on_screen));
+        }
+        // A fully occluded window is still published on screen. No z-order
+        // or frontmost-app requirement is introduced for background input.
+        assert!(
+            decide_background_input(TARGET, &matched_facts(), BackgroundAction::WindowPointer)
+                .is_execute()
+        );
     }
 }

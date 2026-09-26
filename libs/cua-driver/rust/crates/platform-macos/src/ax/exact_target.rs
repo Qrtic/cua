@@ -18,7 +18,7 @@ use super::bindings::{
     kAXErrorAttributeUnsupported, kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr,
     AXError, AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
-use crate::windows::{all_automation_windows, resolve_window_owner, WindowOwner};
+use crate::windows::all_automation_windows;
 
 /// Resolve the CGWindowID of the top-level AX window that owns `element`.
 ///
@@ -40,7 +40,11 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// # Safety
 /// `element` must remain retained with its bounded messaging timeout.
-pub(crate) unsafe fn native_text_field_in_window(element: AXUIElementRef, pid: i32, window_id: u32) -> bool {
+pub(crate) unsafe fn native_text_field_in_window(
+    element: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+) -> bool {
     super::element_ancestry::proves_native_text(element, pid, window_id)
 }
 
@@ -369,13 +373,18 @@ pub fn gather_background_facts(
     window_id: u32,
     element_ptr: Option<usize>,
 ) -> BackgroundTargetFacts {
-    let window_server = match resolve_window_owner(pid, window_id) {
-        WindowOwner::SamePid => WindowServerOwnership::SamePid,
-        WindowOwner::Unknown => WindowServerOwnership::NotFound,
-        WindowOwner::ForeignPid { owner_pid, .. } => {
-            WindowServerOwnership::ForeignPid { owner_pid }
-        }
+    let window = crate::windows::window_info_by_id(window_id);
+    let window_server = match window.as_ref() {
+        Some(window) if window.pid == pid => WindowServerOwnership::SamePid,
+        Some(window) => WindowServerOwnership::ForeignPid {
+            owner_pid: window.pid,
+        },
+        None => WindowServerOwnership::NotFound,
     };
+    let target_on_screen = window
+        .as_ref()
+        .filter(|window| window.pid == pid)
+        .map(|window| window.is_on_screen);
 
     // SAFETY: the application element is created and released here; window
     // elements are released inside ax_window_records; the caller guarantees
@@ -437,6 +446,7 @@ pub fn gather_background_facts(
         window_server,
         ax_window_present: target.is_some(),
         target_minimized: target.and_then(|record| record.minimized),
+        target_on_screen,
         app_hidden,
         competing_keyboard_destinations,
         element: element.unwrap_or(ElementAncestry::NotAddressed),
@@ -510,6 +520,7 @@ mod tests {
                 || true,
             ),
             app_hidden: Some(false),
+            target_on_screen: Some(true),
             competing_keyboard_destinations: count_competing_keyboard_destinations(
                 42,
                 900,

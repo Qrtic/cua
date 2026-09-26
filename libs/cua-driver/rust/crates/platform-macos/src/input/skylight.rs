@@ -1153,8 +1153,10 @@ fn exact_ax_activation_steps(
     Ok(statuses)
 }
 
-/// This classification means the bounded read found no exact AX window and
-/// performed no AX write. Never classify an AX timeout/write error this way.
+/// The bounded read found no exact AX window available for input and performed
+/// no AX write. This also covers a proven native panel which AppKit keeps
+/// ordered out after a process-only activation. Never classify an AX timeout
+/// or an uncertain write this way.
 #[derive(Debug)]
 struct ExactActivationWindowUnavailable;
 
@@ -1228,15 +1230,19 @@ fn request_cocoa_activation_without_all_windows(
     check_exact_activation_owner(pid, window_id, &mut check_activity)?;
     let window = crate::windows::window_info_by_id(window_id)
         .ok_or_else(|| anyhow::anyhow!("Cocoa activation target no longer exists"))?;
-    // This recovery is for an ordinary, exact same-process window. A floating
-    // panel or delegated/system surface needs its existing separate proof.
-    if window.pid != pid
-        || window.layer != 0
-        || window.bounds.width <= 0.0
-        || window.bounds.height <= 0.0
-    {
-        anyhow::bail!("Cocoa AX publication requires an ordinary exact target window");
+    // A floating panel needs independent, repeated native focus/parent/window
+    // proof. A same-process WindowServer row alone never grants this recovery.
+    let focused_panel = window.layer != 0 && has_exact_focused_native_panel(pid, window_id);
+    if !cocoa_publication_target_allowed(&window, pid, focused_panel) {
+        anyhow::bail!(
+            "Cocoa AX publication requires an ordinary window or a proven exact native panel"
+        );
     }
+    tracing::debug!(
+        pid, window_id, layer = window.layer, window_on_screen = window.is_on_screen,
+        focused_panel_verified = focused_panel,
+        "requesting bounded Cocoa publication for exact input target"
+    );
     let app = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }
         .ok_or_else(|| anyhow::anyhow!("Cocoa activation process no longer exists"))?;
     check_exact_activation_owner(pid, window_id, &mut check_activity)?;
@@ -1244,6 +1250,26 @@ fn request_cocoa_activation_without_all_windows(
         anyhow::bail!("Cocoa refused the bounded application activation request");
     }
     check_exact_activation_owner(pid, window_id, check_activity)
+}
+
+fn has_exact_focused_native_panel(pid: i32, window_id: u32) -> bool {
+    crate::ax::focused_panel::copy_focused_panel(pid, Some(window_id))
+        .map(OwnedActivationAx)
+        .is_some()
+}
+
+fn cocoa_publication_target_allowed(
+    window: &crate::windows::WindowInfo,
+    pid: i32,
+    focused_panel_verified: bool,
+) -> bool {
+    window.pid == pid
+        && window.window_id != 0
+        && window.bounds.width.is_finite()
+        && window.bounds.height.is_finite()
+        && window.bounds.width > 0.0
+        && window.bounds.height > 0.0
+        && (window.layer == 0 || focused_panel_verified)
 }
 
 /// Finish only the requested native window's activation. Process activation
@@ -1261,6 +1287,15 @@ fn complete_exact_ax_window_activation(
     };
 
     check_exact_activation_owner(pid, window_id, &mut check_activity)?;
+    if exact_window_on_screen(pid, window_id) == Some(false)
+        && has_exact_focused_native_panel(pid, window_id)
+    {
+        // AppKit, rather than AXRaise on an ordered-out panel, must publish a
+        // hides-on-deactivate panel. The existing bounded caller requests Cocoa
+        // once and retries reads only. A closed-but-retained panel stays out and
+        // times out before any AX mutation or global input.
+        return Err(ExactActivationWindowUnavailable.into());
+    }
     if let Some(host_id) = crate::ax::attached_sheet::focused_dialog_host(pid, window_id) {
         let sheet = OwnedActivationAx(
             crate::ax::attached_sheet::copy_focused_attached_sheet(pid, window_id)
@@ -1358,6 +1393,12 @@ fn bounded_focused_window_id(pid: i32) -> Option<u32> {
     });
     bound_activation_ax(&window).ok()?;
     unsafe { crate::ax::bindings::ax_get_window_id(window.0) }
+}
+
+fn exact_window_on_screen(pid: i32, window_id: u32) -> Option<bool> {
+    crate::windows::window_info_by_id(window_id)
+        .filter(|window| window.pid == pid)
+        .map(|window| window.is_on_screen)
 }
 
 /// Observable AX context only. AXFocusedWindow is NOT a proof of the target's
@@ -2679,8 +2720,11 @@ fn exact_window_is_ready(
     target_psn: [u8; 8],
     focused_window_id: Option<u32>,
     target_window_id: u32,
+    on_screen: Option<bool>,
 ) -> bool {
-    current_front_psn == Some(target_psn) && focused_window_id == Some(target_window_id)
+    current_front_psn == Some(target_psn)
+        && focused_window_id == Some(target_window_id)
+        && on_screen == Some(true)
 }
 
 /// Block until WindowServer and Accessibility agree that the exact target is
@@ -2705,7 +2749,13 @@ fn await_exact_window_ready_guarded(
         window_id,
         target_psn,
         || check_exact_activation_owner(pid, window_id, &mut check_activity),
-        || (current_front_process_psn(), bounded_focused_window_id(pid)),
+        || {
+            (
+                current_front_process_psn(),
+                bounded_focused_window_id(pid),
+                exact_window_on_screen(pid, window_id),
+            )
+        },
         || started.elapsed(),
         || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
     )
@@ -2715,7 +2765,7 @@ fn await_exact_window_ready_with(
     window_id: u32,
     target_psn: [u8; 8],
     mut check_activity: impl FnMut() -> anyhow::Result<()>,
-    mut sample: impl FnMut() -> (Option<[u8; 8]>, Option<u32>),
+    mut sample: impl FnMut() -> (Option<[u8; 8]>, Option<u32>, Option<bool>),
     mut elapsed: impl FnMut() -> std::time::Duration,
     mut pause: impl FnMut(),
 ) -> anyhow::Result<()> {
@@ -2723,16 +2773,18 @@ fn await_exact_window_ready_with(
     let mut samples = 0u32;
     let mut front_match = None;
     let mut focused_window = None;
+    let mut on_screen = None;
     loop {
         check_activity().map_err(|error| anyhow::anyhow!(
-            "exact foreground target readiness interrupted: {error}; front_match={front_match:?}, ax_focused_window={focused_window:?}, samples={samples}, ready_samples={consecutive_ready_samples}, elapsed_ms={}",
+            "exact foreground target readiness interrupted: {error}; front_match={front_match:?}, ax_focused_window={focused_window:?}, window_on_screen={on_screen:?}, samples={samples}, ready_samples={consecutive_ready_samples}, elapsed_ms={}",
             elapsed().as_millis()
         ))?;
-        let (front, focused) = sample();
+        let (front, focused, visible) = sample();
         front_match = front.map(|psn| psn == target_psn);
         focused_window = focused;
+        on_screen = visible;
         samples += 1;
-        if exact_window_is_ready(front, target_psn, focused_window, window_id) {
+        if exact_window_is_ready(front, target_psn, focused_window, window_id, on_screen) {
             consecutive_ready_samples += 1;
         } else {
             consecutive_ready_samples = 0;
@@ -2740,13 +2792,13 @@ fn await_exact_window_ready_with(
         // AX is synchronous. Recheck activity after the bounded sample too,
         // before accepting even the second matching observation.
         check_activity().map_err(|error| anyhow::anyhow!(
-            "exact foreground target readiness interrupted: {error}; front_match={front_match:?}, ax_focused_window={focused_window:?}, samples={samples}, ready_samples={consecutive_ready_samples}, elapsed_ms={}",
+            "exact foreground target readiness interrupted: {error}; front_match={front_match:?}, ax_focused_window={focused_window:?}, window_on_screen={on_screen:?}, samples={samples}, ready_samples={consecutive_ready_samples}, elapsed_ms={}",
             elapsed().as_millis()
         ))?;
         let elapsed_ms = elapsed();
         if elapsed_ms >= ACTIVATION_WAIT_TIMEOUT {
             anyhow::bail!(
-                "exact foreground target did not become ready: timeout; front_match={front_match:?}, ax_focused_window={focused_window:?}, target_window={window_id}, samples={samples}, ready_samples={consecutive_ready_samples}, elapsed_ms={}",
+                "exact foreground target did not become ready: timeout; front_match={front_match:?}, ax_focused_window={focused_window:?}, window_on_screen={on_screen:?}, target_window={window_id}, samples={samples}, ready_samples={consecutive_ready_samples}, elapsed_ms={}",
                 elapsed_ms.as_millis()
             );
         }
@@ -2762,8 +2814,11 @@ fn exact_window_activation_required(
     focused_window: Option<u32>,
     target_pid: i32,
     target_window: u32,
+    on_screen: Option<bool>,
 ) -> bool {
-    front_pid != Some(target_pid) || focused_window != Some(target_window)
+    front_pid != Some(target_pid)
+        || focused_window != Some(target_window)
+        || on_screen != Some(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2896,6 +2951,7 @@ fn with_foreground_hid_activation_inner(
             bounded_focused_window_id(target_pid),
             target_pid,
             target_wid,
+            exact_window_on_screen(target_pid, target_wid),
         ) {
             episode.check()?;
             pip_activation = Some(crate::pip::begin_temporary_activation(
@@ -4147,18 +4203,83 @@ mod tests {
 
     #[test]
     fn foreground_same_process_different_window_requires_activation() {
-        assert!(exact_window_activation_required(Some(7), Some(41), 7, 42));
-        assert!(exact_window_activation_required(None, Some(42), 7, 42));
-        assert!(exact_window_activation_required(Some(7), None, 7, 42));
+        assert!(exact_window_activation_required(
+            Some(7),
+            Some(41),
+            7,
+            42,
+            Some(true)
+        ));
+        assert!(exact_window_activation_required(
+            None,
+            Some(42),
+            7,
+            42,
+            Some(true)
+        ));
+        assert!(exact_window_activation_required(
+            Some(7),
+            None,
+            7,
+            42,
+            Some(true)
+        ));
     }
 
     #[test]
     fn foreground_exact_focused_target_skips_reactivation() {
         let mut activation_writes = 0;
-        if exact_window_activation_required(Some(7), Some(42), 7, 42) {
+        if exact_window_activation_required(Some(7), Some(42), 7, 42, Some(true)) {
             activation_writes += 1;
         }
         assert_eq!(activation_writes, 0);
+    }
+
+    #[test]
+    fn foreground_retained_panel_focus_does_not_skip_publication() {
+        for visibility in [Some(false), None] {
+            assert!(exact_window_activation_required(
+                Some(7),
+                Some(42),
+                7,
+                42,
+                visibility
+            ));
+        }
+    }
+
+    #[test]
+    fn cocoa_publication_requires_separate_proof_for_accessory_panels() {
+        let mut window = crate::windows::WindowInfo {
+            window_id: 42,
+            pid: 7,
+            app_name: String::new(),
+            title: String::new(),
+            bounds: crate::windows::WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 480.0,
+                height: 270.0,
+            },
+            layer: 0,
+            z_index: 1,
+            is_on_screen: false,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        };
+        assert!(super::cocoa_publication_target_allowed(&window, 7, false));
+        window.layer = 3;
+        assert!(!super::cocoa_publication_target_allowed(&window, 7, false));
+        assert!(super::cocoa_publication_target_allowed(&window, 7, true));
+        assert!(!super::cocoa_publication_target_allowed(&window, 8, true));
+        window.window_id = 0;
+        assert!(!super::cocoa_publication_target_allowed(&window, 7, true));
+        window.window_id = 42;
+        for width in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            window.bounds.width = width;
+            assert!(!super::cocoa_publication_target_allowed(&window, 7, true));
+        }
     }
 
     #[test]
@@ -4242,7 +4363,11 @@ mod tests {
             || Ok(()),
             || {
                 samples.set(samples.get() + 1);
-                (Some(psn), windows.next().expect("bounded samples"))
+                (
+                    Some(psn),
+                    windows.next().expect("bounded samples"),
+                    Some(true),
+                )
             },
             || elapsed.get(),
             || elapsed.set(elapsed.get() + Duration::from_millis(10)),
@@ -4260,7 +4385,7 @@ mod tests {
             42,
             psn,
             || Ok(()),
-            || (Some(psn), Some(41)),
+            || (Some(psn), Some(41), Some(true)),
             || elapsed.get(),
             || elapsed.set(elapsed.get() + Duration::from_millis(100)),
         )
@@ -4276,6 +4401,53 @@ mod tests {
     }
 
     #[test]
+    fn foreground_retained_panel_cannot_dispatch_until_it_is_on_screen() {
+        for visibility in [Some(false), None] {
+            let elapsed = Cell::new(Duration::ZERO);
+            let hid = Cell::new(false);
+            let error = await_exact_window_ready_with(
+                42,
+                [1; 8],
+                || Ok(()),
+                || (Some([1; 8]), Some(42), visibility),
+                || elapsed.get(),
+                || elapsed.set(elapsed.get() + Duration::from_millis(100)),
+            )
+            .map(|_| hid.set(true))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("timeout"));
+            assert!(error.contains("ready_samples=0"));
+            assert!(error.contains(&format!("window_on_screen={visibility:?}")));
+            assert!(!hid.get());
+        }
+    }
+
+    #[test]
+    fn foreground_panel_visibility_must_settle_for_two_consecutive_samples() {
+        let mut visibility = [Some(true), Some(false), None, Some(true), Some(true)].into_iter();
+        let samples = Cell::new(0);
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = await_exact_window_ready_with(
+            42,
+            [1; 8],
+            || Ok(()),
+            || {
+                samples.set(samples.get() + 1);
+                (
+                    Some([1; 8]),
+                    Some(42),
+                    visibility.next().expect("bounded samples"),
+                )
+            },
+            || elapsed.get(),
+            || elapsed.set(elapsed.get() + Duration::from_millis(10)),
+        );
+        assert!(result.is_ok());
+        assert_eq!(samples.get(), 5);
+    }
+
+    #[test]
     fn foreground_readiness_guard_loss_after_sample_stops_hid() {
         let checks = Cell::new(0);
         let hid = Cell::new(false);
@@ -4287,7 +4459,7 @@ mod tests {
                 anyhow::ensure!(checks.get() != 4, "activity changed during AX sample");
                 Ok(())
             },
-            || (Some([1; 8]), Some(42)),
+            || (Some([1; 8]), Some(42), Some(true)),
             || Duration::from_millis(10),
             || {},
         )
@@ -4454,10 +4626,48 @@ mod tests {
         let target = [1, 2, 3, 4, 5, 6, 7, 8];
         let other = [8, 7, 6, 5, 4, 3, 2, 1];
 
-        assert!(exact_window_is_ready(Some(target), target, Some(42), 42));
-        assert!(!exact_window_is_ready(Some(other), target, Some(42), 42));
-        assert!(!exact_window_is_ready(Some(target), target, Some(41), 42));
-        assert!(!exact_window_is_ready(None, target, Some(42), 42));
+        assert!(exact_window_is_ready(
+            Some(target),
+            target,
+            Some(42),
+            42,
+            Some(true)
+        ));
+        assert!(!exact_window_is_ready(
+            Some(other),
+            target,
+            Some(42),
+            42,
+            Some(true)
+        ));
+        assert!(!exact_window_is_ready(
+            Some(target),
+            target,
+            Some(41),
+            42,
+            Some(true)
+        ));
+        assert!(!exact_window_is_ready(
+            None,
+            target,
+            Some(42),
+            42,
+            Some(true)
+        ));
+        assert!(!exact_window_is_ready(
+            Some(target),
+            target,
+            Some(42),
+            42,
+            Some(false)
+        ));
+        assert!(!exact_window_is_ready(
+            Some(target),
+            target,
+            Some(42),
+            42,
+            None
+        ));
     }
 
     #[test]
