@@ -456,16 +456,57 @@ impl PopoverTree for NativeTree {
         Instant::now() < self.deadline
     }
     fn visible_menu_window(&self, node: &AxNode, pid: i32) -> Option<u32> {
-        if !self.within_budget() {
-            return None;
+        let timing = super::menu_window_diagnostics::Timing::start();
+        let mut observed_frame = None;
+        let mut observed_windows = None;
+        let mut matched_window = None;
+        let mut phase = "budget_before_frame";
+        let result = (|| {
+            if !self.within_budget() {
+                return None;
+            }
+            phase = "frame_read_missing";
+            observed_frame = unsafe { super::bindings::element_screen_rect(node.0) };
+            let frame = observed_frame?;
+            observed_windows = Some(crate::windows::all_windows_including_accessory_layers());
+            phase = "window_match";
+            let window = match_menu_window(pid, &frame, observed_windows.as_deref().unwrap())?;
+            // The original temporary snapshot was dropped before the final
+            // budget check. Retain it only when matching has already failed.
+            drop(observed_windows.take());
+            matched_window = Some(window);
+            phase = "budget_after_match";
+            self.within_budget().then_some(window)
+        })();
+        // Resolve the original decision and its end timestamp before any
+        // diagnostic enumeration/formatting. Reuse the existing snapshot only.
+        let completed = crate::order_diagnostics::monotonic_us();
+        if let Some(window) = matched_window.filter(|_| result.is_none()) {
+            timing.refusal_after_match(completed, pid, observed_frame, window);
+        } else if result.is_none() {
+            timing.refusal(
+                completed,
+                pid,
+                phase,
+                observed_frame,
+                observed_windows.iter().flatten().map(|window| {
+                    super::menu_window_diagnostics::Candidate {
+                        pid: window.pid,
+                        id: window.window_id,
+                        bounds: [
+                            window.bounds.x,
+                            window.bounds.y,
+                            window.bounds.width,
+                            window.bounds.height,
+                        ],
+                        layer: window.layer,
+                        on_screen: window.is_on_screen,
+                        on_current_space: window.on_current_space,
+                    }
+                }),
+            );
         }
-        let frame = unsafe { super::bindings::element_screen_rect(node.0) }?;
-        let window = match_menu_window(
-            pid,
-            &frame,
-            &crate::windows::all_windows_including_accessory_layers(),
-        )?;
-        self.within_budget().then_some(window)
+        result
     }
 }
 

@@ -76,7 +76,7 @@ fn micros(duration: std::time::Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
 }
 
-fn monotonic_us() -> u64 {
+pub(crate) fn monotonic_us() -> u64 {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     micros(ORIGIN.get_or_init(Instant::now).elapsed())
 }

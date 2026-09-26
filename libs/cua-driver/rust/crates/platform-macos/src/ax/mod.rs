@@ -30,6 +30,7 @@ pub mod exact_target;
 pub(crate) mod focused_panel;
 pub(crate) mod menu_context;
 pub(crate) mod menu_selection;
+mod menu_window_diagnostics;
 pub(crate) mod native_text_editor;
 pub mod tree;
 mod virtual_button;
