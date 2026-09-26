@@ -283,6 +283,7 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "hotkey",
     "set_value",
     "bring_to_front",
+    "present_window",
     "set_window_frame",
     "begin_foreground_segment",
     "end_foreground_segment",
@@ -896,6 +897,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "invoke_menu"
         | "launch_app"
         | "bring_to_front"
+        | "present_window"
         | "set_window_frame"
         | "begin_foreground_segment"
         | "end_foreground_segment"
@@ -1197,6 +1199,7 @@ fn enforce_hard_invariants(
             | "set_value"
             | "kill_app"
             | "bring_to_front"
+            | "present_window"
             | "begin_foreground_segment"
             | "end_foreground_segment"
             | "prepare_dialog"

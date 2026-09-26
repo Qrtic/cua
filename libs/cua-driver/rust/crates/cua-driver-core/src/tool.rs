@@ -387,7 +387,12 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "list_apps" => &["app.list"],
         "kill_app" => &["app.kill"],
         "list_windows" => &["window.list"],
-        "bring_to_front" => &["window.activate"],
+        "bring_to_front"
+        | "present_window"
+        | "begin_foreground_segment"
+        | "end_foreground_segment"
+        | "prepare_dialog"
+        | "prepare_observation" => &["window.activate"],
         "set_window_frame" => &["window.frame.set"],
         "debug_window_info" => &["window.debug_info"],
 
@@ -438,7 +443,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
 
         // ── driver self-service ──────────────────────────────────────
         "check_for_update" => &["driver.update_check"],
-        "probe" => &["driver.probe"],
+        "probe" | "health_report" => &["driver.probe"],
 
         // ── encrypted local Computer History ─────────────────────────
         "history_status" => &["history.status"],
@@ -1924,6 +1929,7 @@ impl ToolRegistry {
         let delivery_mode = if matches!(
             tool_name,
             "bring_to_front"
+                | "present_window"
                 | "begin_foreground_segment"
                 | "end_foreground_segment"
                 | "prepare_dialog"
@@ -2636,6 +2642,7 @@ fn is_physical_desktop_action(tool: &str) -> bool {
             | "hotkey"
             | "set_value"
             | "bring_to_front"
+            | "present_window"
             | "set_window_frame"
             | "end_foreground_segment"
             | "prepare_dialog"
@@ -3928,6 +3935,107 @@ resources:
             0,
             "routine standard recording is promptless"
         );
+    }
+
+    #[tokio::test]
+    async fn present_window_enters_canonical_dispatch_once() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = argument_registry("present_window", None, hits.clone());
+        let result = registry
+            .invoke_with_context(
+                "present_window",
+                serde_json::json!({
+                    "pid": 42, "window_id": 7, "element_token": "observed-window",
+                    "delivery_mode": "foreground", "presentation_scope": "exact_window_only_v1"
+                }),
+                standard_context(),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn present_window_preserves_exact_manifest_window_scope() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = argument_registry("present_window", None, hits.clone());
+        let context = bounded_context(
+            r#"version: 3
+expires_after: 1h
+idle_timeout: 30m
+allow:
+  tools: [present_window]
+resources:
+  desktop:
+    windows:
+      - pid: 42
+        window_id: 7
+"#,
+        );
+        for (pid, window_id, allowed) in [(42, 7, true), (42, 8, false), (43, 7, false)] {
+            let result = registry
+                .invoke_with_context(
+                    "present_window",
+                    serde_json::json!({
+                        "pid": pid, "window_id": window_id, "element_token": "observed-window",
+                        "delivery_mode": "foreground", "presentation_scope": "exact_window_only_v1"
+                    }),
+                    context.clone(),
+                )
+                .await;
+            assert_eq!(result.is_error != Some(true), allowed, "{result:?}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn present_window_cannot_target_its_own_authorization_process() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = argument_registry("present_window", None, hits.clone());
+        let result = registry
+            .invoke_with_context(
+                "present_window",
+                serde_json::json!({
+                    "pid": std::process::id(), "window_id": 7,
+                    "delivery_mode": "foreground", "presentation_scope": "exact_window_only_v1"
+                }),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content.iter().any(|item| matches!(item,
+            crate::protocol::Content::Text { text, .. }
+            if text.contains("own authorization process"))),
+            "{result:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn present_window_waits_for_the_physical_input_lane() {
+        let guard = desktop_action_coordinator().lock().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = argument_registry("present_window", None, hits.clone());
+        let call = registry.invoke_with_context(
+            "present_window",
+            serde_json::json!({
+                "pid": 42, "window_id": 7, "element_token": "observed-window",
+                "delivery_mode": "foreground", "presentation_scope": "exact_window_only_v1"
+            }),
+            standard_context(),
+        );
+        tokio::pin!(call);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut call)
+            .await
+            .is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        drop(guard);
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -5376,10 +5484,16 @@ mod capability_tests {
         "kill_app",
         "list_windows",
         "bring_to_front",
+        "present_window",
+        "begin_foreground_segment",
+        "end_foreground_segment",
+        "prepare_dialog",
+        "prepare_observation",
         "set_window_frame",
         "debug_window_info",
         // permissions / config
         "check_permissions",
+        "health_report",
         "get_config",
         "set_config",
         // sessions

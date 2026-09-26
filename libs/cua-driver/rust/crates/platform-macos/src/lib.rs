@@ -162,3 +162,27 @@ mod cursor_overlay_host_tests {
         assert!(!cursor_overlay_facility_available(false, false));
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod registration_tests {
+    #[test]
+    fn registered_native_tools_have_reviewed_capabilities_and_risks() {
+        // Inspect the actual platform registry so a new tool cannot be missed
+        // merely because a second, manually maintained test list omitted it.
+        let registry = super::register_tools();
+        let mut missing = Vec::new();
+        for (name, _definition) in registry.iter_defs() {
+            // A schema-derived delivery-mode token alone does not describe
+            // the operation's capability or permit a name-only omission.
+            if cua_driver_core::tool::default_capabilities_for(name).is_empty() {
+                missing.push(format!("{name}: missing capabilities"));
+            }
+            if cua_driver_core::authorization::advertised_risk_for(name).class
+                == cua_driver_core::authorization::RiskClass::Unclassified
+            {
+                missing.push(format!("{name}: unreviewed risk"));
+            }
+        }
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+    }
+}

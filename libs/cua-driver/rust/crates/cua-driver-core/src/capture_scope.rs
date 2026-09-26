@@ -175,6 +175,7 @@ fn is_scoped_action(tool_name: &str) -> bool {
             | "press_key"
             | "hotkey"
             | "set_value"
+            | "present_window"
             | "begin_foreground_segment"
             | "end_foreground_segment"
             | "prepare_dialog"
@@ -329,6 +330,41 @@ mod tests {
 
     fn fresh(prefix: &str) -> String {
         format!("capture-scope-{prefix}-{}", std::process::id())
+    }
+
+    #[test]
+    fn present_window_cannot_escape_the_session_capture_scope() {
+        let window = fresh("presentation-window");
+        let desktop = fresh("presentation-desktop");
+        bind_session(&window, Some(CaptureScopePolicy::Window)).unwrap();
+        bind_session(&desktop, Some(CaptureScopePolicy::Desktop)).unwrap();
+        assert!(enforce_tool(
+            "present_window",
+            &json!({
+                "session": window, "pid": 42, "window_id": 7
+            })
+        )
+        .is_ok());
+        assert_eq!(
+            enforce_tool(
+                "present_window",
+                &json!({"session": window, "scope": "desktop"})
+            )
+            .unwrap_err()
+            .code,
+            "desktop_scope_disabled"
+        );
+        assert_eq!(
+            enforce_tool(
+                "present_window",
+                &json!({
+                    "session": desktop, "pid": 42, "window_id": 7
+                })
+            )
+            .unwrap_err()
+            .code,
+            "window_scope_disabled"
+        );
     }
 
     #[test]
