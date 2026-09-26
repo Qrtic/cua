@@ -236,6 +236,7 @@ mod tests {
     #[test]
     fn application_menu_pixels_are_refused_before_any_capture_or_transform() {
         let image = crate::ax::application_menu::ApplicationMenuImage {
+            kind: crate::ax::application_menu::MenuKind::Application,
             pid: 42,
             document_window_id: 910_007,
             menu_window_id: 910_009,

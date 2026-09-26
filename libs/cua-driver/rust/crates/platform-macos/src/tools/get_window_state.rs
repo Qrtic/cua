@@ -424,6 +424,7 @@ fn apply_application_menu_scope_metadata(
     structured["screenshot_coordinates_actionable"] = serde_json::json!(false);
     structured["screenshot_target"] = serde_json::json!("application_menu.visual_target");
     structured["application_menu"] = serde_json::json!({
+        "kind":menu.kind.as_str(),
         "host_pid":menu.pid,"host_window_id":menu.document_window_id,
         "visual_target":{
             "pid":menu.pid,"window_id":menu.menu_window_id,
@@ -1178,13 +1179,17 @@ impl Tool for GetWindowStateTool {
             // walker also applies a native per-element messaging timeout because
             // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
             let walk_future = crate::foreground_activity::spawn_blocking(move || {
-                let tree = if delegated_panel {
-                    crate::ax::tree::walk_tree_bounded_strict_window(
+                let tree = if delegated_panel && !observation_only {
+                    crate::ax::tree::walk_tree_bounded_strict_window_with_visible_menu(
                         pid,
                         window_id,
                         q.as_deref(),
                         max_elements,
                         max_depth,
+                    )
+                } else if delegated_panel {
+                    crate::ax::tree::walk_tree_bounded_strict_window(
+                        pid, window_id, q.as_deref(), max_elements, max_depth,
                     )
                 } else if !observation_only {
                     crate::ax::tree::walk_tree_bounded_with_visible_menu(
@@ -1221,8 +1226,10 @@ impl Tool for GetWindowStateTool {
                 return (None, None, None);
             }
             match crate::foreground_activity::spawn_blocking(move || {
-                let menu = if !observation_only && transient_target.is_none() && !delegated_panel {
-                    crate::ax::application_menu::active_application_menu(pid, window_id)
+                let menu = if !observation_only {
+                    crate::ax::application_menu::active_open_menu_projection(
+                        pid, window_id, transient_target.is_none() && !delegated_panel,
+                    ).map(|menu| menu.image)
                 } else {
                     None
                 };
@@ -3460,6 +3467,7 @@ mod tests {
 
     fn menu_image_fixture() -> crate::ax::application_menu::ApplicationMenuImage {
         crate::ax::application_menu::ApplicationMenuImage {
+            kind: crate::ax::application_menu::MenuKind::Application,
             pid: 42,
             document_window_id: 7,
             menu_window_id: 9,

@@ -5328,6 +5328,7 @@ mod tests {
             height: 100.0,
         };
         let menu = crate::ax::application_menu::ApplicationMenuImage {
+            kind: crate::ax::application_menu::MenuKind::Application,
             pid: observed.pid as i32,
             document_window_id: observed.window_id as u32,
             menu_window_id: source.window_id as u32,

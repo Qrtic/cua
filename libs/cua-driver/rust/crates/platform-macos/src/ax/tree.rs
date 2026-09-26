@@ -248,6 +248,20 @@ pub fn walk_tree_bounded_strict_window(
     )
 }
 
+/// The same exact helper-window scope, with only a context menu proven under
+/// that host eligible to replace the observation surface. No app menu bar.
+pub(crate) fn walk_tree_bounded_strict_window_with_visible_menu(
+    pid: i32,
+    window_id: u32,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+) -> TreeWalkResult {
+    walk_tree_bounded_with_projection(
+        pid, Some(window_id), query, max_elements, max_depth, true, true,
+    )
+}
+
 fn walk_tree_bounded_with_projection(
     pid: i32,
     window_id: Option<u32>,
@@ -384,19 +398,21 @@ fn walk_tree_bounded_with_projection(
             top_level.to_vec()
         };
 
-        // A menu projection is admitted only where ordinary exact-window
-        // scoping already permits the application's menu bar. Dialogs and
-        // delegated helper windows keep their strict existing surface.
+        // Menu-bar projection retains its original scoping permission. A
+        // context menu instead proves ancestry in the exact selected host,
+        // including an already authorized helper, without sibling inheritance.
         let visible_menu = window_id
             .filter(|_| {
                 prioritize_visible_menu
-                    && !strict_exact_window
                     && window_scope.as_ref().is_some_and(WindowScope::is_matched)
+            })
+            .and_then(|wid| {
+                let allow_application_menu = !strict_exact_window
                     && walk_these.iter().any(|&child| {
                         copy_string_attr(child, "AXRole").as_deref() == Some("AXMenuBar")
-                    })
-            })
-            .and_then(|wid| super::application_menu::active_application_menu_projection(pid, wid));
+                    });
+                super::application_menu::active_open_menu_projection(pid, wid, allow_application_menu)
+            });
         let roots = if let Some(menu) = visible_menu.as_ref() {
             application_menu = Some(menu.image.clone());
             vec![menu.root()]
