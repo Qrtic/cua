@@ -250,8 +250,7 @@ impl Tool for PresentWindowTool {
             let mut attempted = false;
             let outcome = (|| -> anyhow::Result<()> {
                 let deadline = Instant::now() + Duration::from_secs(4);
-                let check_target = || -> anyhow::Result<()> {
-                    crate::foreground_activity::check_request()?;
+                let validate_target = || -> anyhow::Result<()> {
                     anyhow::ensure!(Instant::now() < deadline, "exact presentation deadline expired");
                     let current = state.element_cache.get_element_retained_for_snapshot(pid, window, snapshot_id, element_index)
                         .ok_or_else(|| anyhow::anyhow!("presentation observation was replaced"))?;
@@ -260,13 +259,25 @@ impl Tool for PresentWindowTool {
                     let windows = window_snapshot()?;
                     anyhow::ensure!(windows.iter().any(|w| w.pid == pid && w.window_id == window && visible_ordinary(w)),
                         "presentation target is hidden, off-Space or unavailable");
-                    crate::foreground_activity::check_request()?;
                     anyhow::ensure!(Instant::now() < deadline, "exact presentation deadline expired");
                     Ok(())
                 };
-                check_target()?;
+                crate::foreground_activity::check_request()?;
+                validate_target()?;
                 let before = window_snapshot()?;
                 let episode = crate::foreground_activity::Episode::begin(pid, window)?;
+                // Activation must be allowed to start while the exact target
+                // is still in the background. check_request() becomes the
+                // foreground input guard once an episode exists, so using it
+                // here would reject the transition before its first write.
+                // Keep the admitted activity/request and exact target checks
+                // around every preparation write; require exact foreground
+                // ownership independently before retaining the presentation.
+                let check_target = || -> anyhow::Result<()> {
+                    episode.check()?;
+                    validate_target()?;
+                    episode.check()
+                };
                 let presented = (|| -> anyhow::Result<()> {
                     if !exact_front(pid, window, &before) {
                         check_target()?;
