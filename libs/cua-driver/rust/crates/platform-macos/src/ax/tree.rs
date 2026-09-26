@@ -163,6 +163,9 @@ pub struct TreeWalkResult {
     /// When present, the bounded projection walks only this proven visible
     /// application menu. Its action anchor remains the exact document window.
     pub(crate) application_menu: Option<super::application_menu::ApplicationMenuImage>,
+    /// Same-window menu discovered through a live AX hit test. Pixels remain
+    /// in the exact host's coordinate frame, unlike a separate menu window.
+    pub(crate) embedded_menu: Option<std::sync::Arc<super::embedded_menu::EmbeddedMenuProof>>,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -277,6 +280,7 @@ fn walk_tree_bounded_with_projection(
     let mut limits = WalkLimits::new(max_elements, max_depth);
     let mut window_scope: Option<WindowScope> = None;
     let mut application_menu = None;
+    let embedded_menu;
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -289,6 +293,7 @@ fn walk_tree_bounded_with_projection(
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
                 application_menu: None,
+                embedded_menu: None,
             };
         }
         set_messaging_timeout(app_elem);
@@ -413,8 +418,14 @@ fn walk_tree_bounded_with_projection(
                     });
                 super::application_menu::active_open_menu_projection(pid, wid, allow_application_menu)
             });
+        embedded_menu = window_id
+            .filter(|_| prioritize_visible_menu && visible_menu.is_none()
+                && window_scope.as_ref().is_some_and(WindowScope::is_matched))
+            .and_then(|wid| super::embedded_menu::active_menu(pid, wid));
         let roots = if let Some(menu) = visible_menu.as_ref() {
             application_menu = Some(menu.image.clone());
+            vec![menu.root()]
+        } else if let Some(menu) = embedded_menu.as_ref() {
             vec![menu.root()]
         } else {
             walk_these
@@ -458,6 +469,7 @@ fn walk_tree_bounded_with_projection(
         truncated: truncated_flag,
         window_scope,
         application_menu,
+        embedded_menu,
     }
 }
 

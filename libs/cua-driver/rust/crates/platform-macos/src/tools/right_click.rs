@@ -208,6 +208,7 @@ impl Tool for RightClickTool {
                     crate::foreground_activity::spawn_blocking(move || {
                         let element_ptr = element_guard.as_ptr();
                         crate::foreground_activity::check_request()?;
+                        element_guard.validate_observation_scope()?;
                         super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
                         unsafe {
                             super::ensure_app_context_element_window(
@@ -224,7 +225,10 @@ impl Tool for RightClickTool {
 
             return match result {
                 Ok(Ok(msg)) => ToolResult::text(msg),
-                Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),
+                Ok(Err(e)) => match e.downcast_ref::<crate::ax::embedded_menu::StaleEmbeddedMenu>() {
+                    Some(stale) => stale.result(pid, wid),
+                    None => ToolResult::error(format!("Right-click failed: {e}")),
+                },
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
         }

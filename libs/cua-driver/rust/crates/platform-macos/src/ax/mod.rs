@@ -23,6 +23,7 @@ pub(crate) mod attached_sheet;
 pub mod bindings;
 pub mod cache;
 pub(crate) mod date_value;
+pub(crate) mod embedded_menu;
 mod element_ancestry;
 pub mod enablement;
 pub mod exact_target;

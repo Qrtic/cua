@@ -1302,7 +1302,9 @@ pub fn right_click_at_xy_with_window_local(
     wid: u32,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    right_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers)
+    right_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers)?;
+    crate::ax::embedded_menu::remember_right_click(pid, wid, [x, y]);
+    Ok(())
 }
 
 fn right_click_at_xy_inner(

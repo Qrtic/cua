@@ -30,7 +30,10 @@ use cua_driver_core::element_cache::ElementCacheCore;
 /// `CFGetTypeID` (`EXC_BREAKPOINT`) and crashes the daemon. The retain is taken
 /// under the cache lock (see [`ElementCache::get_element_retained`]); the
 /// matching `CFRelease` fires on drop.
-pub struct RetainedElement(usize);
+pub struct RetainedElement {
+    ptr: usize,
+    embedded_menu: Option<std::sync::Arc<super::embedded_menu::EmbeddedMenuProof>>,
+}
 
 impl RetainedElement {
     /// Retain a pointer whose lifetime the caller already owns or borrows.
@@ -44,19 +47,30 @@ impl RetainedElement {
         if ptr != 0 {
             CFRetain(ptr as AXUIElementRef as CFTypeRef);
         }
-        Self(ptr)
+        Self { ptr, embedded_menu: None }
     }
 
     /// The raw pointer, valid for as long as this guard is held.
     pub fn as_ptr(&self) -> usize {
-        self.0
+        self.ptr
+    }
+
+    /// The proof travels with the retained pointer, so a concurrent cache
+    /// replacement cannot substitute a different menu's visibility evidence.
+    pub(crate) fn validate_observation_scope(&self) -> anyhow::Result<()> {
+        if self.embedded_menu.as_ref().is_some_and(|menu| !menu.is_live()) {
+            return Err(super::embedded_menu::StaleEmbeddedMenu.into());
+        }
+        Ok(())
     }
 }
 
 impl Clone for RetainedElement {
     fn clone(&self) -> Self {
         // The source guard keeps the object alive until its clone owns a retain.
-        unsafe { Self::retain(self.0) }
+        let mut cloned = unsafe { Self::retain(self.ptr) };
+        cloned.embedded_menu = self.embedded_menu.clone();
+        cloned
     }
 }
 
@@ -67,8 +81,8 @@ unsafe impl Send for RetainedElement {}
 
 impl Drop for RetainedElement {
     fn drop(&mut self) {
-        if self.0 != 0 {
-            unsafe { CFRelease(self.0 as AXUIElementRef as CFTypeRef) };
+        if self.ptr != 0 {
+            unsafe { CFRelease(self.ptr as AXUIElementRef as CFTypeRef) };
         }
     }
 }
@@ -84,6 +98,7 @@ pub struct CacheKey {
 pub struct CachedSnapshot {
     /// element_index → raw AXUIElementRef pointer (retained, as usize for Send).
     pub elements: Vec<usize>,
+    embedded_menu: Option<std::sync::Arc<super::embedded_menu::EmbeddedMenuProof>>,
 }
 
 impl Drop for CachedSnapshot {
@@ -111,6 +126,13 @@ impl ElementCache {
 
     /// Replace the snapshot for (pid, window_id) with the nodes from a fresh walk.
     pub fn update(&self, pid: i32, window_id: u32, snapshot_id: Option<u32>, nodes: &[AXNode]) {
+        self.update_with_embedded_menu(pid, window_id, snapshot_id, nodes, None);
+    }
+
+    pub(crate) fn update_with_embedded_menu(
+        &self, pid: i32, window_id: u32, snapshot_id: Option<u32>, nodes: &[AXNode],
+        embedded_menu: Option<std::sync::Arc<super::embedded_menu::EmbeddedMenuProof>>,
+    ) {
         let elements: Vec<usize> = nodes
             .iter()
             .filter(|n| n.element_index.is_some())
@@ -119,7 +141,7 @@ impl ElementCache {
         self.core.insert_for_snapshot(
             CacheKey { pid, window_id },
             snapshot_id,
-            CachedSnapshot { elements },
+            CachedSnapshot { elements, embedded_menu },
         );
     }
 
@@ -144,9 +166,10 @@ impl ElementCache {
                     // snapshot (and thus this CFTypeRef) is alive right now.
                     unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
                 }
-                Some(RetainedElement(ptr))
+                Some(RetainedElement { ptr, embedded_menu: s.embedded_menu.clone() })
             })
             .flatten()
+            .filter(|element| element.validate_observation_scope().is_ok())
     }
 
     /// Snapshot-bound variant used by every model-visible element action.
@@ -164,9 +187,10 @@ impl ElementCache {
                 if ptr != 0 {
                     unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
                 }
-                Some(RetainedElement(ptr))
+                Some(RetainedElement { ptr, embedded_menu: s.embedded_menu.clone() })
             })
             .flatten()
+            .filter(|element| element.validate_observation_scope().is_ok())
     }
 
     /// Number of indexed elements for (pid, window_id), or 0 if not cached.
@@ -188,6 +212,33 @@ mod tests {
     use super::*;
     use core_foundation::base::{CFGetRetainCount, CFRetain, TCFType};
     use core_foundation::string::CFString;
+
+    #[test]
+    fn expired_embedded_menu_snapshot_refuses_even_a_live_retained_element() {
+        let value = CFString::new("cua-embedded-menu-snapshot-retain-regression");
+        let ptr = value.as_concrete_TypeRef() as usize;
+        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let cache = ElementCache::new();
+        unsafe { CFRetain(ptr as CFTypeRef); }
+        cache.update_with_embedded_menu(1, 2, Some(7), &[node_with_ptr(ptr)],
+            Some(super::super::embedded_menu::expired_test_proof()));
+        assert!(cache.get_element_retained_for_snapshot(1, 2, 7, 0).is_none());
+        assert!(cache.get_element_retained(1, 2, 0).is_none());
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
+        cache.update(1, 2, Some(8), &[]);
+        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
+    }
+
+    #[test]
+    fn retained_element_clone_preserves_embedded_menu_scope() {
+        let value = CFString::new("cua-embedded-menu-retained-guard-scope-regression");
+        let mut guard = unsafe { RetainedElement::retain(value.as_concrete_TypeRef() as usize) };
+        guard.embedded_menu = Some(super::super::embedded_menu::expired_test_proof());
+        let copied = guard.clone();
+        drop(guard);
+        assert!(copied.validate_observation_scope().unwrap_err()
+            .is::<super::super::embedded_menu::StaleEmbeddedMenu>());
+    }
 
     // An AXNode carrying a raw CFTypeRef pointer as if it were an element.
     // A long, dynamic string is heap-allocated (not a tagged-pointer CFString),

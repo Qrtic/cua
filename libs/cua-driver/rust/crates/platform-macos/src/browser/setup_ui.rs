@@ -1751,6 +1751,7 @@ mod tests {
             truncated: false,
             window_scope: Some(crate::ax::WindowScope::Matched),
             application_menu: None,
+            embedded_menu: None,
         }
     }
 
@@ -1880,6 +1881,7 @@ mod tests {
             truncated: true,
             window_scope: Some(crate::ax::WindowScope::Matched),
             application_menu: None,
+            embedded_menu: None,
         };
         assert!(
             exact_pixel_setup_checkbox(0, &truncated, 0, chrome(), false)

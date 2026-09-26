@@ -681,7 +681,8 @@ impl OwnedTreeWalk {
         window_id: u32,
         snapshot_id: Option<u32>,
     ) {
-        cache.update(pid, window_id, snapshot_id, &self.tree.nodes);
+        cache.update_with_embedded_menu(pid, window_id, snapshot_id, &self.tree.nodes,
+            self.tree.embedded_menu.clone());
         self.handles_published = true;
     }
 }
@@ -1346,6 +1347,18 @@ impl Tool for GetWindowStateTool {
             }
         }
 
+        if let Some(menu) = tree_result.as_ref().and_then(|tree| tree.embedded_menu.as_ref()) {
+            let proof = menu.clone();
+            if !crate::foreground_activity::spawn_blocking(move || proof.is_live()).await.unwrap_or(false) {
+                return ToolResult::error(
+                    "The embedded context menu changed during observation. Re-observe the exact window; no new AX binding was published.",
+                ).with_structured(serde_json::json!({
+                    "code":"embedded_menu_changed_during_observation", "effect":"refused",
+                    "retryable":true, "pid":pid, "window_id":window_id,
+                }));
+            }
+        }
+
         if let Some(menu) = application_menu.as_ref() {
             let proof = menu.clone();
             if !crate::foreground_activity::spawn_blocking(move || {
@@ -1729,6 +1742,13 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(tree) = published_tree_result {
             structured["tree_truncated"] = serde_json::json!(tree.truncated);
+            if tree.embedded_menu.is_some() {
+                structured["embedded_context_menu"] = serde_json::json!({
+                    "host_window_id":window_id,
+                    "tree_scope":"visible_menu",
+                    "coordinate_frame":"host_window",
+                });
+            }
         }
         if let Some((_, context, _)) = app_context_observation.as_ref() {
             structured["selection"] = context.selection_json(true);
@@ -2952,6 +2972,7 @@ mod tests {
             truncated: false,
             window_scope: None,
             application_menu: None,
+            embedded_menu: None,
         })
     }
 

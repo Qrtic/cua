@@ -906,6 +906,7 @@ impl Tool for ClickTool {
                 let result = crate::foreground_activity::spawn_blocking(move || {
                     let element_ptr = element_guard.as_ptr();
                     crate::foreground_activity::check_request()?;
+                    element_guard.validate_observation_scope()?;
                     super::ensure_app_context_delegation_live(
                         middle_app_context_route.as_ref(),
                     )?;
@@ -1072,6 +1073,7 @@ impl Tool for ClickTool {
                     crate::foreground_activity::spawn_blocking(move || {
                         let element_ptr = element_guard.as_ptr();
                         crate::foreground_activity::check_request()?;
+                        element_guard.validate_observation_scope()?;
                         super::ensure_app_context_delegation_live(ax_app_context_route.as_ref())?;
                         unsafe {
                             super::ensure_app_context_element_window(
@@ -1094,6 +1096,7 @@ impl Tool for ClickTool {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
                             let action = || {
+                                element_guard.validate_observation_scope()?;
                                 outcome = Some(perform_ax_click(
                                     element_ptr,
                                     idx,
@@ -1232,7 +1235,9 @@ impl Tool for ClickTool {
                     ToolResult::text(msg).with_structured(structured)
                 }
                 Ok(Err(e)) => {
-                    if let Some(unconfirmed) = e.downcast_ref::<AxActionResponseUnconfirmed>() {
+                    if let Some(stale) = e.downcast_ref::<crate::ax::embedded_menu::StaleEmbeddedMenu>() {
+                        stale.result(pid, wid)
+                    } else if let Some(unconfirmed) = e.downcast_ref::<AxActionResponseUnconfirmed>() {
                         unconfirmed.result()
                     } else if let Some(disabled) =
                         e.downcast_ref::<crate::input::ax_actions::AxActionDisabled>()
