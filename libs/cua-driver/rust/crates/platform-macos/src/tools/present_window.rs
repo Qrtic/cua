@@ -178,6 +178,20 @@ fn refused(message: impl ToString, attempted: bool) -> ToolResult {
     }))
 }
 
+fn verified(pid: i32, window: u32) -> ToolResult {
+    ToolResult::text("The requested window is now in front; sibling windows retained their order.")
+        .with_structured(json!({
+            "code": "window_presentation_verified", "effect": "confirmed",
+        "route": "system_api", "verified": true,
+        "delivery": cua_driver_contract::ActionDelivery {
+            mode: cua_driver_contract::ActionDeliveryMode::Foreground,
+            delivered_count: None,
+        },
+            "pid": pid, "window_id": window,
+            "presentation_scope": "exact_window_only_v1", "siblings_preserved": true,
+        }))
+}
+
 #[async_trait]
 impl Tool for PresentWindowTool {
     fn def(&self) -> &ToolDef {
@@ -253,15 +267,32 @@ impl Tool for PresentWindowTool {
             let outcome = (|| -> anyhow::Result<()> {
                 let deadline = Instant::now() + Duration::from_secs(4);
                 let validate_target = || -> anyhow::Result<()> {
-                    anyhow::ensure!(Instant::now() < deadline, "exact presentation deadline expired");
-                    let current = state.element_cache.get_element_retained_for_snapshot(pid, window, snapshot_id, element_index)
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "exact presentation deadline expired"
+                    );
+                    let current = state
+                        .element_cache
+                        .get_element_retained_for_snapshot(pid, window, snapshot_id, element_index)
                         .ok_or_else(|| anyhow::anyhow!("presentation observation was replaced"))?;
-                    anyhow::ensure!(unsafe { CFEqual(current.as_ptr() as _, element.as_ptr() as _) != 0 }, "presentation token changed");
-                    unsafe { validate_root(element.as_ptr() as AXUIElementRef, pid, window)?; }
+                    anyhow::ensure!(
+                        unsafe { CFEqual(current.as_ptr() as _, element.as_ptr() as _) != 0 },
+                        "presentation token changed"
+                    );
+                    unsafe {
+                        validate_root(element.as_ptr() as AXUIElementRef, pid, window)?;
+                    }
                     let windows = window_snapshot()?;
-                    anyhow::ensure!(windows.iter().any(|w| w.pid == pid && w.window_id == window && visible_ordinary(w)),
-                        "presentation target is hidden, off-Space or unavailable");
-                    anyhow::ensure!(Instant::now() < deadline, "exact presentation deadline expired");
+                    anyhow::ensure!(
+                        windows
+                            .iter()
+                            .any(|w| w.pid == pid && w.window_id == window && visible_ordinary(w)),
+                        "presentation target is hidden, off-Space or unavailable"
+                    );
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "exact presentation deadline expired"
+                    );
                     Ok(())
                 };
                 crate::foreground_activity::check_request()?;
@@ -284,21 +315,44 @@ impl Tool for PresentWindowTool {
                     if !exact_front(pid, window, &before) {
                         check_target()?;
                         attempted = true;
-                        crate::input::skylight::present_exact_window_guarded(pid, window, check_target)?;
+                        crate::input::skylight::present_exact_window_guarded(
+                            pid,
+                            window,
+                            check_target,
+                        )?;
                         check_target()?;
-                        let ax_status = unsafe { perform_action(element.as_ptr() as AXUIElementRef, "AXRaise") };
-                        tracing::debug!(pid, window, ax_status, "Explicit exact-window presentation requested");
+                        let ax_status = unsafe {
+                            perform_action(element.as_ptr() as AXUIElementRef, "AXRaise")
+                        };
+                        tracing::debug!(
+                            pid,
+                            window,
+                            ax_status,
+                            "Explicit exact-window presentation requested"
+                        );
                     }
                     let mut stable = None;
                     loop {
                         episode.check()?;
                         let now = Instant::now();
-                        anyhow::ensure!(now < deadline, "exact presentation was not verified before its deadline");
+                        anyhow::ensure!(
+                            now < deadline,
+                            "exact presentation was not verified before its deadline"
+                        );
                         let after = window_snapshot()?;
-                        anyhow::ensure!(siblings_preserved(&before, &after, pid, window), "presentation changed another application window's order or visibility");
+                        anyhow::ensure!(
+                            siblings_preserved(&before, &after, pid, window),
+                            "presentation changed another application window's order or visibility"
+                        );
                         if exact_front(pid, window, &after) {
-                            if now.duration_since(*stable.get_or_insert(now)) >= Duration::from_millis(100) { break; }
-                        } else { stable = None; }
+                            if now.duration_since(*stable.get_or_insert(now))
+                                >= Duration::from_millis(100)
+                            {
+                                break;
+                            }
+                        } else {
+                            stable = None;
+                        }
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     check_target()?;
@@ -307,11 +361,14 @@ impl Tool for PresentWindowTool {
                 episode.finish_presenting(presented)
             })();
             match outcome {
-                Ok(()) => ToolResult::text("The requested window is now in front; sibling windows retained their order.")
-                    .with_structured(json!({"code":"window_presentation_verified", "effect":"confirmed", "route":"system_api", "delivery":"foreground", "verified":true, "pid":pid, "window_id":window, "presentation_scope":"exact_window_only_v1", "siblings_preserved":true})),
-                Err(error) => refused(format!("Exact-window presentation stopped: {error:#}"), attempted),
+                Ok(()) => verified(pid, window),
+                Err(error) => refused(
+                    format!("Exact-window presentation stopped: {error:#}"),
+                    attempted,
+                ),
             }
-        }).await;
+        })
+        .await;
         match result {
             Ok(result) => result,
             Err(error) => refused(
@@ -325,6 +382,19 @@ impl Tool for PresentWindowTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_presentation_delivery_decodes_with_the_shared_action_contract() {
+        let wire = serde_json::to_value(verified(42, 7)).unwrap();
+        let delivery: cua_driver_contract::ActionDelivery =
+            serde_json::from_value(wire["structuredContent"]["delivery"].clone()).unwrap();
+        assert_eq!(
+            delivery.mode,
+            cua_driver_contract::ActionDeliveryMode::Foreground
+        );
+        assert_eq!(delivery.delivered_count, None);
+    }
+
     fn w(pid: i32, id: u32, z: usize, visible: bool) -> WindowInfo {
         WindowInfo {
             pid,
