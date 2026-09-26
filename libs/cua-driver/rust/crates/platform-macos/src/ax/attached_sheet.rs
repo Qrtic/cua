@@ -515,6 +515,68 @@ pub(crate) fn sheet_is_closed(pid: i32, sheet_id: u32) -> bool {
         })
 }
 
+fn result_sheet_windows_agree(
+    snapshot: &crate::windows::WindowEnumeration,
+    pid: i32,
+    panel_id: u32,
+    host_id: u32,
+    successor: &AttachedSheetSuccessor,
+) -> bool {
+    panel_id != 0
+        && host_id != 0
+        && successor.host_id == host_id
+        && successor.path.last() == Some(&host_id)
+        && !successor.path.contains(&panel_id)
+        && dialog_windows_allow_host_return(snapshot, pid, panel_id, host_id)
+        && snapshot.windows.iter().any(|window| {
+            window.pid == pid
+                && window.window_id == successor.window_id
+                && window.is_on_screen
+        })
+}
+
+fn prove_dialog_result_sheet<T: SheetTree>(
+    tree: &T,
+    snapshot: &crate::windows::WindowEnumeration,
+    pid: i32,
+    panel_id: u32,
+    host_id: u32,
+) -> Option<AttachedSheetSuccessor> {
+    // The common nested Go To / New Folder transition still has a live file
+    // panel. Avoid traversing its AX chain for this terminal-result case.
+    if !dialog_windows_allow_host_return(snapshot, pid, panel_id, host_id) {
+        return None;
+    }
+    let successor = prove_successor(tree, pid, host_id)?;
+    (result_sheet_windows_agree(snapshot, pid, panel_id, host_id, &successor)
+        && tree.within_budget())
+    .then_some(successor)
+}
+
+/// A completed Open/Save panel may be replaced by a progress or result sheet
+/// on the SAME retained document host. This is a return-source proof only:
+/// the new sheet never inherits the old panel's input capability. Reuse the
+/// reciprocal native attachment proof, and check closure/visibility on both
+/// sides of its AX reads. An unrelated same-process window is insufficient.
+pub(crate) fn focused_dialog_result_sheet(
+    pid: i32,
+    panel_id: u32,
+    host_id: u32,
+) -> Option<AttachedSheetSuccessor> {
+    let before = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+    unsafe {
+        let tree = NativeTree {
+            app: Node::owned(AXUIElementCreateApplication(pid))?,
+            deadline: Instant::now() + Duration::from_millis(500),
+        };
+        let successor = prove_dialog_result_sheet(&tree, &before, pid, panel_id, host_id)?;
+        let after = crate::windows::all_windows_including_accessory_layers_with_snapshot();
+        (result_sheet_windows_agree(&after, pid, panel_id, host_id, &successor)
+            && tree.within_budget())
+        .then_some(successor)
+    }
+}
+
 pub(crate) fn dialog_returned_to_host(pid: i32, sheet_id: u32, host_id: u32) -> bool {
     let windows = crate::windows::all_windows_including_accessory_layers_with_snapshot();
     if !dialog_windows_allow_host_return(&windows, pid, sheet_id, host_id) {
@@ -928,6 +990,68 @@ mod tests {
         snapshot.windows[0].pid = 42;
         snapshot.windows[0].is_on_screen = false;
         assert!(prove_replaced_dialog_host(&make_tree(), &snapshot, 42, 900, 700).is_none());
+    }
+
+    #[test]
+    fn completed_save_result_sheet_requires_closed_panel_and_exact_original_host() {
+        use crate::windows::{WindowBounds, WindowEnumeration, WindowInfo};
+        let window = |id, pid, visible| WindowInfo {
+            window_id: id, pid, app_name: String::new(), title: String::new(),
+            bounds: WindowBounds { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
+            layer: 0, z_index: 0, is_on_screen: visible,
+            current_space_id: None, on_current_space: None, space_ids: None,
+        };
+        let make_snapshot = || WindowEnumeration {
+            windows: vec![window(700, 42, true), window(900, 42, true)],
+            current_space_id: None, succeeded: true,
+        };
+        let make_tree = || pages_with_identifier("operation-progress");
+        let successor = prove_dialog_result_sheet(&make_tree(), &make_snapshot(), 42, 800, 700)
+            .expect("A new native result sheet on the proven host can end the old panel episode");
+        assert_eq!(successor.window_id, 900);
+        assert_eq!(successor.host_id, 700);
+        // This is NOT a new standard file-dialog input authority.
+        assert!(dialog_host(&make_tree(), 42, 900).is_none());
+        for (panel, host) in [(0, 700), (800, 0), (900, 700), (800, 701), (700, 700)] {
+            assert!(prove_dialog_result_sheet(&make_tree(), &make_snapshot(), 42, panel, host).is_none());
+        }
+        for old in [window(800, 42, true), window(800, 99, false)] {
+            let mut changed = make_snapshot();
+            changed.windows.push(old);
+            assert!(prove_dialog_result_sheet(&make_tree(), &changed, 42, 800, 700).is_none());
+            assert!(!result_sheet_windows_agree(&changed, 42, 800, 700, &successor),
+                "Reappearing or reused panels invalidate a proof after AX reads too");
+        }
+        for row in 0..2 {
+            let mut hidden = make_snapshot();
+            hidden.windows[row].is_on_screen = false;
+            assert!(prove_dialog_result_sheet(&make_tree(), &hidden, 42, 800, 700).is_none());
+            let mut reused = make_snapshot();
+            reused.windows[row].pid = 99;
+            assert!(prove_dialog_result_sheet(&make_tree(), &reused, 42, 800, 700).is_none());
+        }
+        let mut unreadable = make_snapshot();
+        unreadable.succeeded = false;
+        assert!(prove_dialog_result_sheet(&make_tree(), &unreadable, 42, 800, 700).is_none());
+        for alter in [
+            |t: &mut Tree| t.attached = false,
+            |t: &mut Tree| t.matching_window_relation = false,
+            |t: &mut Tree| t.host_listed = false,
+            |t: &mut Tree| t.owned = false,
+            |t: &mut Tree| t.host.window = 701,
+            |t: &mut Tree| t.host.owner = 99,
+            |t: &mut Tree| t.sheet.owner = 99,
+            |t: &mut Tree| t.sheet.role = "AXWebArea",
+            |t: &mut Tree| t.sheet.window = t.host.window,
+            |t: &mut Tree| t.host_minimized = Ok(true),
+            |t: &mut Tree| t.sheet_on_screen = false,
+            |t: &mut Tree| t.focus_changed = true,
+            |t: &mut Tree| t.budget.set(0),
+        ] {
+            let mut tree = make_tree();
+            alter(&mut tree);
+            assert!(prove_dialog_result_sheet(&tree, &make_snapshot(), 42, 800, 700).is_none());
+        }
     }
 
     #[test]

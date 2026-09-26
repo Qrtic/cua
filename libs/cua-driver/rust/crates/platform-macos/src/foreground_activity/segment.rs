@@ -247,6 +247,55 @@ impl NativeSegment {
         true
     }
 
+    fn record_completed_dialog_result(
+        &self,
+        before: &crate::ax::attached_sheet::DialogAttachment,
+        successor: &crate::ax::attached_sheet::AttachedSheetSuccessor,
+        now_ms: u64,
+        activity: Snapshot,
+    ) -> bool {
+        let Some(host) = self.dialog_host else {
+            return false;
+        };
+        if host.pid != self.binding.target.pid
+            || self.dialog_panel != Some(before.panel_id)
+            || before.host_id != host.window_id
+            || successor.host_id != host.window_id
+            || successor.window_id == 0
+            || successor.window_id == before.window_id
+            || successor.window_id == host.window_id
+            || successor.path.first() != Some(&successor.window_id)
+            || successor.path.last() != Some(&host.window_id)
+            || successor.path.contains(&before.panel_id)
+            || !self.owner_live()
+        {
+            return false;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.activated
+            || !inner.policy.in_flight()
+            || inner.dialog_target.as_ref() != Some(before)
+            || inner.completed_return_source.is_some()
+            || inner.dialog_closed
+            || inner.cleanup_unknown
+            || inner.ending
+            || inner.restoring
+            || inner.policy.check(&self.binding, now_ms, activity).is_err()
+        {
+            return false;
+        }
+        inner.completed_return_source = Some(ExactWindowTarget {
+            pid: host.pid,
+            window_id: successor.window_id,
+        });
+        inner.dialog_closed = true;
+        inner.dialog_closed_destination = Some(host);
+        // Keep dialog_target, the current Call, its lease, and deadline intact.
+        // validate_dialog_call prevents further input until a normal end and
+        // fresh observation; the successor is retained for restoration only.
+        true
+    }
+
     fn cleanup_is_settled(&self) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         !inner.policy.in_flight()
@@ -336,7 +385,7 @@ impl NativeSegment {
         if self.dialog_closed() {
             return Err(failure(
                 "foreground_dialog_closed",
-                "The dialog closed onto its exact host; finish this segment before observing or acting again",
+                "The Open/Save dialog ended; finish this segment before observing or acting again",
                 true,
             ));
         }
@@ -604,7 +653,7 @@ impl Call {
         if self.segment.dialog_closed() {
             Some(failure(
                 "foreground_dialog_closed",
-                "The dialog closed onto its exact host; finish this segment before observing again",
+                "The Open/Save dialog ended; finish this segment before observing again",
                 true,
             ))
         } else if self
@@ -686,6 +735,29 @@ impl Call {
                     .unwrap_or_else(|e| e.into_inner())
                     .dialog_target
                     .clone();
+                if let Some(before) = &before {
+                    if let Some(successor) = crate::ax::attached_sheet::focused_dialog_result_sheet(
+                        self.target.pid,
+                        before.panel_id,
+                        before.host_id,
+                    ) {
+                        let source = ExactWindowTarget {
+                            pid: self.target.pid,
+                            window_id: successor.window_id,
+                        };
+                        if exact_front(source)
+                            && self.segment.record_completed_dialog_result(
+                                before, &successor, clock_ms(), snapshot(),
+                            )
+                        {
+                            tracing::debug!(target: "cua_focus_restore", pid=source.pid,
+                                closed_panel=before.panel_id, host=before.host_id,
+                                return_source_window=source.window_id,
+                                "Completed dialog result sheet retained for restoration only");
+                            return true;
+                        }
+                    }
+                }
                 let after = bounded_focused_window(self.target.pid).and_then(|id| {
                     exact_front(ExactWindowTarget {
                         pid: self.target.pid,
@@ -2335,6 +2407,83 @@ mod tests {
         assert_eq!(segment.completed_return_source(), None);
         ticket.revoke();
         ticket.settle();
+    }
+
+    #[tokio::test]
+    async fn completed_dialog_result_ends_input_without_rebinding_or_renewing_ownership() {
+        use crate::ax::attached_sheet::{AttachedSheetSuccessor, DialogAttachment};
+        let (mut segment, _, _) = fixture().await;
+        let before = DialogAttachment {
+            window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+        };
+        let successor = AttachedSheetSuccessor {
+            window_id: 99, host_id: 70, path: vec![99, 70],
+        };
+        let mutable = Arc::get_mut(&mut segment).unwrap();
+        mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+        mutable.dialog_panel = Some(71);
+        mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
+        let ticket = call(&segment);
+        let binding = segment.binding.clone();
+        let deadline = segment.inner.lock().unwrap().policy.deadline_ms();
+        assert!(!segment.record_completed_dialog_result(&before, &successor, 5_001, idle()));
+        ticket.mark_activated();
+        assert!(segment.record_completed_dialog_result(&before, &successor, 5_001, idle()));
+        assert_eq!(segment.binding, binding);
+        assert_eq!(ticket.target(), binding.target);
+        assert_eq!(segment.current_target(), binding.target);
+        assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
+        assert_eq!(segment.restoration_source(), ExactWindowTarget { pid: 42, window_id: 99 });
+        assert_eq!(segment.expected_front(), segment.restoration_source());
+        assert_eq!(ticket.dialog_closed_summary().unwrap()["phase"], "closed");
+        for tool in ["get_window_state", "click", "type_text", "set_value", "prepare_dialog"] {
+            assert!(segment.validate_dialog_call(tool, binding.target).is_err());
+        }
+        assert!(!binding_matches(&segment, &binding.owner, segment.restoration_source(), &segment.owner));
+        assert!(!segment.record_completed_dialog_result(&before, &successor, 5_002, idle()));
+        ticket.settle();
+        assert!(segment.inner.lock().unwrap().resources.is_some(), "A normal end still owns cleanup");
+        ticket.revoke();
+        assert!(segment.cleanup_is_settled());
+    }
+
+    #[tokio::test]
+    async fn completed_dialog_result_requires_original_host_live_call_and_activity() {
+        use crate::ax::attached_sheet::{AttachedSheetSuccessor, DialogAttachment};
+        for scenario in 0..9 {
+            let (mut segment, _, _) = fixture().await;
+            let mut before = DialogAttachment {
+                window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+            };
+            let mut successor = AttachedSheetSuccessor {
+                window_id: 99, host_id: 70, path: vec![99, 70],
+            };
+            let mutable = Arc::get_mut(&mut segment).unwrap();
+            mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+            mutable.dialog_panel = Some(71);
+            mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
+            let ticket = call(&segment);
+            ticket.mark_activated();
+            let mut activity = idle();
+            let mut now = 5_001;
+            match scenario {
+                0 => successor.host_id = 69,
+                1 => successor.window_id = 71,
+                2 => successor.path = vec![99, 71, 70],
+                3 => before.panel_id = 72,
+                4 => before.window_id = 72,
+                5 => activity.generation += 1,
+                6 => now = u64::MAX,
+                7 => ticket.revoke(),
+                8 => ticket.settle(),
+                _ => unreachable!(),
+            }
+            assert!(!segment.record_completed_dialog_result(&before, &successor, now, activity), "scenario {scenario}");
+            assert_eq!(segment.completed_return_source(), None);
+            assert!(!segment.dialog_closed());
+            ticket.revoke();
+            ticket.settle();
+        }
     }
 
     #[tokio::test]
