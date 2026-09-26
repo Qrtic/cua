@@ -1226,7 +1226,7 @@ fn release_owned_inputs() -> bool {
     })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RestoreEvidence {
     generation: u64,
     pid: i32,
@@ -1266,25 +1266,51 @@ pub(crate) fn capture_restore(pid: i32) -> Option<RestoreEvidence> {
     })
 }
 
-pub(crate) fn restore_background_focus(evidence: RestoreEvidence, expected_pid: i32) {
-    if expected_pid == evidence.pid
-        && {
-            let current = snapshot();
-            current.reliable && current.generation == evidence.generation
-        }
+fn background_restore_evidence_current(evidence: RestoreEvidence, expected_pid: i32) -> bool {
+    let current = snapshot();
+    expected_pid == evidence.pid
+        && current.reliable && current.generation == evidence.generation
         && matches!(
             crate::windows::resolve_window_owner(evidence.pid, evidence.window),
             crate::windows::WindowOwner::SamePid
         )
-    {
+}
+
+/// Submit once while the dispatcher serializes cancellation. A successful
+/// submission still needs exact AX/window readiness completion outside its lock.
+pub(crate) fn restore_background_focus(evidence: RestoreEvidence, expected_pid: i32) -> bool {
+    if background_restore_evidence_current(evidence, expected_pid) {
         let submitted =
             crate::input::skylight::submit_exact_window_restore(evidence.pid, evidence.window);
         tracing::debug!(target: "cua_focus_restore", pid = evidence.pid,
             window = evidence.window, submitted, "Exact prior-window restoration attempted");
+        submitted
     } else {
         tracing::debug!(target: "cua_focus_restore", pid = evidence.pid,
             expected_pid, reason = "evidence_revoked_or_destination_changed",
             "Prior-window restoration skipped");
+        false
+    }
+}
+
+pub(crate) fn complete_background_focus(
+    evidence: RestoreEvidence,
+    expected_pid: i32,
+    mut check_lease: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    crate::input::skylight::complete_exact_window_restore_guarded(evidence.pid, evidence.window, || {
+        check_lease()?;
+        if !background_restore_evidence_current(evidence, expected_pid) {
+            anyhow::bail!("background restoration activity or exact window evidence was revoked");
+        }
+        check_lease()
+    })
+}
+
+#[cfg(test)]
+impl RestoreEvidence {
+    pub(crate) fn for_test(pid: i32, window: u32, generation: u64) -> Self {
+        Self { pid, window, generation }
     }
 }
 

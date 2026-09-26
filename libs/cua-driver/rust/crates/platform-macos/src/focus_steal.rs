@@ -121,6 +121,15 @@ struct RestoreCandidate {
     restore_to: i32,
 }
 
+/// Created only after this candidate's native submission succeeds. It grants
+/// no new lease, time or destination; completion still validates the original
+/// entry and captured activity/window evidence before each AX operation.
+#[derive(Clone, Copy, Debug)]
+struct RestoreCompletion {
+    candidate: RestoreCandidate,
+    evidence: crate::foreground_activity::RestoreEvidence,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivationRecheck {
     Waiting,
@@ -675,12 +684,29 @@ impl Dispatcher {
         {
             return false;
         }
-        // The production closure only submits NSRunningApplication activation;
+        // The production closure only submits exact WindowServer/key records;
         // it must not wait for activation or re-enter this dispatcher. Our
         // observer is on its own serial NSOperationQueue, so a resulting
         // notification is queued rather than synchronously re-entering here.
         submit(candidate.restore_to);
         true
+    }
+
+    fn restoration_completion_is_current(
+        &self,
+        completion: RestoreCompletion,
+        current_front: impl FnOnce() -> Option<i32>,
+    ) -> bool {
+        let candidate = completion.candidate;
+        let entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get(&candidate.handle.0) else { return false; };
+        entry.deadline > Instant::now()
+            && entry.restore_to == candidate.restore_to
+            && entry.restore_to != candidate.activated_pid
+            && entry.allowed_pid != Some(candidate.activated_pid)
+            && entry.target_pid.is_none_or(|pid| pid == candidate.activated_pid)
+            && entry.activity_restore == Some(completion.evidence)
+            && current_front() == Some(candidate.restore_to)
     }
 
     /// Number of entries (for tests).
@@ -944,12 +970,32 @@ fn restore_activation_candidate(dispatcher: &Arc<Dispatcher>, candidate: Restore
         .get(&candidate.handle.0)
         .and_then(|entry| entry.activity_restore);
     if let Some(evidence) = evidence {
+        let mut submitted = false;
         let admitted = dispatcher.submit_restore_if_current(candidate, || observed_activation_front(activated_pid), |pid| {
-            crate::foreground_activity::restore_background_focus(evidence, pid)
+            submitted = crate::foreground_activity::restore_background_focus(evidence, pid);
         });
         tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
-            activated_pid, restore_pid = candidate.restore_to, admitted,
+            activated_pid, restore_pid = candidate.restore_to, admitted, submitted,
             "Evaluated activation restoration candidate");
+        if admitted && submitted {
+            let completion = RestoreCompletion { candidate, evidence };
+            // AX calls and readiness reads must not hold entries.lock():
+            // cancellation needs to invalidate this same ticket between steps.
+            let result = crate::foreground_activity::complete_background_focus(
+                evidence, candidate.restore_to, || {
+                    if !dispatcher.restoration_completion_is_current(completion, || {
+                        crate::input::skylight::front_process_pid()
+                    }) {
+                        anyhow::bail!("original restoration lease or foreground was revoked");
+                    }
+                    Ok(())
+                },
+            );
+            tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
+                activated_pid, restore_pid = candidate.restore_to,
+                completed = result.is_ok(), error = ?result.err(),
+                "Completed exact prior-window restoration");
+        }
     } else {
         tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
             activated_pid, restore_pid = candidate.restore_to,
@@ -1469,6 +1515,70 @@ mod tests {
             ),
         ));
         assert!(!d.submit_restore_if_current(candidate, || Some(99), |_| panic!("stale front")));
+    }
+
+    fn submitted_completion_fixture() -> (Arc<Dispatcher>, SuppressionHandle, RestoreCompletion) {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.exact_completion");
+        let evidence = crate::foreground_activity::RestoreEvidence::for_test(7, 70, 3);
+        d.entries.lock().unwrap().get_mut(&h.0).unwrap().activity_restore = Some(evidence);
+        let candidate = d.snapshot_restore_candidates(42, Some(42))[0];
+        assert!(d.submit_restore_if_current(candidate, || Some(42), |_| {}));
+        (d, h, RestoreCompletion { candidate, evidence })
+    }
+
+    #[test]
+    fn restoration_completion_uses_original_entry_after_submission_lock_is_released() {
+        let (d, _, completion) = submitted_completion_fixture();
+        assert!(d.entries.try_lock().is_ok(), "AX completion must be able to reacquire the lease");
+        assert!(d.restoration_completion_is_current(completion, || Some(7)));
+        for newer_or_unresolved_front in [Some(42), Some(99), None] {
+            assert!(!d.restoration_completion_is_current(completion, || newer_or_unresolved_front));
+        }
+    }
+
+    #[test]
+    fn restoration_completion_cannot_outlive_cancelled_or_replaced_tail() {
+        let (d, h, completion) = submitted_completion_fixture();
+        d.mark_deferred(h, Instant::now() + Duration::from_secs(1));
+        assert!(d.restoration_completion_is_current(completion, || Some(7)));
+        d.cancel_deferred(42);
+        let replacement = d.add(Some(42), 7, "test.replacement");
+        d.entries.lock().unwrap().get_mut(&replacement.0).unwrap().activity_restore = Some(completion.evidence);
+        assert!(!d.restoration_completion_is_current(completion, || Some(7)));
+    }
+
+    #[test]
+    fn restoration_completion_rechecks_deadline_destination_target_and_activity_identity() {
+        for change in ["expired", "destination", "target", "allowed", "evidence", "missing_evidence"] {
+            let (d, h, completion) = submitted_completion_fixture();
+            {
+                let mut entries = d.entries.lock().unwrap();
+                let entry = entries.get_mut(&h.0).unwrap();
+                match change {
+                    "expired" => entry.deadline = Instant::now(),
+                    "destination" => entry.restore_to = 99,
+                    "target" => entry.target_pid = Some(99),
+                    "allowed" => entry.allowed_pid = Some(42),
+                    "evidence" => entry.activity_restore = Some(crate::foreground_activity::RestoreEvidence::for_test(7, 70, 4)),
+                    "missing_evidence" => entry.activity_restore = None,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(!d.restoration_completion_is_current(completion, || Some(7)), "{change}");
+        }
+    }
+
+    #[test]
+    fn restoration_completion_revalidates_between_individual_ax_steps() {
+        let (d, h, completion) = submitted_completion_fixture();
+        let mut completed_operations = Vec::new();
+        for operation in ["AXRaise", "AXMain", "AXFocused"] {
+            if !d.restoration_completion_is_current(completion, || Some(7)) { break; }
+            completed_operations.push(operation);
+            d.remove(h); // e.g. user starts an intentional foreground segment.
+        }
+        assert_eq!(completed_operations, ["AXRaise"]);
     }
 
     #[test]

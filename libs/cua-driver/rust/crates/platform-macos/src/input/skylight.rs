@@ -2603,6 +2603,44 @@ pub(crate) fn submit_exact_window_restore(pid: i32, window: u32) -> bool {
     post_exact_key_window_records(psn, window).is_ok()
 }
 
+/// Finish an already submitted exact prior-window restore, outside the focus
+/// dispatcher's cancellation lock. This performs no new process activation or
+/// key-window record replay. The caller must retain the original lease and
+/// activity evidence and revalidate them before every bounded AX operation.
+pub(crate) fn complete_exact_window_restore_guarded(
+    pid: i32,
+    window: u32,
+    mut check_lease_and_activity: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut psn = [0u8; 8];
+    check_lease_and_activity()?;
+    if !get_process_psn_for_window(window, pid, &mut psn) {
+        anyhow::bail!("original restoration process/window no longer resolves");
+    }
+    let mut check = || {
+        check_lease_and_activity()?;
+        if !restoration_completion_context_matches(
+            front_process_pid(), bounded_focused_window_id(pid),
+            exact_window_on_screen(pid, window), pid, window,
+        ) {
+            anyhow::bail!("original restoration window lost its current foreground context");
+        }
+        check_lease_and_activity()
+    };
+    complete_exact_ax_window_activation(pid, window, &mut check)?;
+    await_exact_window_ready_guarded(pid, window, psn, check)
+}
+
+fn restoration_completion_context_matches(
+    front: Option<i32>, focused: Option<u32>, visible: Option<bool>, pid: i32, window: u32,
+) -> bool {
+    // None is permitted only in this post-submission completion path: the live
+    // Notes Cmd+N race leaves the original app active but its AX key window
+    // unpublished. A known different window must win over the old evidence.
+    front == Some(pid) && visible == Some(true)
+        && focused.is_none_or(|current| current == window)
+}
+
 fn make_key_window_record(window_id: u32, event_kind: u8) -> [u8; 0xF8] {
     let mut record = [0u8; 0xF8];
     record[0x04] = 0xF8;
@@ -3289,6 +3327,26 @@ mod tests {
         complete_activation_with_bounded_cocoa_request, ExactActivationWindowUnavailable,
         ACTIVATION_WAIT_TIMEOUT,
     };
+
+    #[test]
+    fn restoration_completion_accepts_only_original_visible_foreground_window() {
+        use super::restoration_completion_context_matches;
+        // Native submission may clear AXFocusedWindow until the captured exact
+        // window is made main/focused. Ordinary background ordering must not
+        // use this post-submission allowance.
+        assert!(restoration_completion_context_matches(Some(7), None, Some(true), 7, 70));
+        assert!(restoration_completion_context_matches(Some(7), Some(70), Some(true), 7, 70));
+        for (front, focused, visible) in [
+            (None, None, Some(true)),
+            (Some(42), None, Some(true)),
+            (Some(99), Some(70), Some(true)),
+            (Some(7), Some(71), Some(true)),
+            (Some(7), Some(70), Some(false)),
+            (Some(7), Some(70), None),
+        ] {
+            assert!(!restoration_completion_context_matches(front, focused, visible, 7, 70));
+        }
+    }
 
     #[test]
     #[ignore = "requires a live WindowServer and an independently captured stable foreground PID"]
