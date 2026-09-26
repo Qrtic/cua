@@ -84,6 +84,9 @@ type GetFrontProcessFn = unsafe extern "C" fn(*mut c_void) -> i32;
 /// Deprecated but still resolves. Writes the target pid's 8-byte PSN.
 type GetProcessForPIDFn = unsafe extern "C" fn(pid_t, *mut c_void) -> i32;
 
+/// `OSStatus GetProcessPID(const ProcessSerialNumber *, pid_t *)`
+type GetProcessPIDFn = unsafe extern "C" fn(*const c_void, *mut pid_t) -> i32;
+
 /// Factory: `+[SLSEventAuthenticationMessage messageWithEventRecord:pid:version:]`
 /// ObjC send: `(id self, SEL _cmd, void* record, int32 pid, uint32 version) -> id`
 type FactoryMsgSendFn = unsafe extern "C" fn(
@@ -247,6 +250,11 @@ fn get_front_process_fn() -> Option<GetFrontProcessFn> {
 fn get_process_for_pid_fn() -> Option<GetProcessForPIDFn> {
     static SYM: OnceLock<Option<GetProcessForPIDFn>> = OnceLock::new();
     *SYM.get_or_init(|| find_sym(b"GetProcessForPID\0").map(|p| unsafe { as_fn(p) }))
+}
+
+fn get_process_pid_fn() -> Option<GetProcessPIDFn> {
+    static SYM: OnceLock<Option<GetProcessPIDFn>> = OnceLock::new();
+    *SYM.get_or_init(|| find_sym(b"GetProcessPID\0").map(|p| unsafe { as_fn(p) }))
 }
 
 /// `true` when `SLEventPostToPid` resolved.
@@ -1015,6 +1023,24 @@ pub fn front_process_matches(target_pid: libc::pid_t, target_wid: u32) -> Option
         return None;
     }
     Some(front_psn == target_psn)
+}
+
+/// Read the current WindowServer foreground process without an AppKit cache.
+/// Missing symbols, a failed query, or an unresolvable process grant no focus
+/// restoration authority. In particular, do not fall back to an older
+/// `NSWorkspace.frontmostApplication` value when this observation fails.
+pub(crate) fn front_process_pid() -> Option<pid_t> {
+    let get_front = get_front_process_fn()?;
+    let get_pid = get_process_pid_fn()?;
+    let mut psn = [0u8; 8];
+    if unsafe { get_front(psn.as_mut_ptr().cast()) } != 0 {
+        return None;
+    }
+    let mut pid = 0;
+    if unsafe { get_pid(psn.as_ptr().cast(), &mut pid) } != 0 || pid <= 0 {
+        return None;
+    }
+    Some(pid)
 }
 
 /// Make `target_pid` and `target_wid` WindowServer-frontmost and leave them
@@ -3263,6 +3289,18 @@ mod tests {
         complete_activation_with_bounded_cocoa_request, ExactActivationWindowUnavailable,
         ACTIVATION_WAIT_TIMEOUT,
     };
+
+    #[test]
+    #[ignore = "requires a live WindowServer and an independently captured stable foreground PID"]
+    fn live_front_process_pid_matches_independent_foreground() {
+        let expected: libc::pid_t = std::env::var("CUA_TEST_EXPECTED_FRONT_PID")
+            .expect("supply an independently observed foreground PID")
+            .parse()
+            .expect("positive process ID");
+        assert!(expected > 0);
+        assert_eq!(super::front_process_pid(), Some(expected));
+    }
+
     #[test]
     fn window_return_public_post_requires_exact_opt_in() {
         use super::WindowReturnPostRoute;

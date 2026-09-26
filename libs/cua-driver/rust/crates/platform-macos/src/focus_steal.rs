@@ -850,10 +850,26 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
     reconcile_activation(
         dispatcher,
         activated_pid,
-        crate::apps::frontmost_pid,
+        || observed_activation_front(activated_pid),
         std::thread::sleep,
         |candidate| restore_activation_candidate(dispatcher, candidate),
     );
+}
+
+fn observed_activation_front(activated_pid: i32) -> Option<i32> {
+    // The notification and NSWorkspace's cached foreground can disagree for
+    // the whole bounded recheck. Waiting on that same cache cannot establish
+    // whether restoration is appropriate. Read WindowServer directly, as the
+    // existing exact-window input teardown already does. Keep the cached value
+    // only as diagnostic evidence; it must not authorize or veto restoration.
+    let current_front = crate::input::skylight::front_process_pid();
+    let workspace_front = crate::apps::frontmost_pid();
+    if current_front != workspace_front {
+        tracing::debug!(target: "cua_focus_restore", activated_pid,
+            current_front = ?current_front, workspace_front = ?workspace_front,
+            "Foreground sources disagree during activation protection");
+    }
+    current_front
 }
 
 fn reconcile_activation(
@@ -884,13 +900,18 @@ fn reconcile_activation(
     tracing::debug!(target: "cua_focus_restore", activated_pid,
         pending_count=pending.len(), "Rechecking activation notification ahead of foreground state");
     let until = Instant::now() + ACTIVATION_RECHECK_INTERVAL * ACTIVATION_RECHECK_LIMIT as u32;
-    for _ in 0..ACTIVATION_RECHECK_LIMIT {
+    for iteration in 0..ACTIVATION_RECHECK_LIMIT {
         let remaining = until.saturating_duration_since(Instant::now());
         if pending.is_empty() || remaining.is_zero() { break; }
         pause(ACTIVATION_RECHECK_INTERVAL.min(remaining));
         if Instant::now() >= until { break; }
         let current_front = read_front();
-        pending.retain(|candidate| match dispatcher.recheck_activation_candidate(*candidate, current_front) {
+        pending.retain(|candidate| {
+            let decision = dispatcher.recheck_activation_candidate(*candidate, current_front);
+            tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
+                activated_pid, iteration, current_front = ?current_front, decision = ?decision,
+                "Rechecked activation restoration authority");
+            match decision {
             ActivationRecheck::Waiting => true,
             ActivationRecheck::Ready => {
                 // Submission still revalidates this exact entry, foreground,
@@ -900,7 +921,12 @@ fn reconcile_activation(
                 false
             }
             ActivationRecheck::Revoked => false,
+            }
         });
+    }
+    if !pending.is_empty() {
+        tracing::debug!(target: "cua_focus_restore", activated_pid, pending_count = pending.len(),
+            "Activation recheck ended without a current target foreground");
     }
 }
 
@@ -918,7 +944,7 @@ fn restore_activation_candidate(dispatcher: &Arc<Dispatcher>, candidate: Restore
         .get(&candidate.handle.0)
         .and_then(|entry| entry.activity_restore);
     if let Some(evidence) = evidence {
-        let admitted = dispatcher.submit_restore_if_current(candidate, crate::apps::frontmost_pid, |pid| {
+        let admitted = dispatcher.submit_restore_if_current(candidate, || observed_activation_front(activated_pid), |pid| {
             crate::foreground_activity::restore_background_focus(evidence, pid)
         });
         tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
