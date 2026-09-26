@@ -928,7 +928,7 @@ fn post_synthetic_focus_command(command: &SyntheticFocusCommand) -> anyhow::Resu
 fn post_synthetic_focus_command_with(
     command: &SyntheticFocusCommand,
     post: impl FnOnce(&[u8; 8], &[u8; 0xF8]) -> i32,
-    process_status: impl FnOnce(&[u8; 8]) -> Option<i32>,
+    mut process_status: impl FnMut(&[u8; 8]) -> Option<i32>,
 ) -> anyhow::Result<()> {
     let record = synthetic_focus_record(command.window_id, command.focused);
     let status = post(&command.psn, &record);
@@ -938,14 +938,32 @@ fn post_synthetic_focus_command_with(
     // remove. Activation errors and uncertain cleanup still fail. This does
     // not verify the preceding action and never posts a replacement event.
     const PROC_NOT_FOUND: i32 = -600;
-    if !command.focused
-        && status == PROC_NOT_FOUND
-        && process_status(&command.psn) == Some(PROC_NOT_FOUND)
-    {
+    if !command.focused && status == PROC_NOT_FOUND {
+        // Process Manager may still know the registration after the event
+        // destination has disappeared. Allow only that live-status response
+        // to settle, querying the same PSN without posting another event.
+        // Missing APIs and any other lookup failure remain indeterminate.
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(250);
+        let first_status = process_status(&command.psn);
+        let mut last_status = first_status;
+        let mut queries = 1;
+        while last_status == Some(0) && started.elapsed() < budget {
+            let remaining = budget.saturating_sub(started.elapsed());
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+            last_status = process_status(&command.psn);
+            queries += 1;
+        }
         tracing::debug!(target: "cua_focus_restore", window_id=command.window_id,
-            post_status=status, process_status=PROC_NOT_FOUND,
-            "Synthetic focus cleanup has no remaining target process");
-        return Ok(());
+            post_status=status, initial_process_status=?first_status,
+            final_process_status=?last_status, queries, elapsed_ms=started.elapsed().as_millis(),
+            "Checked exact process retirement after synthetic cleanup post failure");
+        if last_status == Some(PROC_NOT_FOUND) {
+            tracing::debug!(target: "cua_focus_restore", window_id=command.window_id,
+                post_status=status, process_status=PROC_NOT_FOUND,
+                "Synthetic focus cleanup has no remaining target process");
+            return Ok(());
+        }
     }
     if status != 0 {
         anyhow::bail!("target-only synthetic focus event failed with OSStatus {status}");
@@ -4818,6 +4836,47 @@ mod tests {
             assert!(super::post_synthetic_focus_command_with(
                 &plan.deactivate_target, |_, _| -600, |_| lookup,
             ).is_err(), "process absence was not proven: {lookup:?}");
+        }
+    }
+
+    #[test]
+    fn synthetic_focus_cleanup_waits_for_readonly_process_retirement() {
+        let plan = synthetic_target_focus_plan([1; 8], 731);
+        let posts = Cell::new(0);
+        let queries = Cell::new(0);
+        let result = super::post_synthetic_focus_command_with(
+            &plan.deactivate_target,
+            |psn, _| {
+                assert_eq!(*psn, plan.deactivate_target.psn);
+                posts.set(posts.get() + 1);
+                -600
+            },
+            |psn| {
+                assert_eq!(*psn, plan.deactivate_target.psn);
+                queries.set(queries.get() + 1);
+                Some(if queries.get() == 1 { 0 } else { -600 })
+            },
+        );
+        assert!(result.is_ok(), "delayed process retirement must settle without replaying cleanup input");
+        assert_eq!(posts.get(), 1);
+        assert_eq!(queries.get(), 2);
+    }
+
+    #[test]
+    fn synthetic_focus_cleanup_does_not_wait_through_ambiguous_process_queries() {
+        let plan = synthetic_target_focus_plan([1; 8], 731);
+        for ambiguous in [None, Some(-50), Some(-54)] {
+            let queries = Cell::new(0);
+            let result = super::post_synthetic_focus_command_with(
+                &plan.deactivate_target,
+                |_, _| -600,
+                |_| {
+                    queries.set(queries.get() + 1);
+                    if queries.get() == 1 { ambiguous } else { Some(-600) }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(queries.get(), 1, "uncertain identity must not become a retry loop");
         }
     }
 
