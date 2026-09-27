@@ -61,6 +61,12 @@ fn container_role(role: &str) -> bool {
     )
 }
 
+// These are host-side anchors, never controls or an expanded path inside a
+// popover. They require the exact host's logical and physical identity below.
+fn host_collection_role(role: &str) -> bool {
+    matches!(role, "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea")
+}
+
 trait PopoverTree {
     type Node: Clone;
     fn role(&self, node: &Self::Node) -> Option<String>;
@@ -69,10 +75,47 @@ trait PopoverTree {
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn parent(&self, node: &Self::Node) -> Option<Self::Node>;
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
+    fn contains_unique_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
     fn virtual_button_child(&self, _parent: &Self::Node, _child: &Self::Node) -> bool { false }
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn within_budget(&self) -> bool;
     fn visible_menu_window(&self, node: &Self::Node, pid: i32) -> Option<u32>;
+}
+
+/// Revalidate only the new host-collection route. Legacy-only paths do not
+/// perform these reads. Nodes and observed roles are retained from the first
+/// reciprocal traversal; no current or focused window can replace the host.
+fn revalidate_host_collection<T: PopoverTree>(
+    tree: &T,
+    pid: i32,
+    host_id: u32,
+    popover_id: u32,
+    host: &T::Node,
+    nodes: &[T::Node],
+    roles: &[String],
+) -> bool {
+    if nodes.is_empty() || nodes.len() != roles.len() || roles[0] != "AXPopover" {
+        return false;
+    }
+    for (index, (node, role)) in nodes.iter().zip(roles).enumerate() {
+        let parent = nodes.get(index + 1).unwrap_or(host);
+        if !tree.within_budget()
+            || tree.owner(node) != Some(pid)
+            || tree.role(node).as_deref() != Some(role.as_str())
+            || tree.window_id(node) != Some(if index == 0 { popover_id } else { host_id })
+            || !tree.window(node).is_some_and(|window| tree.same(&window, host))
+            || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
+            || !tree.contains_unique_child(parent, node)
+            || !tree.within_budget()
+        {
+            return false;
+        }
+    }
+    tree.within_budget()
+        && tree.owner(host) == Some(pid)
+        && matches!(tree.role(host).as_deref(), Some("AXWindow" | "AXSheet"))
+        && tree.window_id(host) == Some(host_id)
+        && tree.within_budget()
 }
 
 struct MenuPath<N> {
@@ -264,6 +307,9 @@ fn prove_checked<T: PopoverTree>(
     let mut current = element.clone();
     let mut visited = Vec::new();
     let mut crossed_popover = false;
+    let mut host_segment_start = 0;
+    let mut host_roles = Vec::new();
+    let mut uses_host_collection = false;
     for depth in 0..MAX_DEPTH {
         if !tree.within_budget() {
             return Err("ancestry_deadline");
@@ -310,6 +356,16 @@ fn prove_checked<T: PopoverTree>(
                 && tree
                     .window(&popover)
                     .is_some_and(|node| tree.same(&node, &host))
+                && (!uses_host_collection
+                    || revalidate_host_collection(
+                        tree,
+                        pid,
+                        host_id,
+                        popover_id,
+                        &host,
+                        &visited[host_segment_start..],
+                        &host_roles,
+                    ))
                 && tree.within_budget();
             return unchanged.then_some(()).ok_or("attachment_changed");
         }
@@ -317,6 +373,16 @@ fn prove_checked<T: PopoverTree>(
         match role.as_deref() {
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
+                host_segment_start = visited.len();
+            }
+            Some(role) if crossed_popover && host_collection_role(role) => {
+                if tree.window_id(&current) != Some(host_id)
+                    || !tree.window(&current).is_some_and(|window| tree.same(&window, &host))
+                    || !tree.within_budget()
+                {
+                    return Err("host_collection_identity_mismatch");
+                }
+                uses_host_collection = true;
             }
             Some(role)
                 if menu_path.is_some() && native_menu_role(Some(role)) && !crossed_popover => {}
@@ -338,6 +404,9 @@ fn prove_checked<T: PopoverTree>(
             tracing::debug!(target: "cua_popover_proof", depth, role = ?role,
                 "popover ancestry lacks reciprocal child relation");
             return Err("ancestor_child_relation_missing");
+        }
+        if crossed_popover {
+            host_roles.push(role.expect("accepted role"));
         }
         visited.push(current);
         current = parent;
@@ -443,6 +512,30 @@ impl PopoverTree for NativeTree {
                         child.0 as CFTypeRef,
                     ) != 0
                 })
+        }
+    }
+    fn contains_unique_child(&self, parent: &AxNode, child: &AxNode) -> bool {
+        unsafe {
+            let attr = CFString::new("AXChildren");
+            let mut value: CFTypeRef = std::ptr::null();
+            if AXUIElementCopyAttributeValue(parent.0, attr.as_concrete_TypeRef(), &mut value)
+                != kAXErrorSuccess
+                || value.is_null()
+            {
+                return false;
+            }
+            if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
+                CFRelease(value);
+                return false;
+            }
+            let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+            children.len() <= MAX_CHILDREN
+                && (0..children.len()).filter(|index| {
+                    CFEqual(
+                        *children.get(*index).expect("bounded index"),
+                        child.0 as CFTypeRef,
+                    ) != 0
+                }).count() == 1
         }
     }
     fn same(&self, left: &AxNode, right: &AxNode) -> bool {
@@ -688,6 +781,12 @@ mod tests {
                 .get(parent)
                 .is_some_and(|n| n.children.iter().any(|c| self.same(c, child)))
         }
+        fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
+            self.nodes.get(parent).is_some_and(|node| {
+                node.children.len() <= MAX_CHILDREN as usize
+                    && node.children.iter().filter(|candidate| self.same(candidate, child)).count() == 1
+            })
+        }
         fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
             self.virtual_edges.contains(&(*parent, *child))
         }
@@ -756,6 +855,182 @@ mod tests {
             virtual_edges: Vec::new(),
         }
     }
+
+    fn host_collection() -> Tree {
+        // Retained live native structure: the collection and layout nodes are
+        // outside the popover, with the host's logical and physical identity.
+        let roles = [
+            "AXCheckBox", "AXGroup", "AXPopover", "AXGroup", "AXCell", "AXRow",
+            "AXOutline", "AXScrollArea", "AXLayoutArea", "AXSplitGroup", "AXWindow",
+        ];
+        let mut tree = pages();
+        tree.nodes = roles.into_iter().enumerate().map(|(index, role)| {
+            let node = index as u32;
+            (node, Node {
+                identity: node, role, owner: 42,
+                window: if node == 0 { Some(2) } else if node < 10 { Some(10) } else { None },
+                id: Some(if node <= 2 { 900 } else { 700 }),
+                parent: (node < 10).then_some(node + 1),
+                children: if node == 0 { vec![] } else { vec![node - 1] },
+            })
+        }).collect();
+        tree.budget.set(500);
+        tree
+    }
+
+    // Mutation is delivered on the second read of one retained host fact,
+    // after the original traversal accepted it. It never touches real AX.
+    struct ChangingHost {
+        tree: Tree,
+        node: u32,
+        field: &'static str,
+        reads: Cell<usize>,
+        unique_reads: Cell<usize>,
+    }
+    impl ChangingHost {
+        fn new(tree: Tree, node: u32, field: &'static str) -> Self {
+            Self { tree, node, field, reads: Cell::new(0), unique_reads: Cell::new(0) }
+        }
+        fn changed(&self, node: &u32, field: &str) -> bool {
+            if *node != self.node || field != self.field { return false; }
+            let reads = self.reads.get();
+            self.reads.set(reads + 1);
+            reads > 0
+        }
+    }
+    impl PopoverTree for ChangingHost {
+        type Node = u32;
+        fn role(&self, node: &u32) -> Option<String> {
+            if self.changed(node, "role") { Some("AXGroup".into()) } else { self.tree.role(node) }
+        }
+        fn owner(&self, node: &u32) -> Option<i32> {
+            if self.changed(node, "owner") { Some(99) } else { self.tree.owner(node) }
+        }
+        fn window(&self, node: &u32) -> Option<u32> {
+            if self.changed(node, "window") { Some(9) } else { self.tree.window(node) }
+        }
+        fn window_id(&self, node: &u32) -> Option<u32> {
+            if self.changed(node, "id") { Some(701) } else { self.tree.window_id(node) }
+        }
+        fn parent(&self, node: &u32) -> Option<u32> {
+            if self.changed(node, "parent") { None } else { self.tree.parent(node) }
+        }
+        fn contains_child(&self, parent: &u32, child: &u32) -> bool {
+            !self.changed(parent, "children") && self.tree.contains_child(parent, child)
+        }
+        fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
+            self.unique_reads.set(self.unique_reads.get() + 1);
+            if self.field == "deadline" { self.tree.budget.set(0); }
+            !self.changed(parent, "children") && self.tree.contains_unique_child(parent, child)
+        }
+        fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
+            self.tree.virtual_button_child(parent, child)
+        }
+        fn same(&self, left: &u32, right: &u32) -> bool { self.tree.same(left, right) }
+        fn within_budget(&self) -> bool { self.tree.within_budget() }
+        fn visible_menu_window(&self, node: &u32, pid: i32) -> Option<u32> {
+            self.tree.visible_menu_window(node, pid)
+        }
+    }
+
+    #[test]
+    fn host_collection_proves_native_control_and_popover_root_to_exact_host() {
+        for logical_host in [false, true] {
+            let mut tree = host_collection();
+            if logical_host { tree.nodes.get_mut(&0).unwrap().window = Some(10); }
+            assert!(prove(&tree, 42, 700, &0));
+            assert!(prove(&tree, 42, 700, &2));
+            assert!(!prove(&tree, 42, 701, &0));
+        }
+    }
+
+    #[test]
+    fn host_collection_does_not_admit_inner_collections_or_collection_actions() {
+        for role in ["AXCell", "AXRow", "AXOutline", "AXLayoutArea"] {
+            let mut tree = host_collection();
+            tree.nodes.get_mut(&1).unwrap().role = role;
+            assert!(!prove(&tree, 42, 700, &0), "inner {role}");
+            tree.nodes.get_mut(&0).unwrap().window = Some(10);
+            assert!(!prove(&tree, 42, 700, &0), "host-named inner {role}");
+            assert!(!prove(&host_collection(), 42, 700, &4));
+            assert_eq!(advertised_action(Some(role), "press", &["AXPress".into()]), None);
+        }
+    }
+
+    #[test]
+    fn host_collection_requires_every_outer_node_to_name_the_exact_host() {
+        for node in 3..10 {
+            for kind in 0..5 {
+                let mut tree = host_collection();
+                let entry = tree.nodes.get_mut(&node).unwrap();
+                match kind {
+                    0 => entry.owner = 99,
+                    1 => entry.id = None,
+                    2 => entry.id = Some(900),
+                    3 => entry.window = None,
+                    _ => entry.window = Some(9),
+                }
+                assert!(!prove(&tree, 42, 700, &0), "node {node} kind {kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn host_collection_requires_unique_reciprocal_edges_and_keeps_boundaries() {
+        for parent in 3..=10 {
+            for duplicate in [false, true] {
+                let mut tree = host_collection();
+                let entry = tree.nodes.get_mut(&parent).unwrap();
+                if duplicate { entry.children.push(parent - 1); } else { entry.children.clear(); }
+                assert!(!prove(&tree, 42, 700, &0), "parent {parent} duplicate {duplicate}");
+            }
+        }
+        for role in ["AXTable", "AXList", "AXWebArea", "AXApplication", "AXWindow", "AXSheet", "AXPopover"] {
+            let mut tree = host_collection();
+            tree.nodes.get_mut(&5).unwrap().role = role;
+            assert!(!prove(&tree, 42, 700, &0), "boundary {role}");
+        }
+        let mut tree = host_collection();
+        tree.nodes.get_mut(&5).unwrap().parent = Some(4);
+        tree.nodes.get_mut(&4).unwrap().children.push(5);
+        assert!(!prove(&tree, 42, 700, &0), "cycle");
+    }
+
+    #[test]
+    fn host_collection_rereads_live_roles_identity_and_edges_before_authorizing() {
+        for field in ["role", "owner", "window", "id", "parent", "children"] {
+            let node = if field == "children" { 5 } else { 4 };
+            let tree = ChangingHost::new(host_collection(), node, field);
+            assert!(!prove(&tree, 42, 700, &0), "changed {field}");
+            assert!(tree.reads.get() >= 2, "must exercise fresh {field} read");
+        }
+    }
+
+    #[test]
+    fn host_collection_keeps_deadline_and_child_bounds_without_retry() {
+        for budget in [0, 5, 15, 25] {
+            let tree = host_collection();
+            tree.budget.set(budget);
+            assert!(!prove(&tree, 42, 700, &0), "budget {budget}");
+        }
+        let tree = ChangingHost::new(host_collection(), 4, "deadline");
+        assert!(!prove(&tree, 42, 700, &0));
+        assert_eq!(tree.unique_reads.get(), 1);
+        let mut tree = host_collection();
+        tree.nodes.get_mut(&5).unwrap().children = vec![4; MAX_CHILDREN as usize + 1];
+        assert!(!prove(&tree, 42, 700, &0));
+    }
+
+    #[test]
+    fn legacy_popover_paths_never_invoke_host_collection_revalidation() {
+        let tree = ChangingHost::new(pages(), 4, "deadline");
+        assert!(prove(&tree, 42, 700, &0));
+        assert_eq!(tree.unique_reads.get(), 0);
+        let tree = ChangingHost::new(wrapped_toolbar_popover(), 4, "deadline");
+        assert!(prove(&tree, 42, 700, &0));
+        assert_eq!(tree.unique_reads.get(), 0);
+    }
+
     #[test]
     fn pages_swatch_crosses_its_attached_popover_to_exact_host() {
         assert!(prove(&pages(), 42, 700, &0));

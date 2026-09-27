@@ -48,6 +48,7 @@ impl std::fmt::Display for DiscoveryStop {
 trait Tree {
     type Node: Clone;
     fn roots(&self) -> Result<Vec<Self::Node>, DiscoveryStop>;
+    fn focused(&self) -> Option<Self::Node>;
     fn role(&self, node: &Self::Node) -> Option<String>;
     fn owner(&self, node: &Self::Node) -> Option<i32>;
     fn id(&self, node: &Self::Node) -> Option<u32>;
@@ -373,6 +374,209 @@ fn prove_menu_path<T: Tree>(
     Ok(Some(MenuProof { id: menu.window_id, members, frame: frame.map(f64::to_bits) }))
 }
 
+// Collection roles are local to this focused-popover route, never the shared
+// menu/provider/container walk. Focus supplies a candidate, not authority.
+fn host_collection_role(role: &str) -> bool {
+    matches!(role, "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea")
+}
+
+fn focused_popover_descendant_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXButton"
+            | "AXTextField"
+            | "AXTextArea"
+            | "AXPopUpButton"
+            | "AXCheckBox"
+            | "AXRadioButton"
+            | "AXDateTimeArea"
+            | "AXRadioGroup"
+            | "AXGroup"
+            | "AXScrollArea"
+            | "AXSplitGroup"
+            | "AXToolbar"
+    )
+}
+
+fn reciprocal_edge<T: Tree>(
+    tree: &T,
+    parent: &T::Node,
+    child: &T::Node,
+) -> Result<bool, DiscoveryStop> {
+    budget(tree)?;
+    if !tree
+        .parent(child)
+        .is_some_and(|node| tree.same(&node, parent))
+    {
+        budget(tree)?;
+        return Ok(false);
+    }
+    let children = tree.children(parent)?;
+    if children.len() > MAX_CHILDREN {
+        return Err(DiscoveryStop::ChildLimit);
+    }
+    budget(tree)?;
+    Ok(children
+        .iter()
+        .filter(|node| tree.same(node, child))
+        .count()
+        == 1)
+}
+
+fn prove_collection_popover<T: Tree>(
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    path: &[T::Node],
+    windows: &[WindowInfo],
+) -> Result<Option<u32>, DiscoveryStop> {
+    budget(tree)?;
+    let Some(leaf) = path.last().filter(|_| path.len() >= 3) else {
+        return Ok(None);
+    };
+    if tree.role(leaf).as_deref() != Some("AXPopover") {
+        return Ok(None);
+    }
+    let Some(id) = tree.id(leaf).filter(|id| *id != host.window_id) else {
+        return Ok(None);
+    };
+    let Some(physical) = exact_window(windows, pid, id) else {
+        return Ok(None);
+    };
+    if !surface_matches(tree, &path[0], host)
+        || !surface_matches(tree, leaf, physical)
+        || !tree
+            .window(leaf)
+            .is_some_and(|node| tree.same(&node, &path[0]))
+    {
+        budget(tree)?;
+        return Ok(None);
+    }
+    let mut collection = false;
+    for node in &path[1..path.len() - 1] {
+        budget(tree)?;
+        let Some(role) = tree.role(node) else {
+            return Ok(None);
+        };
+        collection |= host_collection_role(&role);
+        if !(container(&role) || host_collection_role(&role))
+            || tree.owner(node) != Some(pid)
+            || tree.id(node) != Some(host.window_id)
+            || !tree
+                .window(node)
+                .is_some_and(|root| tree.same(&root, &path[0]))
+        {
+            budget(tree)?;
+            return Ok(None);
+        }
+    }
+    // This route cannot rescue an unrelated failure of the legacy proof.
+    if !collection {
+        return Ok(None);
+    }
+    for pair in path.windows(2) {
+        if !reciprocal_edge(tree, &pair[0], &pair[1])? {
+            return Ok(None);
+        }
+    }
+    let proven = tree.popover(leaf, pid, host.window_id);
+    budget(tree)?;
+    Ok(proven.then_some(id))
+}
+
+fn collect_focused_collection_popover<T: Tree>(
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    root: &T::Node,
+    windows: &[WindowInfo],
+    visited: &mut Vec<T::Node>,
+) -> Result<Vec<u32>, DiscoveryStop> {
+    let result = (|| {
+        // Run only after the entire legacy discovery (including menu/provider
+        // revalidation) returned empty. No new AX reads on legacy nonempty/Err.
+        if !windows.iter().any(|window| {
+            window.pid == pid
+                && window.window_id != 0
+                && window.window_id != host.window_id
+                && window.is_on_screen
+                && window.on_current_space != Some(false)
+        }) {
+            return Ok(Vec::new());
+        }
+        budget(tree)?;
+        let focused = tree.focused();
+        budget(tree)?;
+        let Some(mut node) = focused else {
+            return Ok(Vec::new());
+        };
+        let mut upward = Vec::new();
+        let mut popover_index = None;
+        loop {
+            budget(tree)?;
+            if upward.len() >= MAX_DEPTH {
+                return Err(DiscoveryStop::DepthLimit);
+            }
+            if upward.iter().any(|prior| tree.same(prior, &node)) {
+                return Err(DiscoveryStop::Cycle);
+            }
+            if !visited.iter().any(|prior| tree.same(prior, &node)) {
+                if visited.len() >= MAX_NODES {
+                    return Err(DiscoveryStop::NodeLimit);
+                }
+                visited.push(node.clone());
+            }
+            upward.push(node.clone());
+            if tree.owner(&node) != Some(pid) {
+                return Ok(Vec::new());
+            }
+            let role = tree.role(&node);
+            match role.as_deref() {
+                Some("AXPopover") if popover_index.is_none() => {
+                    popover_index = Some(upward.len() - 1);
+                }
+                Some("AXWindow") if popover_index.is_some() && tree.same(&node, root) => break,
+                Some(role) if popover_index.is_none() && focused_popover_descendant_role(role) => {}
+                Some(role)
+                    if popover_index.is_some()
+                        && (container(role) || host_collection_role(role)) => {}
+                _ => return Ok(Vec::new()),
+            }
+            let parent = tree.parent(&node);
+            budget(tree)?;
+            let Some(parent) = parent else {
+                return Ok(Vec::new());
+            };
+            // Descendants only locate the first popover. Retain the legacy native
+            // role/reciprocity boundary; host-side edges are fully proved below.
+            if popover_index.is_none() && !reciprocal_edge(tree, &parent, &node)? {
+                return Ok(Vec::new());
+            }
+            node = parent;
+        }
+        let mut path = upward.split_off(popover_index.expect("popover before host"));
+        path.reverse();
+        let id = prove_collection_popover(tree, pid, host, &path, windows)?;
+        budget(tree)?;
+        let Some(id) = id else { return Ok(Vec::new()) };
+        let fresh = tree.fresh_windows().ok_or(DiscoveryStop::Changed)?;
+        let live_host = exact_window(&fresh, pid, host.window_id).ok_or(DiscoveryStop::Changed)?;
+        let before = exact_window(windows, pid, id).ok_or(DiscoveryStop::Changed)?;
+        let after = exact_window(&fresh, pid, id).ok_or(DiscoveryStop::Changed)?;
+        if !same_identity(host, live_host)
+            || !same_identity(before, after)
+            || !tree.same(root, &exact_root(tree, live_host)?)
+            || prove_collection_popover(tree, pid, live_host, &path, &fresh)? != Some(id)
+        {
+            return Err(DiscoveryStop::Changed);
+        }
+        budget(tree)?;
+        Ok(vec![id])
+    })();
+    budget(tree)?;
+    result
+}
+
 fn collect<T: Tree>(
     tree: &T,
     pid: i32,
@@ -508,7 +712,11 @@ fn collect<T: Tree>(
                 && window.window_id != host_id && matches!(window.layer, 0 | 101)
                 && window.is_on_screen && window.on_current_space != Some(false))
         {
-            return Ok(ids);
+            return if ids.is_empty() {
+                collect_focused_collection_popover(tree, pid, host, &root, windows, &mut visited)
+            } else {
+                Ok(ids)
+            };
         }
         // Only an empty original result may use the remaining shared time and
         // node budget. Mixed popover/sheet+menu cases retain the original set.
@@ -523,7 +731,7 @@ fn collect<T: Tree>(
             .filter(|(_, foreign)| provider_menu_phase || !foreign)
             .map(|(path, _)| (path, true)).collect();
         if queue.is_empty() {
-            return Ok(ids);
+            return collect_focused_collection_popover(tree, pid, host, &root, windows, &mut visited);
         }
     }
 }
@@ -660,6 +868,9 @@ impl Tree for Native {
     type Node = Node;
     fn roots(&self) -> Result<Vec<Node>, DiscoveryStop> {
         self.array(&self.app, "AXWindows", MAX_ROOTS)
+    }
+    fn focused(&self) -> Option<Node> {
+        self.relation(&self.app, "AXFocusedUIElement")
     }
     fn role(&self, node: &Node) -> Option<String> {
         self.ready(node)
@@ -800,10 +1011,15 @@ mod tests {
         change_on_refresh: usize,
         changed_node: Option<(u32, Fact)>,
         changed_frame: Option<(u32, [f64; 4])>,
+        changed_windows: Option<Vec<WindowInfo>>,
+        changed_roots: Option<Vec<u32>>,
         expire_after_refresh: bool,
         children_calls: RefCell<Vec<u32>>,
         children_errors: HashSet<u32>,
         expire_on_id: Option<u32>,
+        focused: Option<u32>,
+        focused_calls: Cell<usize>,
+        expire_on_focus: bool,
     }
     fn window(id: u32) -> WindowInfo {
         WindowInfo {
@@ -887,10 +1103,15 @@ mod tests {
             change_on_refresh: 1,
             changed_node: None,
             changed_frame: None,
+            changed_windows: None,
+            changed_roots: None,
             expire_after_refresh: false,
             children_calls: RefCell::new(Vec::new()),
             children_errors: HashSet::new(),
             expire_on_id: None,
+            focused: None,
+            focused_calls: Cell::new(0),
+            expire_on_focus: false,
         }
     }
     impl Fake {
@@ -908,7 +1129,19 @@ mod tests {
     impl Tree for Fake {
         type Node = u32;
         fn roots(&self) -> Result<Vec<u32>, DiscoveryStop> {
+            if self.refresh_count.get() >= self.change_on_refresh {
+                if let Some(roots) = &self.changed_roots {
+                    return Ok(roots.clone());
+                }
+            }
             Ok(self.roots.clone())
+        }
+        fn focused(&self) -> Option<u32> {
+            self.focused_calls.set(self.focused_calls.get() + 1);
+            if self.expire_on_focus {
+                self.expired.set(true);
+            }
+            self.focused
         }
         fn role(&self, n: &u32) -> Option<String> {
             self.fact(n).map(|v| v.role.into())
@@ -966,6 +1199,11 @@ mod tests {
             self.refresh_count.set(self.refresh_count.get() + 1);
             if self.expire_after_refresh && self.refresh_count.get() >= self.change_on_refresh {
                 self.expired.set(true);
+            }
+            if self.refresh_count.get() >= self.change_on_refresh {
+                if let Some(windows) = &self.changed_windows {
+                    return Some(windows.clone());
+                }
             }
             Some(self.windows.clone())
         }
@@ -1519,5 +1757,356 @@ mod tests {
         t.children_errors.insert(2);
         assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
         assert!(t.children_calls.borrow().contains(&2));
+    }
+
+    fn collection_popover() -> Fake {
+        let mut t = popover();
+        // Native path: host -> split -> layout -> scroll -> outline -> row ->
+        // cell -> group -> popover. The old collector stops at layout.
+        let chain = [
+            (2, "AXSplitGroup"),
+            (5, "AXLayoutArea"),
+            (6, "AXScrollArea"),
+            (7, "AXOutline"),
+            (8, "AXRow"),
+            (9, "AXCell"),
+            (3, "AXGroup"),
+        ];
+        for (index, &(id, role)) in chain.iter().enumerate() {
+            t.nodes.insert(
+                id,
+                Fact {
+                    role,
+                    owner: 42,
+                    id: 10,
+                    parent: Some(if index == 0 { 1 } else { chain[index - 1].0 }),
+                    window: Some(1),
+                    children: vec![chain.get(index + 1).map_or(4, |item| item.0)],
+                },
+            );
+        }
+        t.focused = Some(4);
+        t
+    }
+
+    #[test]
+    fn collection_popover_uses_focused_hint_but_reproves_retained_host_path() {
+        for descendant in [false, true] {
+            let mut t = collection_popover();
+            if descendant {
+                t.nodes.insert(
+                    30,
+                    Fact {
+                        role: "AXCheckBox",
+                        owner: 42,
+                        id: 20,
+                        parent: Some(4),
+                        window: Some(1),
+                        children: vec![],
+                    },
+                );
+                t.nodes.get_mut(&4).unwrap().children = vec![30];
+                t.focused = Some(30);
+            }
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
+            assert_eq!(t.focused_calls.get(), 1);
+            assert_eq!(t.proof_calls.get(), 2);
+            assert_eq!(
+                t.refresh_count.get(),
+                2,
+                "legacy empty then new positive revalidation"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_popover_hint_never_supplies_authority_or_widens_legacy_roles() {
+        for case in 0..8 {
+            let mut t = collection_popover();
+            match case {
+                0 => t.focused = None,
+                1 => t.focused = Some(9), // A focused cell is not a popover.
+                2 => t.proof = false,
+                3 => t.nodes.get_mut(&5).unwrap().role = "AXWebArea",
+                4 => t.nodes.get_mut(&5).unwrap().role = "AXTable",
+                5 => t.nodes.get_mut(&5).unwrap().role = "AXApplication",
+                6 => t.nodes.get_mut(&5).unwrap().role = "AXSheet",
+                _ => t.nodes.get_mut(&5).unwrap().role = "AXWindow",
+            }
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
+        }
+        for role in ["AXCell", "AXRow", "AXOutline", "AXLayoutArea"] {
+            assert!(
+                !container(role),
+                "menu/provider traversal must stay unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_popover_host_nodes_require_exact_owner_physical_and_logical_host() {
+        for id in [2, 5, 6, 7, 8, 9, 3] {
+            for case in 0..5 {
+                let mut t = collection_popover();
+                let node = t.nodes.get_mut(&id).unwrap();
+                match case {
+                    0 => node.owner = 77,
+                    1 => node.id = 20,
+                    2 => node.id = 0,
+                    3 => node.window = Some(2), // Same physical ID is not CF identity.
+                    _ => node.window = None,
+                }
+                assert_eq!(
+                    collect(&t, 42, 10, &t.windows),
+                    Ok(vec![]),
+                    "node {id} case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collection_popover_rejects_one_way_nested_and_replaced_host_paths() {
+        for case in 0..6 {
+            let mut t = collection_popover();
+            match case {
+                0 => t.nodes.get_mut(&9).unwrap().children.clear(),
+                1 => t.nodes.get_mut(&9).unwrap().children.push(3),
+                2 => t.nodes.get_mut(&5).unwrap().parent = Some(1),
+                3 => t.nodes.get_mut(&8).unwrap().role = "AXPopover",
+                4 => {
+                    // Another retained AXWindow object with the same CG ID.
+                    let mut alias = t.nodes[&1].clone();
+                    alias.children = vec![2];
+                    t.nodes.insert(31, alias);
+                    t.nodes.get_mut(&2).unwrap().parent = Some(31);
+                }
+                _ => t.nodes.get_mut(&4).unwrap().window = Some(2),
+            }
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
+        }
+    }
+
+    #[test]
+    fn collection_popover_requires_live_unique_physical_surface_and_current_space() {
+        for case in 0..7 {
+            let mut t = collection_popover();
+            match case {
+                0 => t.windows[1].pid = 77,
+                1 => t.windows[1].is_on_screen = false,
+                2 => t.windows[1].on_current_space = Some(false),
+                3 => {
+                    t.current.remove(&20);
+                }
+                4 => t.windows.push(window(20)),
+                5 => {
+                    t.frames.insert(4, [101.0, 120.0, 400.0, 300.0]);
+                }
+                _ => t.nodes.get_mut(&4).unwrap().id = 10,
+            }
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
+        }
+    }
+
+    #[test]
+    fn collection_popover_changes_after_positive_proof_discard_entire_result() {
+        for case in 0..7 {
+            let mut t = collection_popover();
+            // The first snapshot belongs to the unchanged legacy empty route.
+            t.change_on_refresh = 2;
+            let mut changed = t.nodes[&9].clone();
+            match case {
+                0 => changed.parent = None,
+                1 => changed.children.clear(),
+                2 => changed.id = 999,
+                3 => changed.window = Some(2),
+                4 => changed.owner = 77,
+                5 => changed.role = "AXWebArea",
+                _ => t.changed_frame = Some((4, [101.0, 120.0, 400.0, 300.0])),
+            }
+            t.changed_node = Some((9, changed));
+            assert_eq!(
+                collect(&t, 42, 10, &t.windows),
+                Err(DiscoveryStop::Changed),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_popover_read_errors_and_shared_time_budget_remain_fail_closed() {
+        for case in 0..5 {
+            let mut t = collection_popover();
+            let expected = match case {
+                0 => {
+                    t.children_errors.insert(9);
+                    DiscoveryStop::AxUnavailable
+                }
+                1 => {
+                    t.nodes.get_mut(&9).unwrap().children = vec![3; MAX_CHILDREN + 1];
+                    DiscoveryStop::ChildLimit
+                }
+                2 => {
+                    t.expire_on_focus = true;
+                    DiscoveryStop::Deadline
+                }
+                3 => {
+                    t.expire_on_proof = true;
+                    DiscoveryStop::Deadline
+                }
+                _ => {
+                    t.expire_after_refresh = true;
+                    t.change_on_refresh = 2;
+                    DiscoveryStop::Deadline
+                }
+            };
+            assert_eq!(
+                collect(&t, 42, 10, &t.windows),
+                Err(expected),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_popover_uses_legacy_node_charge_and_bounds_focused_walk() {
+        let mut t = collection_popover();
+        // Original discovery uses 123 nodes, then the focused path must consume
+        // the same budget, not start another 128-node allowance.
+        for id in 100..220 {
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXStaticText",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(1),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
+            t.nodes.get_mut(&1).unwrap().children.push(id);
+        }
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::NodeLimit)
+        );
+        assert_eq!(t.focused_calls.get(), 1);
+        let mut t = collection_popover();
+        t.nodes.get_mut(&5).unwrap().parent = Some(9);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Cycle));
+        let mut t = collection_popover();
+        for id in 30..35 {
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXGroup",
+                    owner: 42,
+                    id: 20,
+                    parent: Some(if id == 34 { 4 } else { id + 1 }),
+                    window: Some(1),
+                    children: if id == 30 { vec![] } else { vec![id - 1] },
+                },
+            );
+        }
+        t.nodes.get_mut(&4).unwrap().children = vec![34];
+        t.focused = Some(30);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::DepthLimit)
+        );
+    }
+
+    #[test]
+    fn collection_hint_is_not_read_for_legacy_success_or_error() {
+        for kind in 0..4 {
+            let mut t = match kind {
+                0 => popover(),
+                1 => native_menu(),
+                2 => layer_zero_menu(),
+                _ => {
+                    let mut t = popover();
+                    t.nodes.get_mut(&1).unwrap().children = vec![4];
+                    t.nodes.get_mut(&4).unwrap().role = "AXSheet";
+                    t.nodes.get_mut(&4).unwrap().parent = Some(1);
+                    t
+                }
+            };
+            t.focused = Some(999); // Invalid and expiring if queried.
+            t.expire_on_focus = true;
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
+            assert_eq!(t.focused_calls.get(), 0, "kind {kind}");
+        }
+        let mut t = collection_popover();
+        t.children_errors.insert(1);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
+        assert_eq!(t.focused_calls.get(), 0);
+    }
+    #[test]
+    fn collection_popover_revalidates_cg_identity_and_retained_root_after_new_proof() {
+        for index in [0, 1] {
+            for case in 0..8 {
+                let mut t = collection_popover();
+                t.change_on_refresh = 2;
+                let mut windows = t.windows.clone();
+                let window = &mut windows[index];
+                match case {
+                    0 => window.window_id += 1,
+                    1 => window.pid = 77,
+                    2 => window.layer += 1,
+                    3 => window.bounds.x += 1.0,
+                    4 => window.bounds.width += 1.0,
+                    5 => window.is_on_screen = false,
+                    6 => window.on_current_space = Some(false),
+                    _ => windows.push(windows[index].clone()),
+                }
+                t.changed_windows = Some(windows);
+                assert_eq!(
+                    collect(&t, 42, 10, &t.windows),
+                    Err(DiscoveryStop::Changed),
+                    "surface {index} case {case}"
+                );
+            }
+        }
+        let mut t = collection_popover();
+        t.nodes.insert(31, t.nodes[&1].clone());
+        t.change_on_refresh = 2;
+        t.changed_roots = Some(vec![31]);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Changed),
+            "same CG identity cannot replace the retained AX root"
+        );
+    }
+
+    #[test]
+    fn collection_popover_descendant_hint_keeps_original_reciprocal_role_boundary() {
+        for case in 0..4 {
+            let mut t = collection_popover();
+            t.nodes.insert(
+                30,
+                Fact {
+                    role: "AXCheckBox",
+                    owner: 42,
+                    id: 20,
+                    parent: Some(4),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
+            t.nodes.get_mut(&4).unwrap().children = vec![30];
+            t.focused = Some(30);
+            match case {
+                0 => t.nodes.get_mut(&30).unwrap().role = "AXCell",
+                1 => t.nodes.get_mut(&30).unwrap().owner = 77,
+                2 => t.nodes.get_mut(&4).unwrap().children.clear(),
+                _ => t.nodes.get_mut(&4).unwrap().children.push(30),
+            }
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
+            assert_eq!(t.proof_calls.get(), 0);
+        }
     }
 }
