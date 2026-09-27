@@ -3040,10 +3040,14 @@ fn probe_already_ready_with(
 
 fn ordinary_activation_shape(
     role: Option<&str>,
-    subrole: Option<&str>,
-    modal: Option<bool>,
+    read_subrole: impl FnOnce() -> Option<String>,
+    read_modal: impl FnOnce() -> Option<bool>,
 ) -> bool {
-    role == Some("AXWindow") && subrole == Some("AXStandardWindow") && modal == Some(false)
+    // A negative role/subrole already declines this optimization. Do not spend
+    // the shared publication budget reading attributes which cannot admit it.
+    role == Some("AXWindow")
+        && read_subrole().as_deref() == Some("AXStandardWindow")
+        && read_modal() == Some(false)
 }
 
 fn ordinary_activation_probe_allowed(
@@ -3054,6 +3058,17 @@ fn ordinary_activation_probe_allowed(
     keyboard_target && !hidden_panel && !standard_dialog
 }
 
+// Only already-read identity/shape facts are retained for the existing branch
+// log. The ID flag distinguishes an unavailable value from an omitted read.
+// A role of None means not read; "unavailable" means its read returned None.
+#[derive(Default)]
+struct OrdinaryProbeDiagnostics {
+    focused_window_id_read: bool,
+    focused_window_id: Option<u32>,
+    focused_role: Option<&'static str>,
+    elapsed_us: u64,
+}
+
 /// Retain the exact focused native window across selection of the fast path.
 /// This is never constructed for hidden panels or proven standard dialogs.
 struct ReadyOrdinaryWindow {
@@ -3062,15 +3077,38 @@ struct ReadyOrdinaryWindow {
 }
 
 impl ReadyOrdinaryWindow {
-    fn has_ordinary_identity(&self, pid: i32, window_id: u32) -> bool {
+    fn has_ordinary_identity(
+        &self,
+        pid: i32,
+        window_id: u32,
+        mut diagnostics: Option<&mut OrdinaryProbeDiagnostics>,
+    ) -> bool {
         use crate::ax::bindings::{ax_get_window_id, copy_bool_attr, copy_string_attr};
-        background_ax_owner(&self.window, pid).is_ok()
-            && unsafe { ax_get_window_id(self.window.0) } == Some(window_id)
-            && ordinary_activation_shape(
-                unsafe { copy_string_attr(self.window.0, "AXRole") }.as_deref(),
-                unsafe { copy_string_attr(self.window.0, "AXSubrole") }.as_deref(),
-                unsafe { copy_bool_attr(self.window.0, "AXModal") },
-            )
+        if background_ax_owner(&self.window, pid).is_err() {
+            return false;
+        }
+        let focused_window_id = unsafe { ax_get_window_id(self.window.0) };
+        if let Some(value) = diagnostics.as_mut() {
+            value.focused_window_id_read = true;
+            value.focused_window_id = focused_window_id;
+        }
+        if focused_window_id != Some(window_id) {
+            return false;
+        }
+        let role = unsafe { copy_string_attr(self.window.0, "AXRole") };
+        if let Some(value) = diagnostics.as_mut() {
+            value.focused_role = Some(match role.as_deref() {
+                Some("AXWindow") => "AXWindow",
+                Some("AXSheet") => "AXSheet",
+                Some(_) => "other",
+                None => "unavailable",
+            });
+        }
+        ordinary_activation_shape(
+            role.as_deref(),
+            || unsafe { copy_string_attr(self.window.0, "AXSubrole") },
+            || unsafe { copy_bool_attr(self.window.0, "AXModal") },
+        )
     }
 
     fn focused_id(&self, pid: i32) -> Option<u32> {
@@ -3089,6 +3127,7 @@ fn probe_ready_ordinary_window(
     window_id: u32,
     target_psn: [u8; 8],
     publication_started: std::time::Instant,
+    diagnostics: &mut OrdinaryProbeDiagnostics,
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Option<ReadyOrdinaryWindow>> {
     check_exact_activation_owner(pid, window_id, &mut check)?;
@@ -3099,7 +3138,7 @@ fn probe_ready_ordinary_window(
         let window = background_ax_attribute(&app, "AXFocusedWindow").ok()?;
         let candidate = ReadyOrdinaryWindow { app, window };
         candidate
-            .has_ordinary_identity(pid, window_id)
+            .has_ordinary_identity(pid, window_id, Some(diagnostics))
             .then_some(candidate)
     })();
     // Unavailable AX attributes may decline this optimization, but must never
@@ -3138,7 +3177,7 @@ fn check_ready_ordinary_window(
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     check_exact_activation_owner(pid, window_id, &mut check)?;
-    let still_ready = proof.has_ordinary_identity(pid, window_id)
+    let still_ready = proof.has_ordinary_identity(pid, window_id, None)
         && exact_window_is_ready(
             current_front_process_psn(),
             target_psn,
@@ -3484,11 +3523,16 @@ fn with_foreground_hid_activation_inner(
                 keyboard_target, hidden_panel, standard_dialog_host.is_some(),
             );
             let mut ready_ordinary_proof = None;
+            let mut ordinary_probe_diagnostics = OrdinaryProbeDiagnostics::default();
             let ready_ordinary = {
                 let mut probe = || {
-                    ready_ordinary_proof = probe_ready_ordinary_window(
-                        target_pid, target_wid, target_psn, publication_started, || episode.check(),
-                    )?;
+                    let probe_started = std::time::Instant::now();
+                    let result = probe_ready_ordinary_window(
+                        target_pid, target_wid, target_psn, publication_started,
+                        &mut ordinary_probe_diagnostics, || episode.check(),
+                    );
+                    ordinary_probe_diagnostics.elapsed_us = probe_started.elapsed().as_micros() as u64;
+                    ready_ordinary_proof = result?;
                     Ok(ready_ordinary_proof.is_some())
                 };
                 foreground_activation_preparation_steps(
@@ -3505,6 +3549,10 @@ fn with_foreground_hid_activation_inner(
             // next guarded phase; no logging between a final check and HID.
             if ordinary_probe_allowed {
                 tracing::debug!(target_pid, target_wid, ready_ordinary,
+                    ordinary_probe_focused_window_id_read = ordinary_probe_diagnostics.focused_window_id_read,
+                    ordinary_probe_focused_window_id = ?ordinary_probe_diagnostics.focused_window_id,
+                    ordinary_probe_focused_role = ?ordinary_probe_diagnostics.focused_role,
+                    ordinary_probe_elapsed_us = ordinary_probe_diagnostics.elapsed_us,
                     publication_elapsed_ms = publication_started.elapsed().as_millis(),
                     "foreground ordinary readiness probe selected");
             }
@@ -3557,7 +3605,7 @@ fn with_foreground_hid_activation_inner(
                 None => anyhow::anyhow!("{error}; ax_activation_statuses=skipped_ready_ordinary"),
             })?;
             if keyboard_sheet.as_ref().is_some_and(|sheet| !sheet.revalidate("before_pointer_priming")) {
-                anyhow::bail!("ordinary sheet keyboard attachment changed before input");
+                anyhow::bail!("ordinary sheet keyboard attachment could not be revalidated before input (proof unavailable or activation budget expired)");
             }
             if ready_ordinary {
                 // Losing the selected proof is terminal, even when the old
@@ -3771,7 +3819,7 @@ fn with_foreground_keyboard_context_activation_inner(
             let action = keyboard_action_after_priming(
                 sheet.map(|sheet| move || {
                     if !sheet.revalidate("after_pointer_priming") {
-                        anyhow::bail!("ordinary sheet keyboard attachment changed after pointer priming");
+                        anyhow::bail!("ordinary sheet keyboard attachment could not be revalidated after pointer priming (proof unavailable or activation budget expired)");
                     }
                     crate::foreground_activity::check_input()
                 }),
@@ -4995,8 +5043,8 @@ mod tests {
         }
         assert!(super::ordinary_activation_shape(
             Some("AXWindow"),
-            Some("AXStandardWindow"),
-            Some(false)
+            || Some("AXStandardWindow".to_owned()),
+            || Some(false)
         ));
         for (role, subrole, modal) in [
             (None, Some("AXStandardWindow"), Some(false)),
@@ -5007,7 +5055,41 @@ mod tests {
             (Some("AXWindow"), Some("AXStandardWindow"), None),
             (Some("AXWindow"), Some("AXStandardWindow"), Some(true)),
         ] {
-            assert!(!super::ordinary_activation_shape(role, subrole, modal));
+            assert!(!super::ordinary_activation_shape(
+                role, || subrole.map(str::to_owned), || modal,
+            ));
+        }
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_negative_shape_skips_unneeded_native_reads() {
+        for role in [None, Some("AXSheet"), Some("AXGroup")] {
+            assert!(!super::ordinary_activation_shape(
+                role,
+                || panic!("a negative role must not read AXSubrole"),
+                || panic!("a negative role must not read AXModal"),
+            ));
+        }
+        for subrole in [None, Some("AXDialog"), Some("AXSystemDialog")] {
+            assert!(!super::ordinary_activation_shape(
+                Some("AXWindow"),
+                || subrole.map(str::to_owned),
+                || panic!("a negative subrole must not read AXModal"),
+            ));
+        }
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_positive_shape_preserves_attribute_order_and_requirements() {
+        for modal in [None, Some(true), Some(false)] {
+            let reads = std::cell::RefCell::new(Vec::new());
+            let accepted = super::ordinary_activation_shape(
+                Some("AXWindow"),
+                || { reads.borrow_mut().push("AXSubrole"); Some("AXStandardWindow".to_owned()) },
+                || { reads.borrow_mut().push("AXModal"); modal },
+            );
+            assert_eq!(accepted, modal == Some(false));
+            assert_eq!(*reads.borrow(), vec!["AXSubrole", "AXModal"]);
         }
     }
 
