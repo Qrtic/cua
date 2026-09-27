@@ -10,7 +10,7 @@
 //! sheet. Such an embedding needs a live, reciprocal parent chain and a verified
 //! WindowServer owner; a foreign AXWindow attribute alone is never sufficient.
 //! AppKit file-panel accessories can instead start in the host, traverse one
-//! remote service, then return to the host's sheet. That bounded round trip has
+//! remote service, then return to the host's window or sheet. That bounded round trip has
 //! its own reciprocal proof; it does not authorize arbitrary provider chains.
 
 use super::bindings::{
@@ -119,7 +119,7 @@ fn resolve_embedded_control<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u3
                     // enter the accessory proof. A failed reciprocal link or
                     // a detached one-way embedding must not trigger a retry.
                     return (owner == provider)
-                        .then(|| resolve_accessory_sheet(tree, start))
+                        .then(|| resolve_accessory_surface(tree, start))
                         .flatten();
                 }
                 if *previous_owner != provider || owner == provider {
@@ -170,11 +170,12 @@ fn resolve_embedded_control<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u3
 }
 
 /// AppKit can expose host-owned accessory controls below a remote file-panel
-/// split group. Prove exactly host -> one service -> the same host's AXSheet.
-/// No other physical surface, web subtree, extra provider, AXWindow shortcut or
+/// split group. Prove exactly host -> one service -> the same host's AXWindow
+/// or AXSheet. Standalone file panels expose AXWindow rather than AXSheet.
+/// No intervening surface, web subtree, extra provider, AXWindow attribute shortcut or
 /// cached downward traversal can supply this relationship. Revalidate every
 /// live link before returning, just as for the one-way provider embedding.
-fn resolve_accessory_sheet<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
+fn resolve_accessory_surface<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32> {
     let host = tree.owner(start)?;
     if host <= 0 {
         return None;
@@ -189,7 +190,7 @@ fn resolve_accessory_sheet<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32
         }
         let owner = tree.owner(&current)?;
         let role = tree.role(&current)?;
-        if owner <= 0 || matches!(role.as_str(), "" | "AXWebArea" | "AXApplication" | "AXWindow" | "AXPopover") {
+        if owner <= 0 || matches!(role.as_str(), "" | "AXWebArea" | "AXApplication" | "AXPopover") {
             return None;
         }
         if owner == host {
@@ -201,7 +202,7 @@ fn resolve_accessory_sheet<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u32
             remote = Some(owner);
         }
         nodes.push((current.clone(), owner, role.clone()));
-        if role == "AXSheet" {
+        if matches!(role.as_str(), "AXWindow" | "AXSheet") {
             let id = tree.window_id(&current)?;
             if remote.is_none() || !returned_to_host || owner != host || id == 0
                 || !tree.owns_window(host, id)
@@ -255,9 +256,9 @@ fn prove_native_text<T: Ancestry>(tree: &T, start: &T::Node, pid: i32, window_id
         if tree.owner(&node) != Some(pid) {
             // This may be the file-panel service on a host-owned accessory's
             // ancestry. The complete separate proof still requires the same
-            // host, exact sheet and live reciprocal links, and rejects web
+            // host, exact window/sheet and live reciprocal links, and rejects web
             // content. Ordinary same-process editors keep their fast path.
-            return resolve_accessory_sheet(tree, start) == Some(window_id);
+            return resolve_accessory_surface(tree, start) == Some(window_id);
         }
         let Some(role) = tree.role(&node).filter(|role| !role.is_empty()) else {
             return false;
@@ -424,6 +425,7 @@ mod tests {
         window_owners: HashMap<u32, i32>,
         child_checks: Cell<usize>,
         fail_child_check_after: Option<usize>,
+        expire_after_child_checks: Option<usize>,
         expired: bool,
     }
     impl Ancestry for Tree {
@@ -460,6 +462,9 @@ mod tests {
         }
         fn within_budget(&self) -> bool {
             !self.expired
+                && !self
+                    .expire_after_child_checks
+                    .is_some_and(|limit| self.child_checks.get() >= limit)
         }
     }
     fn sheet() -> Tree {
@@ -474,6 +479,7 @@ mod tests {
             window_owners: HashMap::from([(8, 42), (7, 42)]),
             child_checks: Cell::new(0),
             fail_child_check_after: None,
+            expire_after_child_checks: None,
             expired: false,
         }
     }
@@ -638,7 +644,7 @@ mod tests {
                 1 => { tree.children.insert(1, vec![]); }
                 2 => tree.nodes.get_mut(&1).unwrap().3 = None,
                 3 => tree.nodes.get_mut(&1).unwrap().0 = "AXPopover",
-                4 => tree.nodes.get_mut(&1).unwrap().0 = "AXWindow",
+                4 => tree.nodes.get_mut(&1).unwrap().0 = "AXApplication",
                 5 => tree.nodes.get_mut(&4).unwrap().0 = "AXWebArea",
                 6 => tree.nodes.get_mut(&4).unwrap().1 = Some(0),
                 7 => tree.expired = true,
@@ -676,8 +682,111 @@ mod tests {
         // authority to retain the original sheet ID.
         let mut detached = save_panel_accessory();
         detached.fail_child_check_after = Some(2);
-        assert_eq!(resolve_accessory_sheet(&detached, &0), None);
+        assert_eq!(resolve_accessory_surface(&detached, &0), None);
         assert_eq!(detached.child_checks.get(), 3);
+    }
+
+    fn standalone_panel_accessory() -> Tree {
+        let mut tree = save_panel_accessory();
+        tree.nodes.get_mut(&1).unwrap().0 = "AXWindow";
+        tree
+    }
+
+    #[test]
+    fn standalone_panel_accessory_resolves_popup_and_text_to_exact_window() {
+        for role in ["AXPopUpButton", "AXTextField"] {
+            let mut tree = standalone_panel_accessory();
+            tree.nodes.get_mut(&0).unwrap().0 = role;
+            // The control has no AXWindow/native ID; the remote split group's
+            // SPI ID cannot replace the first logical surface on its parent chain.
+            assert_eq!(resolve(&tree, &0), Some(8));
+            assert_eq!(resolve_with_window_fallback(&tree, &0, false), Some(8));
+            assert_ne!(resolve(&tree, &0), Some(7));
+            assert_ne!(resolve(&tree, &0), Some(9));
+            if role == "AXTextField" {
+                assert!(prove_native_text(&tree, &0, 42, 8));
+                assert!(!prove_native_text(&tree, &0, 42, 7));
+                assert!(!prove_native_text(&tree, &0, 99, 8));
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_panel_accessory_rejects_missing_foreign_or_unproven_window() {
+        for kind in 0..9 {
+            let mut tree = standalone_panel_accessory();
+            match kind {
+                0 => { tree.children.insert(4, vec![]); }
+                1 => { tree.children.insert(1, vec![]); }
+                2 => tree.nodes.get_mut(&1).unwrap().3 = None,
+                3 => tree.nodes.get_mut(&1).unwrap().3 = Some(0),
+                4 => { tree.window_owners.insert(8, 99); }
+                5 => { tree.window_owners.remove(&8); }
+                6 => tree.nodes.get_mut(&0).unwrap().1 = None,
+                7 => tree.nodes.get_mut(&4).unwrap().0 = "AXWebArea",
+                _ => tree.expired = true,
+            }
+            assert_eq!(resolve(&tree, &0), None, "case {kind}");
+            assert!(!prove_native_text(&tree, &0, 42, 8), "case {kind}");
+        }
+        let mut sibling = standalone_panel_accessory();
+        sibling.nodes.get_mut(&1).unwrap().3 = Some(10);
+        sibling.window_owners.insert(10, 42);
+        assert_eq!(resolve(&sibling, &0), Some(10));
+        assert!(!prove_native_text(&sibling, &0, 42, 8));
+    }
+
+    #[test]
+    fn standalone_panel_accessory_does_not_skip_an_intervening_surface() {
+        for role in ["AXWindow", "AXSheet", "AXPopover"] {
+            let mut tree = standalone_panel_accessory();
+            tree.nodes.get_mut(&4).unwrap().0 = role;
+            tree.window_owners.insert(9, 99);
+            // A different physical surface owns the nearer parent. The existing
+            // one-way embedding may resolve it, but never the farther host window.
+            assert_eq!(resolve(&tree, &0), Some(9));
+            assert_ne!(resolve(&tree, &0), Some(8));
+            assert!(!prove_native_text(&tree, &0, 42, 8));
+            tree.nodes.get_mut(&4).unwrap().3 = None;
+            assert_eq!(resolve(&tree, &0), None);
+        }
+    }
+
+    #[test]
+    fn standalone_panel_accessory_rejects_extra_provider_return_and_cycle() {
+        for kind in 0..3 {
+            let mut tree = standalone_panel_accessory();
+            tree.nodes.get_mut(&4).unwrap().1 = Some(5);
+            tree.nodes.insert(5, ("AXGroup", Some(1), None, None, 100));
+            tree.children.insert(5, vec![4]);
+            tree.children.insert(1, vec![5]);
+            if kind == 1 {
+                tree.nodes.insert(5, ("AXGroup", Some(6), None, None, 42));
+                tree.nodes.insert(6, ("AXGroup", Some(1), None, None, 99));
+                tree.children.insert(6, vec![5]);
+                tree.children.insert(1, vec![6]);
+            } else if kind == 2 {
+                tree.nodes.get_mut(&4).unwrap().1 = Some(0);
+                tree.children.insert(0, vec![4]);
+            }
+            assert_eq!(resolve(&tree, &0), None, "case {kind}");
+            assert!(!prove_native_text(&tree, &0, 42, 8), "case {kind}");
+        }
+    }
+
+    #[test]
+    fn standalone_panel_accessory_rechecks_edges_and_budget_before_return() {
+        let mut detached = standalone_panel_accessory();
+        detached.fail_child_check_after = Some(2);
+        assert_eq!(resolve_accessory_surface(&detached, &0), None);
+        assert_eq!(detached.child_checks.get(), 3);
+
+        let mut expired = standalone_panel_accessory();
+        // Both forward edges and their reciprocal rechecks succeeded. Expiry
+        // still prevents returning the window at the final surface validation.
+        expired.expire_after_child_checks = Some(4);
+        assert_eq!(resolve_accessory_surface(&expired, &0), None);
+        assert_eq!(expired.child_checks.get(), 4);
     }
 
     #[test]
