@@ -628,13 +628,68 @@ fn prove_successor<T: SheetTree>(tree: &T, pid: i32, source: u32) -> Option<Atta
     })
 }
 
-pub(crate) fn focused_attached_sheet_successor(pid: i32, source: u32) -> Option<AttachedSheetSuccessor> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FocusedSheetContext {
+    Successor(AttachedSheetSuccessor),
+    ExactLeafAncestors(Vec<u32>),
+}
+
+// An exact focused leaf can geometrically contain its smaller parent panel.
+// Its ancestors are not siblings taking over input. This proof is only for
+// excluding those exact ancestors from the generic geometry suspicion; it
+// grants no foreground lease, input alias or authority over another window.
+fn prove_focused_leaf_ancestors<T: SheetTree>(
+    tree: &T, pid: i32, source: u32,
+) -> Option<Vec<u32>> {
+    let focused = tree.focused()?;
+    if tree.role(&focused).as_deref() != Some("AXSheet")
+        || tree.window_id(&focused) != Some(source)
+    {
+        return None;
+    }
+    let chain = prove_chain(tree, pid, source)?;
+    if chain.nodes.len() < 2
+        || !tree.same(&focused, chain.nodes.first()?)
+        || !tree.child_sheets(&focused)?.is_empty()
+        || !visible_chain(tree, pid, &chain)
+    {
+        return None;
+    }
+    let current = prove_chain(tree, pid, source)?;
+    if !same_attachment(tree, &chain, &current)
+        || !visible_chain(tree, pid, &current)
+        || !tree.child_sheets(&focused)?.is_empty()
+        || !tree.same(&focused, &tree.focused()?)
+        || !tree.within_budget()
+    {
+        return None;
+    }
+    Some(chain.window_ids[1..].to_vec())
+}
+
+fn prove_focused_sheet_context<T: SheetTree>(
+    tree: &T, pid: i32, source: u32, inspect_exact_leaf: bool,
+) -> Option<FocusedSheetContext> {
+    // Preserve the original positive successor path and its priority. Both
+    // proofs share one tree/deadline; an exhausted read cannot start a new one.
+    if let Some(proof) = prove_successor(tree, pid, source) {
+        return Some(FocusedSheetContext::Successor(proof));
+    }
+    if !inspect_exact_leaf || !tree.within_budget() { return None; }
+    prove_focused_leaf_ancestors(tree, pid, source)
+        .map(FocusedSheetContext::ExactLeafAncestors)
+}
+
+pub(crate) fn focused_attached_sheet_context(
+    pid: i32, source: u32, inspect_exact_leaf: bool, deadline: Instant,
+) -> Option<FocusedSheetContext> {
+    if Instant::now() >= deadline { return None; }
     unsafe {
         let tree = NativeTree {
             app: Node::owned(AXUIElementCreateApplication(pid))?,
-            deadline: Instant::now() + Duration::from_secs(2),
+            deadline,
         };
-        prove_successor(&tree, pid, source)
+        prove_focused_sheet_context(&tree, pid, source, inspect_exact_leaf)
     }
 }
 

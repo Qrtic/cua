@@ -767,3 +767,89 @@ fn keyboard_revalidation_diagnostics_do_not_revoke_an_accepted_proof() {
         "proven"
     );
 }
+
+#[test]
+fn exact_focused_nested_leaf_proves_ancestors_missing_from_axwindows() {
+    let tree = xcode();
+    assert_eq!(tree.windows, [700]);
+    assert_eq!(prove_focused_sheet_context(&tree, 42, 950, true),
+        Some(FocusedSheetContext::ExactLeafAncestors(vec![900, 700])));
+    assert!(tree.windows_reads.get() >= 2, "both complete chain proofs must run");
+}
+
+#[test]
+fn focused_sheet_context_keeps_successor_priority_and_no_candidate_read_cost() {
+    let old = xcode();
+    let expected = prove_successor(&old, 42, 700).unwrap();
+    let current = xcode();
+    assert_eq!(prove_focused_sheet_context(&current, 42, 700, true),
+        Some(FocusedSheetContext::Successor(expected)));
+    assert_eq!(current.budget.get(), old.budget.get());
+    assert_eq!(current.relation_reads.get(), old.relation_reads.get());
+    assert_eq!(current.windows_reads.get(), old.windows_reads.get());
+    let old = xcode();
+    assert!(prove_successor(&old, 42, 950).is_none());
+    let current = xcode();
+    assert!(prove_focused_sheet_context(&current, 42, 950, false).is_none());
+    assert_eq!(current.budget.get(), old.budget.get());
+    assert_eq!(current.reads.get(), old.reads.get());
+    assert_eq!(current.windows_reads.get(), 0);
+}
+
+#[test]
+fn focused_leaf_ancestor_proof_rejects_wrong_focus_children_and_incomplete_reads() {
+    for focused in [700, 900] {
+        let mut tree = xcode(); tree.focused = focused;
+        assert!(prove_focused_leaf_ancestors(&tree, 42, focused).is_none(),
+            "a host or parent with a nested child is not the exact focused leaf");
+    }
+    let tree = xcode();
+    assert!(prove_focused_leaf_ancestors(&tree, 42, 900).is_none());
+    let mut tree = xcode(); tree.children_complete = false;
+    assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+    for id in [950, 900] {
+        let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().window = Some(701);
+        assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+        let mut tree = xcode();
+        let parent = tree.nodes[&id].parent.unwrap();
+        tree.nodes.get_mut(&parent).unwrap().children.clear();
+        assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+    }
+}
+
+#[test]
+fn focused_leaf_ancestor_proof_keeps_owner_visibility_and_live_host_guards() {
+    for id in [950, 900, 700] {
+        let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().owner = 99;
+        assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+        let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().visible = false;
+        assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+        for state in [Ok(true), Err(crate::ax::bindings::kAXErrorCannotComplete)] {
+            let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().minimized = state;
+            assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+        }
+    }
+    for windows in [vec![], vec![700, 700], vec![900]] {
+        let mut tree = xcode(); tree.windows = windows;
+        assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+    }
+}
+
+#[test]
+fn focused_leaf_ancestor_proof_revalidates_and_never_renews_exhausted_budget() {
+    let mut tree = chess_with_host_focus(); tree.focused = 900;
+    tree.new_child_after_leaf_check = true;
+    assert!(prove_focused_leaf_ancestors(&tree, 42, 900).is_none());
+    assert_eq!(tree.leaf_child_reads.get(), 2, "reject child added after first proof");
+    let mut tree = xcode(); tree.change_focus = true;
+    assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+    for fault in [RelationFault::Reparented, RelationFault::WrongWindow, RelationFault::Unreadable] {
+        let mut tree = xcode(); tree.relation_fault = Some(fault);
+        assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
+    }
+    let mut tree = xcode(); tree.expire_on_parent_read = true;
+    assert!(prove_focused_sheet_context(&tree, 42, 950, true).is_none());
+    assert_eq!(tree.budget.get(), 0);
+    let tree = xcode(); tree.budget.set(0);
+    assert!(prove_focused_sheet_context(&tree, 42, 950, true).is_none());
+}

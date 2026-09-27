@@ -342,6 +342,7 @@ pub(crate) fn detect_same_pid_transient_in_front(
         return SamePidTransientDetection::Indeterminate;
     }
     let windows = enumeration.windows;
+    let has_geometry_candidate = has_same_pid_transient_geometry_candidate(&windows, source);
     // AppKit can omit an attached AXSheet from AXWindows and leave the document
     // as AXMainWindow. Geometry only gates this read; reciprocal AX attachment,
     // exact focus, ownership and visible-chain revalidation authorize the hop.
@@ -349,16 +350,37 @@ pub(crate) fn detect_same_pid_transient_in_front(
         && window.window_id != source.window_id && window.is_on_screen
         && window.on_current_space != Some(false))
     {
-        if let Some(proof) = crate::ax::attached_sheet::focused_attached_sheet_successor(
-            source.pid, source.window_id,
+        use crate::ax::attached_sheet::FocusedSheetContext;
+        let sheet_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        match crate::ax::attached_sheet::focused_attached_sheet_context(
+            source.pid, source.window_id, has_geometry_candidate, sheet_deadline,
         ) {
-            return SamePidTransientDetection::AttachedSheet(proof);
+            Some(FocusedSheetContext::Successor(proof)) => {
+                return SamePidTransientDetection::AttachedSheet(proof);
+            }
+            Some(FocusedSheetContext::ExactLeafAncestors(ancestors))
+                if geometry_candidates_are_proven_ancestors(&windows, source, &ancestors) =>
+            {
+                // The AX proof may take time. A new unrelated window or a
+                // changed physical surface must not inherit the old snapshot.
+                if !recheck_ancestor_geometry(&windows, source, &ancestors,
+                    || std::time::Instant::now() < sheet_deadline,
+                    crate::windows::all_automation_windows_with_space_snapshot)
+                {
+                    return SamePidTransientDetection::Indeterminate;
+                }
+                tracing::debug!(target: "cua_observation_timing", pid=source.pid,
+                    window_id=source.window_id, ?ancestors,
+                    "Exact focused sheet: fresh geometry candidates are proven ancestors");
+                return SamePidTransientDetection::None;
+            }
+            _ => {}
         }
     }
     // Avoid an AX round-trip on the overwhelmingly common single-window path.
     // WindowServer geometry is only a prefilter; it never authorizes a
     // redirect without the exact AX focus/main proof collected below.
-    if !has_same_pid_transient_geometry_candidate(&windows, source) {
+    if !has_geometry_candidate {
         return SamePidTransientDetection::None;
     }
     let ax_facts = match same_pid_ax_window_facts(source.pid) {
@@ -382,6 +404,50 @@ fn has_same_pid_transient_geometry_candidate(windows: &[WindowInfo], source: Win
     windows
         .iter()
         .any(|candidate| is_same_pid_transient_geometry_candidate(candidate, source_window))
+}
+
+// Do not waive the generic guard for a proved sheet when another geometric
+// candidate remains. Only the exact retained chain's ancestors are excluded.
+fn geometry_candidates_are_proven_ancestors(
+    windows: &[WindowInfo], source: WindowTarget, ancestors: &[u32],
+) -> bool {
+    let Some(source_window) = eligible_same_pid_source(windows, source) else {
+        return false;
+    };
+    if ancestors.is_empty() || ancestors.contains(&source.window_id) { return false; }
+    let mut found = false;
+    for candidate in windows.iter()
+        .filter(|candidate| is_same_pid_transient_geometry_candidate(candidate, source_window))
+    {
+        found = true;
+        if !ancestors.contains(&candidate.window_id) { return false; }
+    }
+    found
+}
+
+fn recheck_ancestor_geometry(
+    before: &[WindowInfo], source: WindowTarget, ancestors: &[u32],
+    mut within_budget: impl FnMut() -> bool,
+    enumerate: impl FnOnce() -> crate::windows::WindowEnumeration,
+) -> bool {
+    if !within_budget() { return false; }
+    let current = enumerate();
+    if !within_budget() || !current.succeeded { return false; }
+    for id in std::iter::once(&source.window_id).chain(ancestors.iter()) {
+        let old: Vec<_> = before.iter().filter(|w| w.window_id == *id).collect();
+        let fresh: Vec<_> = current.windows.iter().filter(|w| w.window_id == *id).collect();
+        let ([old], [fresh]) = (old.as_slice(), fresh.as_slice()) else { return false; };
+        if old.pid != source.pid || fresh.pid != source.pid
+            || old.layer != fresh.layer || !fresh.is_on_screen || !old.is_on_screen
+            || fresh.on_current_space != Some(true)
+            || old.on_current_space != fresh.on_current_space
+            || old.current_space_id != fresh.current_space_id || old.space_ids != fresh.space_ids
+            || [old.bounds.x, old.bounds.y, old.bounds.width, old.bounds.height]
+                != [fresh.bounds.x, fresh.bounds.y, fresh.bounds.width, fresh.bounds.height]
+        { return false; }
+    }
+    geometry_candidates_are_proven_ancestors(&current.windows, source, ancestors)
+        && within_budget()
 }
 
 fn same_pid_ax_window_facts(pid: i32) -> Result<Vec<SamePidAxWindowFacts>, ()> {
@@ -829,6 +895,105 @@ mod tests {
         window.on_current_space = Some(true);
         window.space_ids = Some(vec![1]);
         window
+    }
+
+    #[test]
+    fn nested_leaf_geometry_does_not_make_its_proven_save_parent_a_successor() {
+        let source = WindowTarget { pid: 42, window_id: 950 };
+        let windows = vec![
+            current_window(42, 950, "", 0, rect(634.0, 451.0, 460.0, 183.0)),
+            current_window(42, 900, "Save", 1, rect(679.0, 452.0, 370.0, 182.0)),
+            current_window(42, 700, "Document", 2, rect(0.0, 33.0, 1728.0, 1020.0)),
+        ];
+        assert!(has_same_pid_transient_geometry_candidate(&windows, source));
+        assert_eq!(detect_same_pid_transient_in_front_in(
+            &windows, Some(&[same_pid_ax(700, 0, false, true, false)]), source, false),
+            SamePidTransientDetection::Indeterminate,
+            "AXWindows can omit both sheets despite positive native attachment proof");
+        assert!(geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
+        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[]));
+        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[700]));
+        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[950, 900, 700]));
+    }
+
+    #[test]
+    fn a_proven_sheet_ancestor_never_hides_an_unrelated_geometry_candidate() {
+        let source = WindowTarget { pid: 42, window_id: 950 };
+        let mut windows = vec![
+            current_window(42, 950, "", 0, rect(0.0, 0.0, 460.0, 183.0)),
+            current_window(42, 900, "Save", 1, rect(45.0, 1.0, 370.0, 182.0)),
+        ];
+        assert!(geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
+        windows.push(current_window(42, 901, "Other dialog", 2, rect(50.0, 10.0, 100.0, 80.0)));
+        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
+        windows.remove(1);
+        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
+    }
+
+    #[test]
+    fn ancestor_geometry_exception_retains_source_visibility_space_and_pid_gates() {
+        let source = WindowTarget { pid: 42, window_id: 950 };
+        let windows = vec![
+            current_window(42, 950, "", 0, rect(0.0, 0.0, 460.0, 183.0)),
+            current_window(42, 900, "Save", 1, rect(45.0, 1.0, 370.0, 182.0)),
+        ];
+        for kind in 0..4 {
+            let mut changed = windows.clone();
+            match kind {
+                0 => changed[0].is_on_screen = false,
+                1 => changed[0].on_current_space = None,
+                2 => changed[0].pid = 99,
+                _ => changed[1].current_space_id = Some(2),
+            }
+            assert!(!geometry_candidates_are_proven_ancestors(&changed, source, &[900, 700]));
+        }
+    }
+
+    #[test]
+    fn ancestor_exception_rechecks_new_windows_and_changed_physical_identity() {
+        let source = WindowTarget { pid: 42, window_id: 950 };
+        let before = vec![
+            current_window(42, 950, "", 0, rect(0.0, 0.0, 460.0, 183.0)),
+            current_window(42, 900, "Save", 1, rect(45.0, 1.0, 370.0, 182.0)),
+            current_window(42, 700, "Document", 2, rect(0.0, 0.0, 1728.0, 1020.0)),
+        ];
+        let snapshot = |windows| crate::windows::WindowEnumeration {
+            windows, current_space_id: Some(1), succeeded: true,
+        };
+        assert!(recheck_ancestor_geometry(&before, source, &[900, 700], || true,
+            || snapshot(before.clone())));
+        for kind in 0..6 {
+            let mut changed = before.clone();
+            match kind {
+                0 => changed.push(current_window(42, 901, "Other dialog", 0,
+                    rect(50.0, 10.0, 100.0, 80.0))),
+                1 => changed[0].bounds.x += 1.0,
+                2 => changed[1].pid = 99,
+                3 => changed[2].current_space_id = Some(2),
+                4 => changed[2].is_on_screen = false,
+                _ => { changed.remove(1); }
+            }
+            assert!(!recheck_ancestor_geometry(&before, source, &[900, 700], || true,
+                || snapshot(changed)));
+        }
+    }
+
+    #[test]
+    fn ancestor_exception_uses_original_budget_and_refuses_failed_enumeration() {
+        let source = WindowTarget { pid: 42, window_id: 950 };
+        assert!(!recheck_ancestor_geometry(&[], source, &[900], || false,
+            || panic!("expired proof must not start another WindowServer read")));
+        let polls = std::cell::Cell::new(0);
+        assert!(!recheck_ancestor_geometry(&[], source, &[900],
+            || { let n = polls.get(); polls.set(n + 1); n == 0 },
+            || crate::windows::WindowEnumeration {
+                windows: vec![], current_space_id: Some(1), succeeded: true,
+            }));
+        assert_eq!(polls.get(), 2, "the same budget is checked after the read");
+        assert!(!recheck_ancestor_geometry(&[], source, &[900], || true,
+            || crate::windows::WindowEnumeration {
+                windows: vec![], current_space_id: Some(1), succeeded: false,
+            }));
     }
 
     #[test]
