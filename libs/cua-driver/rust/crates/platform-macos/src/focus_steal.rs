@@ -73,6 +73,10 @@ pub(crate) const ENTRY_DEADLINE: Duration = Duration::from_secs(5);
 /// dispatcher is non-empty and prunes expired entries.
 const JANITOR_TICK: Duration = Duration::from_secs(1);
 
+// Wait after each completed target-only ordering check. Never catch up missed
+// ticks, add another task, or extend the entry's original deadline.
+const ORDERING_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 // The activation notification can overtake NSWorkspace.frontmostApplication.
 // Recheck that specific notification briefly; never turn it into a renewable
 // focus lock or a new suppression entry.
@@ -325,7 +329,7 @@ impl SuppressionLease {
         self.poll_task = Some(runtime.spawn(async move {
             loop {
                 let wait_started = Instant::now();
-                let next = (wait_started + Duration::from_millis(100)).min(deadline);
+                let next = (wait_started + ORDERING_POLL_INTERVAL).min(deadline);
                 tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
                 if Instant::now() >= deadline { break; }
                 let timing = crate::order_diagnostics::PollTiming {
@@ -1688,6 +1692,88 @@ mod tests {
         let original = d.entries.lock().unwrap()[&h.0].deadline;
         assert_eq!(d.with_current_targeted(h, |deadline| deadline), Some(original),
             "an in-flight background action needs ordering protection before its response");
+    }
+
+    #[tokio::test]
+    async fn active_ordering_poll_waits_25ms_after_each_completed_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.ordering_poll_schedule");
+        let deadline = d.entries.lock().unwrap()[&h.0].deadline;
+        let mut lease = private_lease(&d, h);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&calls);
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut first_tx = Some(first_tx);
+        let mut second_tx = Some(second_tx);
+        let mut first_completed = None;
+        assert!(lease.start_polling(move |observed_deadline, diagnostics| {
+            assert_eq!(observed_deadline, deadline);
+            match submitted.fetch_add(1, Ordering::SeqCst) + 1 {
+                1 => {
+                    assert!(first_tx.take().unwrap().send(diagnostics).is_ok());
+                    release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    first_completed = Some(Instant::now());
+                    true
+                }
+                2 => {
+                    assert!(second_tx.take().unwrap()
+                        .send((diagnostics, first_completed.unwrap())).is_ok());
+                    false
+                }
+                _ => panic!("false callback must end the single polling task"),
+            }
+        }));
+        let first = tokio::time::timeout(Duration::from_secs(2), first_rx).await.unwrap().unwrap();
+        // Make one check span several polling intervals. The next wait must
+        // begin after it returns, rather than replaying any missed ticks.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        release_tx.send(()).unwrap();
+        let (second, completed) = tokio::time::timeout(Duration::from_secs(2), second_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), lease.poll_task.take().unwrap()).await.unwrap().unwrap();
+        for diagnostics in [first, second] {
+            assert_eq!(diagnostics.source, crate::order_diagnostics::CheckSource::ActivePoll);
+            assert_eq!(diagnostics.timing.scheduled_wake - diagnostics.timing.wait_started,
+                Duration::from_millis(25), "inspect the actual timer plan, not the constant");
+        }
+        assert!(second.timing.wait_started >= completed, "no catch-up after a slow check");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(d.entries.lock().unwrap()[&h.0].deadline, deadline);
+        drop(lease);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn active_ordering_poll_stops_if_callback_crosses_original_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.ordering_poll_expiry_after_check");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline = deadline;
+        let mut lease = private_lease(&d, h);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut entered_tx = Some(entered_tx);
+        assert!(lease.start_polling(move |observed_deadline, _| {
+            assert_eq!(observed_deadline, deadline);
+            assert_eq!(submitted.fetch_add(1, Ordering::SeqCst), 0,
+                "expired lease cannot authorize another callback");
+            entered_tx.take().unwrap().send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            true
+        }));
+        tokio::time::timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline + Duration::from_millis(10))).await;
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), lease.poll_task.take().unwrap()).await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(lease.targeted_deadline().is_none());
+        drop(lease);
+        assert_eq!(d.len(), 0);
     }
 
     #[tokio::test]
