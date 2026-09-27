@@ -232,6 +232,142 @@ fn standard_dialog_attachment_refuses_identifier_failure_after_chain_proof() {
 }
 
 #[test]
+fn standard_dialog_probe_declines_direct_ordinary_before_full_proof() {
+    let mut tree = chess_with_host_focus();
+    tree.focused = 900;
+    let probe = probe_standard_dialog(&tree, 42, 900);
+    assert!(probe.observed_requested_sheet);
+    assert_eq!(probe.host_id, None);
+    assert_eq!(tree.identifier_reads.get(), 1);
+    assert_eq!(tree.windows_reads.get(), 0);
+    assert_eq!(tree.relation_reads.get(), 1, "only the existing direct-parent discovery");
+
+    let mut original = chess_with_host_focus();
+    original.focused = 900;
+    assert!(dialog_attachment(&original, 42, 900).is_none());
+    assert_eq!(original.identifier_reads.get(), 1);
+    assert_eq!(original.windows_reads.get(), 1);
+    assert_eq!(original.relation_reads.get(), 3);
+    // Declining optional preparation cannot stand in for keyboard authority.
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_some());
+    tree.nodes.get_mut(&700).unwrap().children.clear();
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
+}
+
+#[test]
+fn standard_dialog_probe_direct_standard_retains_double_proof_and_final_identifier() {
+    for identifier in ["save-panel", "open-panel"] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = 900;
+        tree.nodes.get_mut(&900).unwrap().id = identifier;
+        let probe = probe_standard_dialog(&tree, 42, 900);
+        assert!(probe.observed_requested_sheet);
+        assert_eq!(probe.host_id, Some(700));
+        assert_eq!(tree.windows_reads.get(), 2);
+        assert_eq!(tree.identifier_reads.get(), 2);
+
+        let mut original = chess_with_host_focus();
+        original.focused = 900;
+        original.nodes.get_mut(&900).unwrap().id = identifier;
+        assert_eq!(dialog_attachment(&original, 42, 900).unwrap().host_id, 700);
+        assert_eq!(tree.windows_reads.get(), original.windows_reads.get());
+        assert_eq!(tree.relation_reads.get(), original.relation_reads.get());
+        assert_eq!(tree.identifier_reads.get(), original.identifier_reads.get());
+        assert_eq!(tree.reads.get(), original.reads.get());
+    }
+}
+
+#[test]
+fn standard_dialog_probe_keeps_nested_standard_ancestor_and_original_read_counts() {
+    let tree = xcode();
+    let probe = probe_standard_dialog(&tree, 42, 950);
+    assert!(probe.observed_requested_sheet);
+    assert_eq!(probe.host_id, Some(700), "GoToWindow is not the standard ancestor");
+    let original = xcode();
+    assert_eq!(dialog_attachment(&original, 42, 950).unwrap().panel_id, 900);
+    assert_eq!(tree.windows_reads.get(), original.windows_reads.get());
+    assert_eq!(tree.relation_reads.get(), original.relation_reads.get());
+    assert_eq!(tree.identifier_reads.get(), original.identifier_reads.get());
+    assert_eq!(tree.reads.get(), original.reads.get());
+}
+
+#[test]
+fn standard_dialog_probe_unknown_direct_identifier_keeps_original_full_proof() {
+    for unreadable in [false, true] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = 900;
+        tree.nodes.get_mut(&900).unwrap().id = "";
+        tree.unreadable_identifier = unreadable.then_some(900);
+        let probe = probe_standard_dialog(&tree, 42, 900);
+        assert!(probe.observed_requested_sheet);
+        assert_eq!(probe.host_id, None);
+        assert_eq!(tree.windows_reads.get(), 1, "unknown cannot take the early decline");
+        assert_eq!(tree.relation_reads.get(), 3);
+        if !unreadable {
+            assert_eq!(tree.identifier_reads.get(), 2, "unknown is reread at the original point");
+        }
+    }
+    let mut later_standard = chess_with_host_focus();
+    later_standard.focused = 900;
+    later_standard.nodes.get_mut(&900).unwrap().id = "";
+    later_standard.identifier_after_first = Some("save-panel");
+    assert_eq!(probe_standard_dialog(&later_standard, 42, 900).host_id, Some(700));
+    assert_eq!(later_standard.windows_reads.get(), 2);
+    assert_eq!(later_standard.identifier_reads.get(), 3,
+        "an early unknown must not replace the original later standard-panel decision");
+}
+
+#[test]
+fn standard_dialog_probe_rechecks_identifier_after_retained_standard_proof() {
+    for unreadable in [false, true] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = 900;
+        tree.nodes.get_mut(&900).unwrap().id = "save-panel";
+        tree.identifier_unreadable_after_first = unreadable;
+        tree.identifier_after_first = (!unreadable).then_some("ordinary-confirmation");
+        let probe = probe_standard_dialog(&tree, 42, 900);
+        assert!(probe.observed_requested_sheet);
+        assert_eq!(probe.host_id, None);
+        assert_eq!(tree.windows_reads.get(), 2);
+        assert_eq!(tree.identifier_reads.get(), 2, "early standard ID is never final authority");
+    }
+}
+
+#[test]
+fn standard_dialog_probe_retained_relation_selection_and_budget_failures_stay_negative() {
+    for fault in [RelationFault::Reparented, RelationFault::WrongWindow, RelationFault::Unreadable] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = 900;
+        tree.nodes.get_mut(&900).unwrap().id = "save-panel";
+        tree.relation_fault = Some(fault);
+        let probe = probe_standard_dialog(&tree, 42, 900);
+        assert!(probe.observed_requested_sheet);
+        assert_eq!(probe.host_id, None);
+    }
+    for expire in [false, true] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = 900;
+        tree.nodes.get_mut(&900).unwrap().id = "save-panel";
+        tree.change_focus = !expire;
+        tree.expire_on_parent_read = expire;
+        let probe = probe_standard_dialog(&tree, 42, 900);
+        assert!(probe.observed_requested_sheet);
+        assert_eq!(probe.host_id, None);
+    }
+}
+
+#[test]
+fn standard_dialog_probe_hint_requires_observed_exact_same_pid_sheet() {
+    for (pid, requested) in [(43, 900), (42, 901), (42, 700)] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = 900;
+        let probe = probe_standard_dialog(&tree, pid, requested);
+        assert!(!probe.observed_requested_sheet);
+        assert_eq!(probe.host_id, None);
+    }
+}
+
+#[test]
 fn ordinary_sheet_keyboard_activation_requires_its_own_proven_visible_leaf() {
     for focus in [700, 900] {
         let mut tree = chess_with_host_focus();

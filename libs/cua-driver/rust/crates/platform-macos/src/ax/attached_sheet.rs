@@ -78,6 +78,12 @@ fn selected_sheet<T: SheetTree>(tree: &T) -> Option<(T::Node, T::Node)> {
 }
 
 fn prove_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attachment<T::Node>> {
+    prove_chain_with_dialog_probe(tree, pid, requested, None)
+}
+
+fn prove_chain_with_dialog_probe<T: SheetTree>(
+    tree: &T, pid: i32, requested: u32, mut probe: Option<&mut StandardDialogProbe>,
+) -> Option<Attachment<T::Node>> {
     let (focused, sheet) = selected_sheet(tree)?;
     if tree.window_id(&sheet) != Some(requested) {
         return None;
@@ -97,6 +103,23 @@ fn prove_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attac
             return None;
         }
         let role = tree.role(&current)?;
+        if let Some(probe) = probe.as_deref_mut() {
+            // These PID/physical-ID/role facts were already read above. They
+            // only decline an optional ordinary-window optimization later.
+            if nodes.is_empty() && role == "AXSheet" {
+                probe.observed_requested_sheet = true;
+            }
+            if nodes.len() == 1 && role == "AXWindow" {
+                // The original first walk has reached the direct parent. A
+                // concrete nonstandard leaf cannot have a standard sheet
+                // ancestor. No input/attachment authority follows from this.
+                match tree.identifier(&nodes[0]).as_deref() {
+                    Some("save-panel" | "open-panel") => probe.direct_standard_identifier = true,
+                    Some(identifier) if !identifier.is_empty() => return None,
+                    _ => {} // Unknown still pays the entire original proof.
+                }
+            }
+        }
         nodes.push(current.clone());
         window_ids.push(id);
         if role == "AXWindow" {
@@ -171,11 +194,18 @@ fn visible_chain<T: SheetTree>(tree: &T, pid: i32, chain: &Attachment<T::Node>) 
 }
 
 fn dialog_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attachment<T::Node>> {
-    let chain = prove_chain(tree, pid, requested)?;
+    dialog_chain_with_probe(tree, pid, requested, None)
+}
+
+fn dialog_chain_with_probe<T: SheetTree>(
+    tree: &T, pid: i32, requested: u32, mut probe: Option<&mut StandardDialogProbe>,
+) -> Option<Attachment<T::Node>> {
+    let chain = prove_chain_with_dialog_probe(tree, pid, requested, probe.as_deref_mut())?;
+    let direct_standard = probe.as_ref().is_some_and(|probe| probe.direct_standard_identifier);
     // A nested dialog is eligible only through a proven standard Open/Save
     // panel ancestor. An arbitrary AXSheet or same-PID sibling is insufficient.
-    if !chain.nodes.iter().take(chain.nodes.len() - 1).any(|node| {
-        matches!(
+    if !chain.nodes.iter().take(chain.nodes.len() - 1).enumerate().any(|(index, node)| {
+        (index == 0 && direct_standard) || matches!(
             tree.identifier(node).as_deref(),
             Some("save-panel" | "open-panel")
         )
@@ -625,7 +655,12 @@ pub(crate) struct DialogAttachment {
 fn dialog_attachment<T: SheetTree>(
     tree: &T, pid: i32, window_id: u32,
 ) -> Option<DialogAttachment> {
-    let chain = dialog_chain(tree, pid, window_id)?;
+    finish_dialog_attachment(tree, window_id, dialog_chain(tree, pid, window_id)?)
+}
+
+fn finish_dialog_attachment<T: SheetTree>(
+    tree: &T, window_id: u32, chain: Attachment<T::Node>,
+) -> Option<DialogAttachment> {
     let panel = chain
         .nodes
         .iter()
@@ -681,6 +716,37 @@ pub(crate) fn focused_dialog_host_before(
     unsafe {
         let tree = NativeTree { app: Node::owned(AXUIElementCreateApplication(pid))?, deadline };
         dialog_attachment(&tree, pid, window_id).map(|chain| chain.host_id)
+    }
+}
+
+/// Facts from the existing standard-dialog discovery, never input authority.
+#[derive(Default)]
+pub(crate) struct StandardDialogProbe {
+    pub(crate) host_id: Option<u32>,
+    pub(crate) observed_requested_sheet: bool,
+    direct_standard_identifier: bool,
+}
+
+fn probe_standard_dialog<T: SheetTree>(tree: &T, pid: i32, window_id: u32) -> StandardDialogProbe {
+    let mut probe = StandardDialogProbe::default();
+    probe.host_id = dialog_chain_with_probe(tree, pid, window_id, Some(&mut probe))
+        .and_then(|chain| finish_dialog_attachment(tree, window_id, chain))
+        .map(|chain| chain.host_id);
+    probe
+}
+
+/// Initial optimization selection only. Positive standard dialogs still pass
+/// both complete chain proofs and the original final identifier reread.
+/// Subsequent selected-dialog revalidation uses focused_dialog_host_before.
+pub(crate) fn probe_standard_dialog_before(
+    pid: i32, window_id: u32, deadline: Instant,
+) -> StandardDialogProbe {
+    if Instant::now() >= deadline { return StandardDialogProbe::default(); }
+    unsafe {
+        let Some(app) = Node::owned(AXUIElementCreateApplication(pid)) else {
+            return StandardDialogProbe::default();
+        };
+        probe_standard_dialog(&NativeTree { app, deadline }, pid, window_id)
     }
 }
 

@@ -3054,8 +3054,9 @@ fn ordinary_activation_probe_allowed(
     keyboard_target: bool,
     hidden_panel: bool,
     standard_dialog: bool,
+    observed_requested_sheet: bool,
 ) -> bool {
-    keyboard_target && !hidden_panel && !standard_dialog
+    keyboard_target && !hidden_panel && !standard_dialog && !observed_requested_sheet
 }
 
 // Only already-read identity/shape facts are retained for the existing branch
@@ -3509,18 +3510,20 @@ fn with_foreground_hid_activation_inner(
             // Only the already-supported standard dialog proof is available
             // before activation. Ordinary keyboard-sheet proof stays in its
             // original later AX phase. Never start a fresh discovery budget.
-            let standard_dialog_host = if keyboard_target && !hidden_panel {
+            let standard_dialog_probe = if keyboard_target && !hidden_panel {
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
-                let host = crate::ax::attached_sheet::focused_dialog_host_before(
+                let probe = crate::ax::attached_sheet::probe_standard_dialog_before(
                     target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
                 );
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
                 anyhow::ensure!(publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
                     "standard dialog discovery exceeded the foreground activation budget");
-                host
-            } else { None };
+                probe
+            } else { crate::ax::attached_sheet::StandardDialogProbe::default() };
+            let standard_dialog_host = standard_dialog_probe.host_id;
             let ordinary_probe_allowed = ordinary_activation_probe_allowed(
                 keyboard_target, hidden_panel, standard_dialog_host.is_some(),
+                standard_dialog_probe.observed_requested_sheet,
             );
             let mut ready_ordinary_proof = None;
             let mut ordinary_probe_diagnostics = OrdinaryProbeDiagnostics::default();
@@ -5034,10 +5037,14 @@ mod tests {
         for keyboard in [false, true] {
             for hidden in [false, true] {
                 for dialog in [false, true] {
-                    assert_eq!(
-                        super::ordinary_activation_probe_allowed(keyboard, hidden, dialog),
-                        keyboard && !hidden && !dialog
-                    );
+                    for observed_sheet in [false, true] {
+                        assert_eq!(
+                            super::ordinary_activation_probe_allowed(
+                                keyboard, hidden, dialog, observed_sheet,
+                            ),
+                            keyboard && !hidden && !dialog && !observed_sheet
+                        );
+                    }
                 }
             }
         }
