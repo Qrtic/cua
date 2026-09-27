@@ -819,9 +819,17 @@ fn window_frame_status(
     }
 }
 
+fn check_recovery_capture_deadline(deadline: Option<Instant>, now: Instant) -> anyhow::Result<()> {
+    if deadline.is_some_and(|deadline| now >= deadline) {
+        anyhow::bail!("ScreenCaptureKit discovery recovery exceeded capture deadline");
+    }
+    Ok(())
+}
+
 fn capture_complete_window_frame(
     filter: &screencapturekit::prelude::SCContentFilter,
     config: &screencapturekit::prelude::SCStreamConfiguration,
+    recovery_deadline: Option<Instant>,
 ) -> anyhow::Result<screencapturekit::cm::CMSampleBuffer> {
     use screencapturekit::cm::SCFrameStatus;
     use screencapturekit::prelude::{SCStream, SCStreamOutputType};
@@ -841,6 +849,14 @@ fn capture_complete_window_frame(
             SCStreamOutputType::Screen,
         )
         .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit rejected window frame output"))?;
+    // Preparing a filter/stream may itself use up the remaining budget. The
+    // extra recovery frame must not start after the original worker deadline.
+    if recovery_deadline.is_some() {
+        if let Err(error) = check_recovery_capture_deadline(recovery_deadline, Instant::now()) {
+            stream.remove_output_handler(handler, SCStreamOutputType::Screen);
+            return Err(error);
+        }
+    }
     stream
         .start_capture()
         .map_err(|error| anyhow::anyhow!("ScreenCaptureKit window stream start failed: {error}"))?;
@@ -1054,7 +1070,11 @@ fn build_window_capture_plan(
 }
 
 /// Capture one complete frame, verify its actual mapping, and encode RGBA/PNG.
-fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
+fn capture_window_from_plan(
+    window_id: u32,
+    plan: &WindowCapturePlan,
+    recovery_deadline: Option<Instant>,
+) -> anyhow::Result<Vec<u8>> {
     use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt};
     use screencapturekit::screenshot_manager::CGImageExt;
 
@@ -1069,7 +1089,7 @@ fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow:
         content_width = content.size.width, content_height = content.size.height,
         output_width = plan.config.width(), output_height = plan.config.height(),
         "Capturing exact window with ScreenCaptureKit configuration");
-    let sample = capture_complete_window_frame(&plan.filter, &plan.config)?;
+    let sample = capture_complete_window_frame(&plan.filter, &plan.config, recovery_deadline)?;
     let mut info = sample.frame_info().ok_or_else(|| {
         anyhow::anyhow!("ScreenCaptureKit omitted frame geometry for window {window_id}")
     })?;
@@ -1138,10 +1158,11 @@ where
 fn capture_window_from_plan_validated(
     window_id: u32,
     plan: &WindowCapturePlan,
+    recovery_deadline: Option<Instant>,
 ) -> anyhow::Result<CaptureIdentityValidation<WindowCaptureBinding>> {
     capture_then_validate_identity(
         plan.binding.clone(),
-        || capture_window_from_plan(window_id, plan),
+        || capture_window_from_plan(window_id, plan, recovery_deadline),
         || current_window_capture_binding(window_id),
     )
 }
@@ -1150,43 +1171,63 @@ fn evict_window_capture_plan(window_id: u32, plan: &std::sync::Arc<WindowCapture
     lock_window_plan_cache().remove_if(&window_id, |stored| std::sync::Arc::ptr_eq(stored, plan));
 }
 
-/// Single-frame capture, with at most one rebuild after a changed binding or
-/// a failed warm plan. A fresh native failure is not replayed. All discovery,
-/// build, frame and revalidation work stays inside the existing three-second
-/// worker, whose permit remains owned until a blocked native call returns.
-fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> {
-    let mut binding = current_window_capture_binding(window_id)?;
+fn empty_discovery_recovered(before: &WindowCaptureBinding, after: &WindowCaptureBinding) -> bool {
+    !before.selection.discovery_usable
+        && after.selection.discovery_usable
+        && before.selection.attachments.is_empty()
+        && after.selection.attachments.is_empty()
+        && before.selection.target == after.selection.target
+        && before.display.is_none()
+        && after.display.is_none()
+}
+
+struct WindowCaptureAttempt {
+    was_cached: bool,
+    result: anyhow::Result<CaptureIdentityValidation<WindowCaptureBinding>>,
+}
+
+/// Keep the native retry control flow injectable without substituting its
+/// strict post-frame validation. Recovery never accepts an earlier frame:
+/// only a new frame taken against the recovered binding can be returned.
+fn capture_window_with_binding_retries<A, R, N>(
+    mut binding: WindowCaptureBinding,
+    deadline: Instant,
+    mut attempt: A,
+    mut refresh_binding: R,
+    mut now: N,
+) -> anyhow::Result<Vec<u8>>
+where
+    A: FnMut(&WindowCaptureBinding, Option<Instant>) -> anyhow::Result<WindowCaptureAttempt>,
+    R: FnMut() -> anyhow::Result<WindowCaptureBinding>,
+    N: FnMut() -> Instant,
+{
+    let window_id = binding.selection.target.window_id;
     let mut retry_available = true;
+    let mut attempts = 0;
     loop {
-        let cached = lock_window_plan_cache().get_cloned_at(&window_id, Instant::now());
-        let reusable = cached.filter(|plan| {
-            if capture_plan_is_reusable(&plan.binding, &binding) {
-                true
-            } else {
-                evict_window_capture_plan(window_id, plan);
-                false
-            }
-        });
-        let was_cached = reusable.is_some();
-        let plan = match reusable {
-            Some(plan) => plan,
-            None => {
-                let plan = build_window_capture_plan(window_id, &binding)?;
-                if binding.selection.can_cache() && binding.display.is_none() {
-                    lock_window_plan_cache().insert_at(
-                        window_id,
-                        std::sync::Arc::clone(&plan),
-                        Instant::now(),
-                    );
-                }
-                plan
-            }
-        };
-        match capture_window_from_plan_validated(window_id, &plan) {
+        if attempts >= 3 {
+            anyhow::bail!("ScreenCaptureKit explicit capture attempt limit reached");
+        }
+        let recovery_deadline = (attempts == 2).then_some(deadline);
+        if recovery_deadline.is_some() {
+            check_recovery_capture_deadline(recovery_deadline, now())?;
+        }
+        attempts += 1;
+        let WindowCaptureAttempt { was_cached, result } = attempt(&binding, recovery_deadline)?;
+        match result {
             Ok(CaptureIdentityValidation::Matched(bytes)) => return Ok(bytes),
             Ok(CaptureIdentityValidation::Changed(current)) => {
-                evict_window_capture_plan(window_id, &plan);
-                if !retry_available {
+                let recovery_recapture =
+                    attempts == 2 && empty_discovery_recovered(&binding, &current);
+                tracing::debug!(target: "cua_capture_geometry", window_id, attempts,
+                    target_equal = binding.selection.target == current.selection.target,
+                    attachments_equal = binding.selection.attachments == current.selection.attachments,
+                    display_equal = binding.display == current.display,
+                    discovery_before = binding.selection.discovery_usable,
+                    discovery_after = current.selection.discovery_usable,
+                    recovery_recapture_eligible = recovery_recapture,
+                    "Discarding frame after explicit capture binding changed");
+                if !retry_available && !recovery_recapture {
                     anyhow::bail!(
                         "ScreenCaptureKit explicit window binding changed again during retry"
                     );
@@ -1195,27 +1236,72 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
                 retry_available = false;
             }
             Err(error) => {
-                evict_window_capture_plan(window_id, &plan);
                 if !was_cached || !retry_available {
                     return Err(error);
                 }
                 tracing::debug!(target: "cua_capture_geometry", window_id, error = %error,
                     "Discarding failed warm plan; rebuilding once with fresh attachment discovery");
-                binding = current_window_capture_binding(window_id)?;
+                binding = refresh_binding()?;
                 retry_available = false;
             }
         }
     }
 }
 
+/// At most one ordinary rebuild after a changed binding or failed warm plan.
+/// Only an empty-discovery recovery on the second frame permits a third frame,
+/// under the original deadline and strict binding equality. Fresh failures are
+/// not replayed; the worker retains its permit until blocked native work ends.
+fn screenshot_window_bytes_sck_inner(window_id: u32, deadline: Instant) -> anyhow::Result<Vec<u8>> {
+    let binding = current_window_capture_binding(window_id)?;
+    capture_window_with_binding_retries(
+        binding,
+        deadline,
+        |binding, recovery_deadline| {
+            let cached = lock_window_plan_cache().get_cloned_at(&window_id, Instant::now());
+            let reusable = cached.filter(|plan| {
+                if capture_plan_is_reusable(&plan.binding, binding) {
+                    true
+                } else {
+                    evict_window_capture_plan(window_id, plan);
+                    false
+                }
+            });
+            let was_cached = reusable.is_some();
+            let plan = match reusable {
+                Some(plan) => plan,
+                None => {
+                    let plan = build_window_capture_plan(window_id, binding)?;
+                    if binding.selection.can_cache() && binding.display.is_none() {
+                        lock_window_plan_cache().insert_at(
+                            window_id,
+                            std::sync::Arc::clone(&plan),
+                            Instant::now(),
+                        );
+                    }
+                    plan
+                }
+            };
+            let result = capture_window_from_plan_validated(window_id, &plan, recovery_deadline);
+            if !matches!(&result, Ok(CaptureIdentityValidation::Matched(_))) {
+                evict_window_capture_plan(window_id, &plan);
+            }
+            Ok(WindowCaptureAttempt { was_cached, result })
+        },
+        || current_window_capture_binding(window_id),
+        Instant::now,
+    )
+}
+
 /// Preserve typed refusal and source context across the worker boundary. A
 /// timeout also cannot fall back: the timed-out worker may still own a capture
 /// of a formerly attached surface, and shell composition is not verified.
 fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
+    let deadline = Instant::now() + WINDOW_CAPTURE_NATIVE_TIMEOUT;
     run_native_capture_worker(
         native_capture_gate(),
         WINDOW_CAPTURE_NATIVE_TIMEOUT,
-        move || screenshot_window_bytes_sck_inner(window_id),
+        move || screenshot_window_bytes_sck_inner(window_id, deadline),
     )
     .and_then(|bytes| {
         if bytes.is_empty() {
@@ -1427,6 +1513,335 @@ mod tests {
             selection: capture_selection_from_snapshot(target, windows, ids, true).unwrap(),
             display: None,
         }
+    }
+
+    fn recovery_binding_fixture() -> WindowCaptureBinding {
+        binding_fixture(
+            &[capture_window_fixture(
+                10,
+                WindowCaptureIdentity::new(42, 0, 100.0, 100.0, 600.0, 500.0),
+            )],
+            10,
+            &[],
+        )
+    }
+
+    #[test]
+    fn discovery_recovery_returns_only_a_new_strictly_validated_frame() {
+        let known = recovery_binding_fixture();
+        let mut unknown = known.clone();
+        unknown.selection.discovery_usable = false;
+        for (initial, states) in [
+            (known.clone(), vec![known.clone()]),
+            (unknown.clone(), vec![unknown.clone()]),
+            (known.clone(), vec![unknown.clone(), unknown.clone()]),
+            (known.clone(), vec![unknown, known.clone(), known]),
+        ] {
+            let expected_attempts = states.len();
+            let mut states = states.into_iter();
+            let attempts = Cell::new(0_u8);
+            let start = Instant::now();
+            let deadline = start + WINDOW_CAPTURE_NATIVE_TIMEOUT;
+            let bytes = capture_window_with_binding_retries(
+                initial,
+                deadline,
+                |expected, recovery_deadline| {
+                    let actual = states.next().expect("unexpected additional capture");
+                    attempts.set(attempts.get() + 1);
+                    assert_eq!(recovery_deadline, (attempts.get() == 3).then_some(deadline));
+                    Ok(WindowCaptureAttempt {
+                        was_cached: false,
+                        result: capture_then_validate_identity(
+                            expected.clone(),
+                            || Ok(vec![attempts.get()]),
+                            || Ok(actual),
+                        ),
+                    })
+                },
+                || panic!("binding changes must use the observed binding"),
+                || start,
+            )
+            .unwrap();
+            assert_eq!(usize::from(attempts.get()), expected_attempts);
+            assert_eq!(bytes, vec![attempts.get()], "earlier PNG must be discarded");
+            assert!(states.next().is_none());
+        }
+    }
+
+    #[test]
+    fn discovery_recovery_never_hides_other_binding_changes() {
+        let known = recovery_binding_fixture();
+        let mut unknown = known.clone();
+        unknown.selection.discovery_usable = false;
+        let attachment = SelectedCaptureWindow::from_info(&capture_window_fixture(
+            11,
+            WindowCaptureIdentity::new(42, 0, 900.0, 900.0, 20.0, 20.0),
+        ));
+        let mut pairs = Vec::new();
+        for field in 0..9 {
+            let mut changed = known.clone();
+            match field {
+                0 => changed.selection.target.window_id += 1,
+                1 => changed.selection.target.identity.pid += 1,
+                2 => changed.selection.target.identity.layer += 1,
+                3 => changed.selection.target.identity.x = 101.0_f64.to_bits(),
+                4 => changed.selection.target.identity.y = 101.0_f64.to_bits(),
+                5 => changed.selection.target.identity.width = 601.0_f64.to_bits(),
+                6 => changed.selection.target.identity.height = 501.0_f64.to_bits(),
+                7 => changed.selection.target.is_on_screen = false,
+                _ => changed.selection.attachments.push(attachment.clone()),
+            }
+            pairs.push((unknown.clone(), changed));
+        }
+        let mut attached_before = unknown.clone();
+        attached_before.selection.attachments.push(attachment);
+        pairs.push((attached_before, known.clone()));
+        let display = Some(capture_display_fixture(1, 0.0, 0.0, 1728.0, 1117.0));
+        let mut display_before = unknown.clone();
+        display_before.display = display;
+        pairs.push((display_before, known.clone()));
+        let mut display_after = known.clone();
+        display_after.display = display;
+        pairs.push((unknown, display_after));
+        assert!(!empty_discovery_recovered(&known, &known));
+        for (before, after) in pairs {
+            assert!(!empty_discovery_recovered(&before, &after));
+            let mut states = vec![before, after].into_iter();
+            let attempts = Cell::new(0);
+            let start = Instant::now();
+            let result = capture_window_with_binding_retries(
+                known.clone(),
+                start + WINDOW_CAPTURE_NATIVE_TIMEOUT,
+                |expected, recovery_deadline| {
+                    assert!(recovery_deadline.is_none());
+                    let actual = states.next().expect("ineligible third capture");
+                    attempts.set(attempts.get() + 1);
+                    Ok(WindowCaptureAttempt {
+                        was_cached: false,
+                        result: capture_then_validate_identity(
+                            expected.clone(),
+                            || Ok(vec![1]),
+                            || Ok(actual),
+                        ),
+                    })
+                },
+                || panic!("unexpected refresh"),
+                || start,
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts.get(), 2);
+        }
+    }
+
+    #[test]
+    fn discovery_recovery_third_change_never_starts_a_fourth_capture() {
+        let known = recovery_binding_fixture();
+        let mut unknown = known.clone();
+        unknown.selection.discovery_usable = false;
+        let mut moved = known.clone();
+        moved.selection.target.identity.x = 101.0_f64.to_bits();
+        let mut attached = known.clone();
+        attached
+            .selection
+            .attachments
+            .push(SelectedCaptureWindow::from_info(&capture_window_fixture(
+                11,
+                WindowCaptureIdentity::new(42, 0, 900.0, 900.0, 20.0, 20.0),
+            )));
+        let mut display = known.clone();
+        display.display = Some(capture_display_fixture(1, 0.0, 0.0, 1728.0, 1117.0));
+        for last in [unknown.clone(), moved, attached, display] {
+            let mut states = vec![unknown.clone(), known.clone(), last].into_iter();
+            let attempts = Cell::new(0);
+            let start = Instant::now();
+            let result = capture_window_with_binding_retries(
+                known.clone(),
+                start + WINDOW_CAPTURE_NATIVE_TIMEOUT,
+                |expected, _| {
+                    let actual = states.next().expect("forbidden fourth capture");
+                    attempts.set(attempts.get() + 1);
+                    Ok(WindowCaptureAttempt {
+                        was_cached: false,
+                        result: capture_then_validate_identity(
+                            expected.clone(),
+                            || Ok(vec![1]),
+                            || Ok(actual),
+                        ),
+                    })
+                },
+                || panic!("unexpected refresh"),
+                || start,
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts.get(), 3);
+        }
+    }
+
+    #[test]
+    fn discovery_recovery_keeps_fresh_and_post_validation_errors_terminal() {
+        let known = recovery_binding_fixture();
+        let mut unknown = known.clone();
+        unknown.selection.discovery_usable = false;
+        for error_at in 1..=3 {
+            for post_read_error in [false, true] {
+                let attempts = Cell::new(0);
+                let start = Instant::now();
+                let result = capture_window_with_binding_retries(
+                    known.clone(),
+                    start + WINDOW_CAPTURE_NATIVE_TIMEOUT,
+                    |expected, _| {
+                        attempts.set(attempts.get() + 1);
+                        assert!(attempts.get() <= error_at);
+                        let actual = if attempts.get() == 1 {
+                            unknown.clone()
+                        } else {
+                            known.clone()
+                        };
+                        Ok(WindowCaptureAttempt {
+                            was_cached: false,
+                            result: capture_then_validate_identity(
+                                expected.clone(),
+                                || {
+                                    if attempts.get() == error_at && !post_read_error {
+                                        anyhow::bail!("native frame failure");
+                                    }
+                                    Ok(vec![1])
+                                },
+                                || {
+                                    if attempts.get() == error_at && post_read_error {
+                                        anyhow::bail!("post-frame binding read failure");
+                                    }
+                                    Ok(actual)
+                                },
+                            ),
+                        })
+                    },
+                    || panic!("fresh errors are never refreshed/replayed"),
+                    || start,
+                );
+                assert!(result.is_err());
+                assert_eq!(attempts.get(), error_at);
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_recovery_keeps_only_the_existing_warm_failure_retry() {
+        let known = recovery_binding_fixture();
+        for fail_again in [false, true] {
+            let attempts = Cell::new(0);
+            let refreshes = Cell::new(0);
+            let start = Instant::now();
+            let result = capture_window_with_binding_retries(
+                known.clone(),
+                start + WINDOW_CAPTURE_NATIVE_TIMEOUT,
+                |expected, recovery_deadline| {
+                    assert!(recovery_deadline.is_none());
+                    attempts.set(attempts.get() + 1);
+                    assert!(attempts.get() <= 2);
+                    Ok(WindowCaptureAttempt {
+                        was_cached: true,
+                        result: if attempts.get() == 1 || fail_again {
+                            Err(anyhow::anyhow!("cached native failure"))
+                        } else {
+                            capture_then_validate_identity(
+                                expected.clone(),
+                                || Ok(vec![2]),
+                                || Ok(known.clone()),
+                            )
+                        },
+                    })
+                },
+                || {
+                    refreshes.set(refreshes.get() + 1);
+                    Ok(known.clone())
+                },
+                || start,
+            );
+            assert_eq!(result.is_err(), fail_again);
+            assert_eq!(attempts.get(), 2);
+            assert_eq!(refreshes.get(), 1);
+        }
+    }
+
+    #[test]
+    fn discovery_recovery_cannot_reset_or_cross_the_original_deadline() {
+        let known = recovery_binding_fixture();
+        let mut unknown = known.clone();
+        unknown.selection.discovery_usable = false;
+        for offset in [Duration::ZERO, Duration::from_millis(1)] {
+            let start = Instant::now();
+            let deadline = start + WINDOW_CAPTURE_NATIVE_TIMEOUT;
+            let clock = Cell::new(start);
+            let attempts = Cell::new(0);
+            let mut states = vec![unknown.clone(), known.clone()].into_iter();
+            let result = capture_window_with_binding_retries(
+                known.clone(),
+                deadline,
+                |expected, recovery_deadline| {
+                    assert!(recovery_deadline.is_none());
+                    let actual = states.next().expect("expired recovery capture started");
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() == 2 {
+                        clock.set(deadline + offset);
+                    }
+                    Ok(WindowCaptureAttempt {
+                        was_cached: false,
+                        result: capture_then_validate_identity(
+                            expected.clone(),
+                            || Ok(vec![1]),
+                            || Ok(actual),
+                        ),
+                    })
+                },
+                || panic!("unexpected refresh"),
+                || clock.get(),
+            );
+            assert!(result.unwrap_err().to_string().contains("deadline"));
+            assert_eq!(attempts.get(), 2);
+        }
+    }
+
+    #[test]
+    fn discovery_recovery_rechecks_deadline_after_preparing_the_extra_frame() {
+        let known = recovery_binding_fixture();
+        let mut unknown = known.clone();
+        unknown.selection.discovery_usable = false;
+        let start = Instant::now();
+        let deadline = start + WINDOW_CAPTURE_NATIVE_TIMEOUT;
+        let clock = Cell::new(start);
+        let attempts = Cell::new(0);
+        let captured = Cell::new(0);
+        let mut states = vec![unknown, known.clone()].into_iter();
+        let result = capture_window_with_binding_retries(
+            known,
+            deadline,
+            |expected, recovery_deadline| {
+                attempts.set(attempts.get() + 1);
+                if let Some(actual_deadline) = recovery_deadline {
+                    assert_eq!(actual_deadline, deadline);
+                    // Filter/stream preparation can outlast the loop admission.
+                    clock.set(deadline);
+                    check_recovery_capture_deadline(recovery_deadline, clock.get())?;
+                    panic!("expired stream must never start");
+                }
+                let actual = states.next().expect("unexpected capture");
+                captured.set(captured.get() + 1);
+                Ok(WindowCaptureAttempt {
+                    was_cached: false,
+                    result: capture_then_validate_identity(
+                        expected.clone(),
+                        || Ok(vec![1]),
+                        || Ok(actual),
+                    ),
+                })
+            },
+            || panic!("unexpected refresh"),
+            || clock.get(),
+        );
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(captured.get(), 2);
     }
 
     #[test]
