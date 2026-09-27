@@ -1316,6 +1316,23 @@ impl std::fmt::Display for ExactActivationWindowUnavailable {
 
 impl std::error::Error for ExactActivationWindowUnavailable {}
 
+#[derive(Debug)]
+struct ExactActivationNonWindowRole(Option<String>);
+
+impl std::fmt::Display for ExactActivationNonWindowRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("exact activation requires an AXWindow, not a child or delegated surface")
+    }
+}
+
+impl std::error::Error for ExactActivationNonWindowRole {}
+
+fn permits_keyboard_sheet_proof(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ExactActivationWindowUnavailable>().is_some()
+        || error.downcast_ref::<ExactActivationNonWindowRole>()
+            .is_some_and(|role| role.0.as_deref() == Some("AXSheet"))
+}
+
 /// WindowServer activation can precede AppKit's AX publication (for example
 /// for a newly opened native window tab). Request Cocoa activation at most
 /// once, without ActivateAllWindows, then wait only for the exact AX window.
@@ -1510,8 +1527,9 @@ fn complete_exact_ax_window_activation(
         }
     }
     let target = target.ok_or(ExactActivationWindowUnavailable)?;
-    if unsafe { copy_string_attr(target.0, "AXRole") }.as_deref() != Some("AXWindow") {
-        anyhow::bail!("exact activation requires an AXWindow, not a child or delegated surface");
+    let role = unsafe { copy_string_attr(target.0, "AXRole") };
+    if role.as_deref() != Some("AXWindow") {
+        return Err(ExactActivationNonWindowRole(role).into());
     }
     let last_operation = std::cell::Cell::new("none");
     exact_ax_activation_steps(
@@ -1553,6 +1571,67 @@ fn bounded_focused_window_id(pid: i32) -> Option<u32> {
     });
     bound_activation_ax(&window).ok()?;
     unsafe { crate::ax::bindings::ax_get_window_id(window.0) }
+}
+
+// Only the foreground keyboard entry point can supply this proof. The ordinary
+// activation helper above remains unchanged for restoration, pointer actions
+// and the file-dialog contract. Input stays addressed to the sheet's own ID.
+fn complete_keyboard_sheet_activation(
+    pid: i32,
+    window_id: u32,
+    sheet: &crate::ax::attached_sheet::KeyboardSheetActivation,
+    mut check_activity: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<[i32; 3]> {
+    use crate::ax::bindings::{perform_action, set_bool_attr_true};
+    exact_ax_activation_steps(
+        || {
+            check_exact_activation_owner(pid, window_id, &mut check_activity)?;
+            check_exact_activation_owner(pid, sheet.host_id(), &mut check_activity)?;
+            if !sheet.revalidate() {
+                anyhow::bail!("ordinary sheet keyboard attachment changed or its activation budget expired");
+            }
+            check_activity()
+        },
+        |operation| unsafe {
+            match operation {
+                "AXMain" => set_bool_attr_true(sheet.host(), operation),
+                "AXRaise" => perform_action(sheet.sheet(), operation),
+                _ => set_bool_attr_true(sheet.sheet(), operation),
+            }
+        },
+        crate::foreground_activity::mark_native_cleanup_unconfirmed,
+    )
+}
+
+fn complete_keyboard_target_ax_activation(
+    pid: i32,
+    window_id: u32,
+    deadline: std::time::Instant,
+    retained: &mut Option<crate::ax::attached_sheet::KeyboardSheetActivation>,
+    mut check_activity: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<[i32; 3]> {
+    if let Some(sheet) = retained {
+        return complete_keyboard_sheet_activation(pid, window_id, sheet, check_activity);
+    }
+    // Preserve the existing successful AXWindow/Open/Save path and its budget.
+    // Only explicit pre-write discovery/role failures permit the new proof;
+    // never retry a failed or indeterminate activation write through it.
+    let error = match complete_exact_ax_window_activation(pid, window_id, &mut check_activity) {
+        Ok(statuses) => return Ok(statuses),
+        Err(error) => error,
+    };
+    if permits_keyboard_sheet_proof(&error) {
+        check_activity()?;
+        if let Some(sheet) = crate::ax::attached_sheet::copy_keyboard_sheet_activation(
+            pid, window_id, deadline,
+        ) {
+            *retained = Some(sheet);
+            return complete_keyboard_sheet_activation(
+                pid, window_id, retained.as_ref().expect("retained sheet proof"), check_activity,
+            );
+        }
+    }
+    Err(error)
 }
 
 fn exact_window_on_screen(pid: i32, window_id: u32) -> Option<bool> {
@@ -3107,7 +3186,7 @@ pub fn with_foreground_hid_activation(
     target_wid: u32,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    with_foreground_hid_activation_inner(target_pid, target_wid, None, None, action)
+    with_foreground_hid_activation_inner(target_pid, target_wid, None, None, false, |_| action())
 }
 
 pub(crate) fn with_foreground_hid_activation_delegated(
@@ -3116,7 +3195,7 @@ pub(crate) fn with_foreground_hid_activation_delegated(
     delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    with_foreground_hid_activation_inner(target_pid, target_wid, None, delegation, action)
+    with_foreground_hid_activation_inner(target_pid, target_wid, None, delegation, false, |_| action())
 }
 
 fn with_foreground_hid_activation_inner(
@@ -3124,7 +3203,8 @@ fn with_foreground_hid_activation_inner(
     target_wid: u32,
     transient_route: Option<crate::transient_ui::TransientRoute>,
     app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
-    action: impl FnOnce() -> anyhow::Result<()>,
+    keyboard_target: bool,
+    action: impl FnOnce(Option<&crate::ax::attached_sheet::KeyboardSheetActivation>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     // Delegated panels without an exact native foreground identity need an
     // atomic native episode contract. Do not revive the old activation bypass.
@@ -3159,6 +3239,7 @@ fn with_foreground_hid_activation_inner(
             // AppKit panel on screen without delivering its Cocoa activation;
             // checking visibility only after SLS skips that necessary step.
             let publication_started = std::time::Instant::now();
+            let mut keyboard_sheet = None;
             let hidden_panel = crate::windows::window_info_by_id(target_wid)
                 .is_some_and(|window| {
                     window.layer != 0
@@ -3189,7 +3270,16 @@ fn with_foreground_hid_activation_inner(
             })?;
             let ax_statuses = complete_activation_with_bounded_cocoa_request(
                 hidden_panel,
-                || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
+                || {
+                    if keyboard_target {
+                        complete_keyboard_target_ax_activation(
+                            target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
+                            &mut keyboard_sheet, || episode.check(),
+                        )
+                    } else {
+                        complete_exact_ax_window_activation(target_pid, target_wid, || episode.check())
+                    }
+                },
                 || {
                     request_cocoa_activation_without_all_windows(target_pid, target_wid, || {
                         episode.check()
@@ -3203,13 +3293,16 @@ fn with_foreground_hid_activation_inner(
                 episode.check()
             })
             .map_err(|error| anyhow::anyhow!("{error}; ax_activation_statuses={ax_statuses:?}"))?;
+            if keyboard_sheet.as_ref().is_some_and(|sheet| !sheet.revalidate()) {
+                anyhow::bail!("ordinary sheet keyboard attachment changed before input");
+            }
             crate::foreground_activity::check_input()?;
-            let result = action();
+            let result = action(keyboard_sheet.as_ref());
             std::thread::sleep(std::time::Duration::from_millis(40));
             return result;
         }
         crate::foreground_activity::check_input()?;
-        action()
+        action(None)
     })();
     // Keep the PiP temporary-activation hold through restoration even when an
     // activation/action error requires normal safe settlement.
@@ -3390,7 +3483,8 @@ fn with_foreground_keyboard_context_activation_inner(
         target_wid,
         transient_route,
         app_context_delegation,
-        || {
+        true,
+        |sheet| {
             let bounds = crate::windows::window_bounds_by_id(target_wid).ok_or_else(|| {
                 anyhow::anyhow!(
                     "target window {target_wid} closed before foreground keyboard delivery"
@@ -3403,6 +3497,18 @@ fn with_foreground_keyboard_context_activation_inner(
                             "target window {target_wid} has no valid frame for foreground keyboard delivery"
                         )
                     })?;
+            // Pointer priming yields to AppKit for at least 40ms. Revalidate
+            // the same retained sheet at the actual keyboard callback entry,
+            // after that wait, without adding queries to existing routes.
+            let action = keyboard_action_after_priming(
+                sheet.map(|sheet| move || {
+                    if !sheet.revalidate() {
+                        anyhow::bail!("ordinary sheet keyboard attachment changed after pointer priming");
+                    }
+                    crate::foreground_activity::check_input()
+                }),
+                action,
+            );
             if focus_click {
                 crate::input::mouse::with_foreground_keyboard_pointer_context_and_focus_click(
                     anchor, action,
@@ -3412,6 +3518,18 @@ fn with_foreground_keyboard_context_activation_inner(
             }
         },
     )
+}
+
+fn keyboard_action_after_priming(
+    revalidate: Option<impl FnOnce() -> anyhow::Result<()>>,
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> impl FnOnce() -> anyhow::Result<()> {
+    move || {
+        if let Some(revalidate) = revalidate {
+            revalidate()?;
+        }
+        action()
+    }
 }
 
 fn preserves_exact_existing_focus(
@@ -4361,6 +4479,105 @@ mod tests {
         assert_eq!(reads.get(), 3);
         assert_eq!(writes.get(), 1);
         assert_eq!(activations.get(), 1);
+    }
+
+    #[test]
+    fn foreground_keyboard_sheet_proof_is_only_allowed_after_an_explicit_prewrite_absence() {
+        assert!(super::permits_keyboard_sheet_proof(
+            &super::ExactActivationWindowUnavailable.into()));
+        assert!(super::permits_keyboard_sheet_proof(
+            &super::ExactActivationNonWindowRole(Some("AXSheet".into())).into()));
+        for role in [None, Some("AXWindow".into()), Some("AXGroup".into()), Some("AXPopover".into()), Some("AXWebArea".into())] {
+            assert!(!super::permits_keyboard_sheet_proof(
+                &super::ExactActivationNonWindowRole(role).into()));
+        }
+        for failure in [
+            "exact activation AXWindows failed: -25204",
+            "exact activation AXRaise failed with AXError -25204; an activation effect is possible",
+            "dialog attachment changed during activation",
+            "foreground target ownership is unavailable",
+            "native activity changed",
+        ] {
+            assert!(!super::permits_keyboard_sheet_proof(&anyhow::anyhow!(failure)),
+                "a failed or indeterminate operation must never enter a second activation route");
+        }
+    }
+
+    #[test]
+    fn foreground_keyboard_priming_child_race_is_checked_at_callback_entry() {
+        let focused_id = Cell::new(900);
+        let child_sheets = Cell::new(0);
+        let proof_checks = Cell::new(0);
+        let posted_keys = Cell::new(0);
+        let callback = super::keyboard_action_after_priming(
+            Some(|| {
+                proof_checks.set(proof_checks.get() + 1);
+                assert_eq!(focused_id.get(), 900, "AX focus can lag behind a child sheet");
+                anyhow::ensure!(child_sheets.get() == 0, "retained leaf is no longer selected");
+                Ok(())
+            }),
+            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+        );
+        assert_eq!(proof_checks.get(), 0, "constructing the callback is not revalidation");
+        // Inject the structural change during the pointer helper's priming
+        // wait. It must be observed after that wait even with unchanged focus.
+        child_sheets.set(1);
+        assert!(callback().is_err());
+        assert_eq!(proof_checks.get(), 1);
+        assert_eq!(posted_keys.get(), 0);
+    }
+
+    #[test]
+    fn foreground_keyboard_priming_cannot_renew_an_expired_sheet_deadline() {
+        let now_ms = Cell::new(390);
+        let original_deadline_ms = 400;
+        let posted_keys = Cell::new(0);
+        let callback = super::keyboard_action_after_priming(
+            Some(|| {
+                anyhow::ensure!(now_ms.get() < original_deadline_ms, "retained proof expired");
+                Ok(())
+            }),
+            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+        );
+        now_ms.set(now_ms.get() + 40);
+        assert!(callback().is_err());
+        assert_eq!(posted_keys.get(), 0);
+    }
+
+    #[test]
+    fn foreground_keyboard_priming_activity_loss_stops_the_keyboard_callback() {
+        let activity_current = Cell::new(true);
+        let posted_keys = Cell::new(0);
+        let callback = super::keyboard_action_after_priming(
+            Some(|| {
+                // The retained attachment can still be valid while external
+                // activity revokes the episode. Both checks must precede HID.
+                anyhow::ensure!(activity_current.get(), "activity lease revoked");
+                Ok(())
+            }),
+            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+        );
+        activity_current.set(false);
+        assert!(callback().is_err());
+        assert_eq!(posted_keys.get(), 0);
+    }
+
+    #[test]
+    fn foreground_keyboard_priming_preserves_valid_and_existing_routes() {
+        let proof_checks = Cell::new(0);
+        let posted_keys = Cell::new(0);
+        let callback = super::keyboard_action_after_priming(
+            Some(|| { proof_checks.set(proof_checks.get() + 1); Ok(()) }),
+            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+        );
+        assert_eq!(proof_checks.get(), 0);
+        callback().unwrap();
+        super::keyboard_action_after_priming(
+            None::<fn() -> anyhow::Result<()>>,
+            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+        )().unwrap();
+        assert_eq!(proof_checks.get(), 1, "existing routes add no attachment query");
+        assert_eq!(posted_keys.get(), 2);
     }
 
     #[test]

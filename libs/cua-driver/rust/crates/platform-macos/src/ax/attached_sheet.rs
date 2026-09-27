@@ -201,6 +201,131 @@ fn dialog_host<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::No
     dialog_chain(tree, pid, requested)?.nodes.last().cloned()
 }
 
+// Ordinary sheets need no file-dialog semantics, but they still need the same
+// positive native attachment proof. Keep this separate from dialog_chain: a
+// standard panel, or an unreadable panel identifier, must not gain a second
+// admission path after the existing file-dialog proof refuses it.
+fn keyboard_activation_chain<T: SheetTree>(
+    tree: &T,
+    pid: i32,
+    requested: u32,
+) -> Option<Attachment<T::Node>> {
+    fn ordinary_leaf<T: SheetTree>(tree: &T, chain: &Attachment<T::Node>) -> Option<()> {
+        if chain.nodes.len() < 2
+            || tree.role(chain.nodes.last()?).as_deref() != Some("AXWindow")
+        {
+            return None;
+        }
+        for sheet in chain.nodes.iter().take(chain.nodes.len().checked_sub(1)?) {
+            if !tree.within_budget()
+                || tree.role(sheet).as_deref() != Some("AXSheet")
+                || matches!(tree.identifier(sheet)?.as_str(), "save-panel" | "open-panel")
+            {
+                return None;
+            }
+        }
+        // AXFocusedWindow can lag behind a newly attached child. The old
+        // discovery API intentionally accepts a focused sheet directly; that
+        // alone is insufficient authority for a new global keyboard route.
+        (tree.within_budget() && tree.child_sheets(chain.nodes.first()?)?.is_empty())
+            .then_some(())
+    }
+
+    if !tree.within_budget() {
+        return None;
+    }
+    let chain = prove_chain(tree, pid, requested)?;
+    ordinary_leaf(tree, &chain)?;
+    if !visible_chain(tree, pid, &chain) {
+        return None;
+    }
+    let current = prove_chain(tree, pid, requested)?;
+    ordinary_leaf(tree, &current)?;
+    (same_attachment(tree, &chain, &current)
+        && visible_chain(tree, pid, &current)
+        && tree.within_budget())
+        .then_some(chain)
+}
+
+fn same_attachment<T: SheetTree>(
+    tree: &T,
+    expected: &Attachment<T::Node>,
+    current: &Attachment<T::Node>,
+) -> bool {
+    expected.window_ids == current.window_ids
+        && expected.nodes.len() == current.nodes.len()
+        && expected.nodes.iter().zip(&current.nodes).all(|(a, b)| tree.same(a, b))
+}
+
+fn keyboard_activation_matches<T: SheetTree>(
+    tree: &T,
+    pid: i32,
+    requested: u32,
+    expected: &Attachment<T::Node>,
+) -> bool {
+    keyboard_activation_chain(tree, pid, requested)
+        .is_some_and(|current| same_attachment(tree, expected, &current) && tree.within_budget())
+}
+
+/// Retained native evidence for one ordinary sheet's keyboard activation.
+/// This grants neither file-dialog/segment authority nor input to its host.
+pub(crate) struct KeyboardSheetActivation {
+    pid: i32,
+    window_id: u32,
+    chain: Attachment<Node>,
+    deadline: Instant,
+}
+
+impl KeyboardSheetActivation {
+    pub(crate) fn sheet(&self) -> AXUIElementRef {
+        self.chain.nodes[0].0
+    }
+
+    pub(crate) fn host(&self) -> AXUIElementRef {
+        self.chain.nodes.last().expect("proven attachment host").0
+    }
+
+    pub(crate) fn host_id(&self) -> u32 {
+        *self.chain.window_ids.last().expect("proven attachment host ID")
+    }
+
+    /// Re-read every reciprocal edge and compare retained native identities.
+    /// All checks share the caller's activation deadline; it is never renewed.
+    pub(crate) fn revalidate(&self) -> bool {
+        if Instant::now() >= self.deadline {
+            return false;
+        }
+        let Some(app) = (unsafe { Node::owned(AXUIElementCreateApplication(self.pid)) }) else {
+            return false;
+        };
+        keyboard_activation_matches(
+            &NativeTree { app, deadline: self.deadline },
+            self.pid,
+            self.window_id,
+            &self.chain,
+        )
+    }
+}
+
+/// Read-only, keyboard-only proof using the existing bounded attachment walk.
+/// AX messages retain their 0.2-second timeout; the supplied absolute deadline
+/// is cooperative; bounded native reads between budget checks can overrun it.
+pub(crate) fn copy_keyboard_sheet_activation(
+    pid: i32,
+    window_id: u32,
+    deadline: Instant,
+) -> Option<KeyboardSheetActivation> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let tree = NativeTree {
+        app: unsafe { Node::owned(AXUIElementCreateApplication(pid))? },
+        deadline,
+    };
+    let chain = keyboard_activation_chain(&tree, pid, window_id)?;
+    Some(KeyboardSheetActivation { pid, window_id, chain, deadline })
+}
+
 fn prove_with_visibility<T: SheetTree>(
     tree: &T,
     pid: i32,
@@ -803,6 +928,22 @@ mod tests {
     fn discovers_focused_sheet_missing_from_top_level_windows() {
         let sheet = prove(&pages(), 42, 900).unwrap();
         assert_eq!(sheet.window, 900);
+    }
+
+    #[test]
+    fn ordinary_keyboard_proof_rejects_replaced_ax_identity_even_with_same_native_id() {
+        for replace_host in [false, true] {
+            let mut tree = pages_with_identifier("ordinary-settings");
+            tree.budget.set(1000);
+            let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
+            if replace_host {
+                tree.host.identity += 10;
+            } else {
+                tree.sheet.identity += 10;
+            }
+            assert!(!keyboard_activation_matches(&tree, 42, 900, &proof),
+                "a reused native ID cannot replace the retained AX object");
+        }
     }
 
     #[test]

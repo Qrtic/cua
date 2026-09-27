@@ -23,6 +23,9 @@ struct Tree {
     children_complete: bool,
     host_child_reads: Cell<usize>,
     new_sibling_after_selection: bool,
+    unreadable_identifier: Option<u32>,
+    leaf_child_reads: Cell<usize>,
+    new_child_after_leaf_check: bool,
 }
 
 impl SheetTree for Tree {
@@ -39,6 +42,7 @@ impl SheetTree for Tree {
         Some(self.nodes.get(n)?.role.into())
     }
     fn identifier(&self, n: &u32) -> Option<String> {
+        if self.unreadable_identifier == Some(*n) { return None; }
         Some(self.nodes.get(n)?.id.into())
     }
     fn owner(&self, n: &u32) -> Option<i32> {
@@ -56,6 +60,11 @@ impl SheetTree for Tree {
     }
     fn child_sheets(&self, n: &u32) -> Option<Vec<u32>> {
         if !self.children_complete { return None; }
+        if *n == 900 {
+            let reads = self.leaf_child_reads.get();
+            self.leaf_child_reads.set(reads + 1);
+            if self.new_child_after_leaf_check && reads > 0 { return Some(vec![950]); }
+        }
         if *n == 700 {
             let reads = self.host_child_reads.get();
             self.host_child_reads.set(reads + 1);
@@ -125,6 +134,9 @@ fn xcode() -> Tree {
         children_complete: true,
         host_child_reads: Cell::new(0),
         new_sibling_after_selection: false,
+        unreadable_identifier: None,
+        leaf_child_reads: Cell::new(0),
+        new_child_after_leaf_check: false,
     }
 }
 
@@ -136,6 +148,113 @@ fn chess_with_host_focus() -> Tree {
     tree.nodes.get_mut(&700).unwrap().id = "_NS:582";
     tree.focused = 700;
     tree
+}
+
+#[test]
+fn ordinary_sheet_keyboard_activation_requires_its_own_proven_visible_leaf() {
+    for focus in [700, 900] {
+        let mut tree = chess_with_host_focus();
+        tree.focused = focus;
+        let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
+        assert_eq!(proof.window_ids, [900, 700]);
+        assert!(keyboard_activation_matches(&tree, 42, 900, &proof));
+        assert!(keyboard_activation_chain(&tree, 42, 700).is_none());
+        assert!(keyboard_activation_chain(&tree, 42, 901).is_none());
+        assert!(dialog_host(&tree, 42, 900).is_none(),
+            "keyboard activation must not grant file-dialog segment authority");
+    }
+    let mut tree = xcode();
+    tree.nodes.get_mut(&900).unwrap().id = "ordinary-settings";
+    tree.nodes.get_mut(&950).unwrap().id = "ordinary-confirmation";
+    assert_eq!(keyboard_activation_chain(&tree, 42, 950).unwrap().window_ids, [950, 900, 700]);
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
+    assert!(dialog_host(&tree, 42, 950).is_none());
+}
+
+#[test]
+fn ordinary_sheet_keyboard_activation_does_not_reclassify_file_panels() {
+    for identifier in ["save-panel", "open-panel"] {
+        let mut tree = xcode();
+        tree.nodes.get_mut(&900).unwrap().id = identifier;
+        assert!(keyboard_activation_chain(&tree, 42, 950).is_none());
+        assert_eq!(dialog_host(&tree, 42, 950), Some(700));
+        tree.unreadable_identifier = Some(900);
+        assert!(dialog_host(&tree, 42, 950).is_none());
+        assert!(keyboard_activation_chain(&tree, 42, 950).is_none(),
+            "an unreadable file panel cannot cross into ordinary-sheet admission");
+    }
+    let mut tree = chess_with_host_focus();
+    tree.unreadable_identifier = Some(900);
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
+    // A readable empty identifier is different from an AX read failure.
+    tree.unreadable_identifier = None;
+    tree.nodes.get_mut(&900).unwrap().id = "";
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_some());
+}
+
+#[test]
+fn focused_sheet_keyboard_activation_refuses_new_children_before_focus_updates() {
+    let mut tree = xcode();
+    tree.nodes.get_mut(&900).unwrap().id = "ordinary-settings";
+    tree.focused = 900;
+    assert!(prove(&tree, 42, 900).is_some(), "legacy discovery is unchanged");
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
+
+    let mut tree = chess_with_host_focus();
+    tree.focused = 900;
+    tree.new_child_after_leaf_check = true;
+    assert!(keyboard_activation_chain(&tree, 42, 900).is_none(),
+        "a child appearing during proof cannot inherit the stale focused-sheet authority");
+}
+
+#[test]
+fn ordinary_sheet_keyboard_activation_refuses_foreign_stale_or_unreadable_chains() {
+    for alter in [
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().owner = 99,
+        |t: &mut Tree| t.nodes.get_mut(&700).unwrap().owner = 99,
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().role = "AXGroup",
+        |t: &mut Tree| t.nodes.get_mut(&700).unwrap().role = "AXGroup",
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().parent = Some(900),
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().window = Some(701),
+        |t: &mut Tree| t.nodes.get_mut(&700).unwrap().children.clear(),
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().visible = false,
+        |t: &mut Tree| t.nodes.get_mut(&700).unwrap().visible = false,
+        |t: &mut Tree| t.nodes.get_mut(&700).unwrap().minimized = Ok(true),
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().minimized = Err(crate::ax::bindings::kAXErrorCannotComplete),
+        |t: &mut Tree| t.windows = vec![700, 700],
+        |t: &mut Tree| t.windows = vec![],
+        |t: &mut Tree| t.children_complete = false,
+        |t: &mut Tree| t.change_focus = true,
+        |t: &mut Tree| t.new_sibling_after_selection = true,
+        |t: &mut Tree| t.budget.set(0),
+    ] {
+        let mut tree = chess_with_host_focus();
+        alter(&mut tree);
+        assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
+    }
+}
+
+#[test]
+fn ordinary_sheet_keyboard_activation_revalidates_before_each_use_without_renewing_budget() {
+    for alter in [
+        |t: &mut Tree| t.nodes.get_mut(&700).unwrap().children.clear(),
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().visible = false,
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().owner = 99,
+        |t: &mut Tree| t.unreadable_identifier = Some(900),
+        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().id = "save-panel",
+        |t: &mut Tree| t.budget.set(0),
+    ] {
+        let mut tree = chess_with_host_focus();
+        let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
+        alter(&mut tree);
+        assert!(!keyboard_activation_matches(&tree, 42, 900, &proof));
+    }
+    let tree = chess_with_host_focus();
+    let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
+    let spent = 1000 - tree.budget.get();
+    tree.budget.set(spent - 1);
+    assert!(!keyboard_activation_matches(&tree, 42, 900, &proof),
+        "the recheck consumes the same finite budget instead of resetting it");
 }
 
 #[test]
