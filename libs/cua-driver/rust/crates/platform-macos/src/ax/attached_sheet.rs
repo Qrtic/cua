@@ -205,42 +205,42 @@ fn dialog_host<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::No
 // positive native attachment proof. Keep this separate from dialog_chain: a
 // standard panel, or an unreadable panel identifier, must not gain a second
 // admission path after the existing file-dialog proof refuses it.
+fn ordinary_keyboard_leaf<T: SheetTree>(tree: &T, chain: &Attachment<T::Node>) -> Option<()> {
+    if chain.nodes.len() < 2
+        || tree.role(chain.nodes.last()?).as_deref() != Some("AXWindow")
+    {
+        return None;
+    }
+    for sheet in chain.nodes.iter().take(chain.nodes.len().checked_sub(1)?) {
+        if !tree.within_budget()
+            || tree.role(sheet).as_deref() != Some("AXSheet")
+            || matches!(tree.identifier(sheet)?.as_str(), "save-panel" | "open-panel")
+        {
+            return None;
+        }
+    }
+    // AXFocusedWindow can lag behind a newly attached child. The old
+    // discovery API intentionally accepts a focused sheet directly; that
+    // alone is insufficient authority for a new global keyboard route.
+    (tree.within_budget() && tree.child_sheets(chain.nodes.first()?)?.is_empty())
+        .then_some(())
+}
+
 fn keyboard_activation_chain<T: SheetTree>(
     tree: &T,
     pid: i32,
     requested: u32,
 ) -> Option<Attachment<T::Node>> {
-    fn ordinary_leaf<T: SheetTree>(tree: &T, chain: &Attachment<T::Node>) -> Option<()> {
-        if chain.nodes.len() < 2
-            || tree.role(chain.nodes.last()?).as_deref() != Some("AXWindow")
-        {
-            return None;
-        }
-        for sheet in chain.nodes.iter().take(chain.nodes.len().checked_sub(1)?) {
-            if !tree.within_budget()
-                || tree.role(sheet).as_deref() != Some("AXSheet")
-                || matches!(tree.identifier(sheet)?.as_str(), "save-panel" | "open-panel")
-            {
-                return None;
-            }
-        }
-        // AXFocusedWindow can lag behind a newly attached child. The old
-        // discovery API intentionally accepts a focused sheet directly; that
-        // alone is insufficient authority for a new global keyboard route.
-        (tree.within_budget() && tree.child_sheets(chain.nodes.first()?)?.is_empty())
-            .then_some(())
-    }
-
     if !tree.within_budget() {
         return None;
     }
     let chain = prove_chain(tree, pid, requested)?;
-    ordinary_leaf(tree, &chain)?;
+    ordinary_keyboard_leaf(tree, &chain)?;
     if !visible_chain(tree, pid, &chain) {
         return None;
     }
     let current = prove_chain(tree, pid, requested)?;
-    ordinary_leaf(tree, &current)?;
+    ordinary_keyboard_leaf(tree, &current)?;
     (same_attachment(tree, &chain, &current)
         && visible_chain(tree, pid, &current)
         && tree.within_budget())
@@ -263,8 +263,23 @@ fn keyboard_activation_matches<T: SheetTree>(
     requested: u32,
     expected: &Attachment<T::Node>,
 ) -> bool {
-    keyboard_activation_chain(tree, pid, requested)
-        .is_some_and(|current| same_attachment(tree, expected, &current) && tree.within_budget())
+    // The retained objects already supply the old identity snapshot. Re-read
+    // their ordinary-leaf and visibility predicates, then prove one complete
+    // current chain, including its reciprocal-edge and selection rechecks.
+    // Never refresh expected from discovery or reuse a prior successful read.
+    if !tree.within_budget()
+        || ordinary_keyboard_leaf(tree, expected).is_none()
+        || !visible_chain(tree, pid, expected)
+    {
+        return false;
+    }
+    let Some(current) = prove_chain(tree, pid, requested) else {
+        return false;
+    };
+    ordinary_keyboard_leaf(tree, &current).is_some()
+        && same_attachment(tree, expected, &current)
+        && visible_chain(tree, pid, &current)
+        && tree.within_budget()
 }
 
 fn keyboard_revalidation_diagnostic_status(
