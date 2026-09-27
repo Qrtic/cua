@@ -6,6 +6,8 @@ use cua_driver_core::{
 use serde_json::Value;
 use std::path::PathBuf;
 
+mod reuse;
+
 pub struct LaunchAppTool;
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -198,6 +200,40 @@ impl Tool for LaunchAppTool {
                     .collect()
             })
             .unwrap_or_default();
+        // A bare request can reuse a positively observed, unhidden ordinary
+        // window without sending the application's reopen AppleEvent. Do not
+        // infer this from the running PID alone, or short-circuit file opens.
+        if reuse::bare_request(&urls, &additional_arguments, &env, creates_new_instance) {
+            if let (Some(pid), Some(bid)) = (
+                existing_reopen_pid(&previously_running_pids, creates_new_instance),
+                response_bundle_id.clone(),
+            ) {
+                let reused = crate::foreground_activity::spawn_blocking(move || {
+                    crate::foreground_activity::check_request()?;
+                    let proof = reuse::observe(pid, &bid);
+                    crate::foreground_activity::check_request()?;
+                    Ok::<_, anyhow::Error>(proof)
+                }).await;
+                match reused {
+                    Ok(Ok(Some((app, windows)))) => {
+                        let windows: Vec<Value> = windows.iter()
+                            .map(super::list_windows::window_record_json).collect();
+                        return ToolResult::text(format!(
+                            "Reused existing {} (pid {}) without a launch request. Call get_window_state to inspect.",
+                            app.name, app.pid,
+                        )).with_structured(serde_json::json!({
+                            "pid": app.pid, "bundle_id": app.bundle, "name": app.name,
+                            "windows": windows,
+                            "launch_state": launch_state(false, true, true),
+                            "visibility_request": {"requested": false, "was_hidden": false},
+                        }));
+                    }
+                    Ok(Ok(None)) => {} // Unproven: retain the original launch path.
+                    Ok(Err(error)) => return structured_launch_failure(&error),
+                    Err(error) => return ToolResult::error(format!("Task error: {error}")),
+                }
+            }
+        }
         let prior_frontmost = crate::apps::frontmost_pid();
         // Every handoff, including a Finder folder, uses the normal
         // activates=false NSWorkspace configuration and the same lease.
