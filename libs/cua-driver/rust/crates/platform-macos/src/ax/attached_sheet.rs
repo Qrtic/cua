@@ -618,31 +618,41 @@ pub(crate) struct DialogAttachment {
     pub path: Vec<u32>,
 }
 
+// Both native wrappers use this exact final proof, including the identifier
+// reread after dialog_chain's two structural reads. A still-attached surface
+// whose standard-panel identifier disappears must not select the reduced
+// foreground preparation path.
+fn dialog_attachment<T: SheetTree>(
+    tree: &T, pid: i32, window_id: u32,
+) -> Option<DialogAttachment> {
+    let chain = dialog_chain(tree, pid, window_id)?;
+    let panel = chain
+        .nodes
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, node)| {
+            matches!(
+                tree.identifier(node).as_deref(),
+                Some("save-panel" | "open-panel")
+            )
+        })?
+        .0;
+    tree.within_budget().then(|| DialogAttachment {
+        window_id,
+        panel_id: chain.window_ids[panel],
+        host_id: *chain.window_ids.last().unwrap(),
+        path: chain.window_ids,
+    })
+}
+
 pub(crate) fn focused_dialog_attachment(pid: i32, window_id: u32) -> Option<DialogAttachment> {
     unsafe {
         let tree = NativeTree {
             app: Node::owned(AXUIElementCreateApplication(pid))?,
             deadline: Instant::now() + Duration::from_secs(2),
         };
-        let chain = dialog_chain(&tree, pid, window_id)?;
-        let panel = chain
-            .nodes
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, node)| {
-                matches!(
-                    tree.identifier(node).as_deref(),
-                    Some("save-panel" | "open-panel")
-                )
-            })?
-            .0;
-        tree.within_budget().then(|| DialogAttachment {
-            window_id,
-            panel_id: chain.window_ids[panel],
-            host_id: *chain.window_ids.last().unwrap(),
-            path: chain.window_ids,
-        })
+        dialog_attachment(&tree, pid, window_id)
     }
 }
 
@@ -660,6 +670,18 @@ pub(crate) fn copy_focused_dialog_host(pid: i32, window_id: u32) -> Option<AXUIE
 
 pub(crate) fn focused_dialog_host(pid: i32, window_id: u32) -> Option<u32> {
     focused_dialog_attachment(pid, window_id).map(|chain| chain.host_id)
+}
+
+/// The same standard Open/Save attachment proof under the caller's existing
+/// deadline. This grants no new sheet/window match or activation authority.
+pub(crate) fn focused_dialog_host_before(
+    pid: i32, window_id: u32, deadline: Instant,
+) -> Option<u32> {
+    if Instant::now() >= deadline { return None; }
+    unsafe {
+        let tree = NativeTree { app: Node::owned(AXUIElementCreateApplication(pid))?, deadline };
+        dialog_attachment(&tree, pid, window_id).map(|chain| chain.host_id)
+    }
 }
 
 /// Closing a sheet may return focus to its previously proven host. Check one

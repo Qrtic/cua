@@ -3198,6 +3198,40 @@ pub(crate) fn with_foreground_hid_activation_delegated(
     with_foreground_hid_activation_inner(target_pid, target_wid, None, delegation, false, |_| action())
 }
 
+/// Preserve the original guarded write order. A positively proven standard
+/// attached dialog omits only kCPSUserGenerated; exact key-window records and
+/// the later AX/readiness checks remain mandatory. An error never retries the
+/// other preparation path.
+fn foreground_activation_preparation_steps(
+    standard_dialog_proven: bool,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut set_front: impl FnMut(u32) -> i32,
+    mut post_key_records: impl FnMut(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    check()?;
+    if set_front(0x400) != 0 {
+        anyhow::bail!("WindowServer rejected foreground HID activation");
+    }
+    check()?;
+    if !standard_dialog_proven && set_front(0x200) != 0 {
+        anyhow::bail!("WindowServer rejected exact foreground key-window activation");
+    }
+    post_key_records(&mut check)
+}
+
+fn complete_proven_standard_dialog_activation(
+    expected_host: u32,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut current_host: impl FnMut() -> Option<u32>,
+    complete: impl FnOnce() -> anyhow::Result<[i32; 3]>,
+) -> anyhow::Result<[i32; 3]> {
+    check()?;
+    anyhow::ensure!(current_host() == Some(expected_host),
+        "standard dialog attachment changed or its activation budget expired");
+    check()?;
+    complete()
+}
+
 fn with_foreground_hid_activation_inner(
     target_pid: libc::pid_t,
     target_wid: u32,
@@ -3255,20 +3289,37 @@ fn with_foreground_hid_activation_inner(
                     episode.check()
                 })?;
             }
-            check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
-            if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) } != 0 {
-                anyhow::bail!("WindowServer rejected foreground HID activation");
-            }
-            check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
-            // Do not call the unguarded multi-write activation helper: native
-            // intervention between any two SPI writes must stop the sequence.
-            if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x200) } != 0 {
-                anyhow::bail!("WindowServer rejected exact foreground key-window activation");
-            }
-            post_exact_key_window_records_guarded(target_psn, target_wid, || {
-                check_exact_activation_owner(target_pid, target_wid, || episode.check())
-            })?;
-            let ax_statuses = complete_activation_with_bounded_cocoa_request(
+            // Only the already-supported standard dialog proof is available
+            // before activation. Ordinary keyboard-sheet proof stays in its
+            // original later AX phase. Never start a fresh discovery budget.
+            let standard_dialog_host = if keyboard_target && !hidden_panel {
+                check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
+                let host = crate::ax::attached_sheet::focused_dialog_host_before(
+                    target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
+                );
+                check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
+                anyhow::ensure!(publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
+                    "standard dialog discovery exceeded the foreground activation budget");
+                host
+            } else { None };
+            foreground_activation_preparation_steps(
+                standard_dialog_host.is_some(),
+                || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
+                |flags| unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, flags) },
+                |check| post_exact_key_window_records_guarded(target_psn, target_wid, check),
+            )?;
+            let ax_statuses = if let Some(host_id) = standard_dialog_host {
+                // A selected proof that fails is terminal. Do not attempt the
+                // old 0x200 path, ordinary-sheet admission or Cocoa recovery.
+                complete_proven_standard_dialog_activation(
+                    host_id,
+                    || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
+                    || crate::ax::attached_sheet::focused_dialog_host_before(
+                        target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
+                    ),
+                    || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
+                )?
+            } else { complete_activation_with_bounded_cocoa_request(
                 hidden_panel,
                 || {
                     if keyboard_target {
@@ -3288,7 +3339,7 @@ fn with_foreground_hid_activation_inner(
                 || episode.check(),
                 || publication_started.elapsed(),
                 || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
-            )?;
+            )? };
             await_exact_window_ready_guarded(target_pid, target_wid, target_psn, || {
                 episode.check()
             })
@@ -4711,6 +4762,131 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(activations.get(), 1);
         assert!(!hid.get());
+    }
+
+    #[test]
+    fn foreground_standard_dialog_preparation_omits_only_user_generated_write() {
+        for proven in [false, true] {
+            let events = std::cell::RefCell::new(Vec::new());
+            super::foreground_activation_preparation_steps(
+                proven,
+                || { events.borrow_mut().push(("check", 0)); Ok(()) },
+                |flags| { events.borrow_mut().push(("front", flags)); 0 },
+                |check| {
+                    for kind in [1, 2] {
+                        check()?;
+                        events.borrow_mut().push(("key_record", kind));
+                    }
+                    Ok(())
+                },
+            ).unwrap();
+            let mut expected = vec![("check", 0), ("front", 0x400), ("check", 0)];
+            if !proven { expected.push(("front", 0x200)); }
+            expected.extend([("check", 0), ("key_record", 1), ("check", 0), ("key_record", 2)]);
+            assert_eq!(*events.borrow(), expected);
+        }
+    }
+
+    #[test]
+    fn foreground_standard_dialog_preparation_guard_loss_stops_every_remaining_write() {
+        for proven in [false, true] {
+            for lose_at in 0..4 {
+                let checks = Cell::new(0);
+                let writes = std::cell::RefCell::new(Vec::new());
+                let hid = Cell::new(false);
+                let result = super::foreground_activation_preparation_steps(
+                    proven,
+                    || {
+                        let index = checks.get(); checks.set(index + 1);
+                        anyhow::ensure!(index != lose_at, "activity or exact owner changed");
+                        Ok(())
+                    },
+                    |flags| { writes.borrow_mut().push(("front", flags)); 0 },
+                    |check| {
+                        for kind in [1, 2] {
+                            check()?;
+                            writes.borrow_mut().push(("key_record", kind));
+                        }
+                        Ok(())
+                    },
+                ).map(|_| hid.set(true));
+                assert!(result.is_err());
+                assert!(!hid.get());
+                let mut expected = Vec::new();
+                if lose_at > 0 { expected.push(("front", 0x400)); }
+                if lose_at > 1 && !proven { expected.push(("front", 0x200)); }
+                if lose_at > 2 { expected.push(("key_record", 1)); }
+                assert_eq!(*writes.borrow(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_standard_dialog_preparation_native_error_never_replays_another_path() {
+        for (proven, fail_at) in [(true, 0x400), (false, 0x400), (false, 0x200)] {
+            let writes = std::cell::RefCell::new(Vec::new());
+            let records = Cell::new(0);
+            let result = super::foreground_activation_preparation_steps(
+                proven, || Ok(()),
+                |flags| {
+                    writes.borrow_mut().push(flags);
+                    if flags == fail_at { -1 } else { 0 }
+                },
+                |_| { records.set(records.get() + 1); Ok(()) },
+            );
+            assert!(result.is_err());
+            assert_eq!(records.get(), 0);
+            assert_eq!(*writes.borrow(), if fail_at == 0x400 { vec![0x400] } else { vec![0x400, 0x200] });
+        }
+        let writes = std::cell::RefCell::new(Vec::new());
+        let result = super::foreground_activation_preparation_steps(
+            true, || Ok(()), |flags| { writes.borrow_mut().push(flags); 0 },
+            |check| { check()?; anyhow::bail!("key-window record failed with OSStatus -1") },
+        );
+        assert_eq!(*writes.borrow(), [0x400]);
+        assert!(result.unwrap_err().to_string().contains("key-window record failed"));
+    }
+
+    #[test]
+    fn foreground_standard_dialog_completion_refuses_changed_or_expired_proof() {
+        for current in [None, Some(701)] {
+            let completions = Cell::new(0);
+            let result = super::complete_proven_standard_dialog_activation(
+                700, || Ok(()), || current,
+                || { completions.set(completions.get() + 1); Ok([0; 3]) },
+            );
+            assert!(result.is_err());
+            assert_eq!(completions.get(), 0);
+        }
+        for lose_at in [0, 1] {
+            let checks = Cell::new(0);
+            let completions = Cell::new(0);
+            let result = super::complete_proven_standard_dialog_activation(
+                700,
+                || {
+                    let n = checks.get(); checks.set(n + 1);
+                    anyhow::ensure!(n != lose_at, "activity changed"); Ok(())
+                },
+                || Some(700), || { completions.set(1); Ok([0; 3]) },
+            );
+            assert!(result.is_err());
+            assert_eq!(completions.get(), 0);
+        }
+    }
+
+    #[test]
+    fn foreground_standard_dialog_completion_preserves_ax_result_without_retry() {
+        let statuses = [0, crate::ax::bindings::kAXErrorAttributeUnsupported, 0];
+        assert_eq!(super::complete_proven_standard_dialog_activation(
+            700, || Ok(()), || Some(700), || Ok(statuses),
+        ).unwrap(), statuses);
+        let attempts = Cell::new(0);
+        let error = super::complete_proven_standard_dialog_activation(
+            700, || Ok(()), || Some(700),
+            || { attempts.set(attempts.get() + 1); Err(super::ExactActivationWindowUnavailable.into()) },
+        ).unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert!(error.downcast_ref::<super::ExactActivationWindowUnavailable>().is_some());
     }
 
     #[test]

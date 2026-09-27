@@ -31,6 +31,7 @@ struct Tree {
     relation_fault: Option<RelationFault>,
     identifier_reads: Cell<usize>,
     identifier_after_first: Option<&'static str>,
+    identifier_unreadable_after_first: bool,
     expire_on_parent_read: bool,
 }
 
@@ -61,6 +62,7 @@ impl SheetTree for Tree {
             let reads = self.identifier_reads.get();
             self.identifier_reads.set(reads + 1);
             if reads > 0 {
+                if self.identifier_unreadable_after_first { return None; }
                 if let Some(identifier) = self.identifier_after_first {
                     return Some(identifier.into());
                 }
@@ -178,6 +180,7 @@ fn xcode() -> Tree {
         relation_fault: None,
         identifier_reads: Cell::new(0),
         identifier_after_first: None,
+        identifier_unreadable_after_first: false,
         expire_on_parent_read: false,
     }
 }
@@ -190,6 +193,42 @@ fn chess_with_host_focus() -> Tree {
     tree.nodes.get_mut(&700).unwrap().id = "_NS:582";
     tree.focused = 700;
     tree
+}
+
+#[test]
+fn standard_dialog_attachment_retains_exact_panel_and_host() {
+    for identifier in ["save-panel", "open-panel"] {
+        let mut tree = xcode();
+        tree.nodes.get_mut(&900).unwrap().id = identifier;
+        assert_eq!(dialog_attachment(&tree, 42, 950), Some(DialogAttachment {
+            window_id: 950, panel_id: 900, host_id: 700, path: vec![950, 900, 700],
+        }));
+        assert_eq!(tree.identifier_reads.get(), 2,
+            "the final standard-panel identifier must be read after the double chain proof");
+    }
+}
+
+#[test]
+fn standard_dialog_attachment_refuses_identifier_changed_after_chain_proof() {
+    let mut weaker = xcode();
+    weaker.identifier_after_first = Some("ordinary-confirmation");
+    assert_eq!(dialog_host(&weaker, 42, 950), Some(700),
+        "a structural host proof alone does not include the required final identifier read");
+    let mut tree = xcode();
+    tree.identifier_after_first = Some("ordinary-confirmation");
+    assert!(dialog_attachment(&tree, 42, 950).is_none());
+    assert_eq!(tree.identifier_reads.get(), 2);
+}
+
+#[test]
+fn standard_dialog_attachment_refuses_identifier_failure_after_chain_proof() {
+    let mut weaker = xcode();
+    weaker.identifier_unreadable_after_first = true;
+    assert_eq!(dialog_host(&weaker, 42, 950), Some(700));
+    let mut tree = xcode();
+    tree.identifier_unreadable_after_first = true;
+    assert!(dialog_attachment(&tree, 42, 950).is_none());
+    assert_eq!(tree.identifier_reads.get(), 2);
 }
 
 #[test]
