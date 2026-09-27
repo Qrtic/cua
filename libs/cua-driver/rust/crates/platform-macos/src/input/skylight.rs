@@ -3004,6 +3004,156 @@ fn exact_window_is_ready(
         && on_screen == Some(true)
 }
 
+/// A read-only fast-path probe, not another activation wait. It uses the same
+/// readiness predicate and consecutive-sample count as the final HID gate,
+/// but a first mismatch/unknown keeps the original activation path. Activity
+/// or the caller's original publication deadline expiring is always terminal.
+fn probe_already_ready_with(
+    window_id: u32,
+    target_psn: [u8; 8],
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut sample: impl FnMut() -> (Option<[u8; 8]>, Option<u32>, Option<bool>),
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(),
+) -> anyhow::Result<bool> {
+    for index in 0..REQUIRED_READY_SAMPLES {
+        check()?;
+        anyhow::ensure!(
+            elapsed() < ACTIVATION_WAIT_TIMEOUT,
+            "ordinary readiness probe exceeded the foreground activation budget"
+        );
+        let (front, focused, visible) = sample();
+        check()?;
+        anyhow::ensure!(
+            elapsed() < ACTIVATION_WAIT_TIMEOUT,
+            "ordinary readiness probe exceeded the foreground activation budget"
+        );
+        if !exact_window_is_ready(front, target_psn, focused, window_id, visible) {
+            return Ok(false);
+        }
+        if index + 1 < REQUIRED_READY_SAMPLES {
+            pause();
+        }
+    }
+    Ok(true)
+}
+
+fn ordinary_activation_shape(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    modal: Option<bool>,
+) -> bool {
+    role == Some("AXWindow") && subrole == Some("AXStandardWindow") && modal == Some(false)
+}
+
+fn ordinary_activation_probe_allowed(
+    keyboard_target: bool,
+    hidden_panel: bool,
+    standard_dialog: bool,
+) -> bool {
+    keyboard_target && !hidden_panel && !standard_dialog
+}
+
+/// Retain the exact focused native window across selection of the fast path.
+/// This is never constructed for hidden panels or proven standard dialogs.
+struct ReadyOrdinaryWindow {
+    app: OwnedActivationAx,
+    window: OwnedActivationAx,
+}
+
+impl ReadyOrdinaryWindow {
+    fn has_ordinary_identity(&self, pid: i32, window_id: u32) -> bool {
+        use crate::ax::bindings::{ax_get_window_id, copy_bool_attr, copy_string_attr};
+        background_ax_owner(&self.window, pid).is_ok()
+            && unsafe { ax_get_window_id(self.window.0) } == Some(window_id)
+            && ordinary_activation_shape(
+                unsafe { copy_string_attr(self.window.0, "AXRole") }.as_deref(),
+                unsafe { copy_string_attr(self.window.0, "AXSubrole") }.as_deref(),
+                unsafe { copy_bool_attr(self.window.0, "AXModal") },
+            )
+    }
+
+    fn focused_id(&self, pid: i32) -> Option<u32> {
+        let focused = background_ax_attribute(&self.app, "AXFocusedWindow").ok()?;
+        if !same_background_ax(&focused, &self.window)
+            || background_ax_owner(&focused, pid).is_err()
+        {
+            return None;
+        }
+        unsafe { crate::ax::bindings::ax_get_window_id(focused.0) }
+    }
+}
+
+fn probe_ready_ordinary_window(
+    pid: i32,
+    window_id: u32,
+    target_psn: [u8; 8],
+    publication_started: std::time::Instant,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<Option<ReadyOrdinaryWindow>> {
+    check_exact_activation_owner(pid, window_id, &mut check)?;
+    let candidate = (|| {
+        let app =
+            OwnedActivationAx(unsafe { crate::ax::bindings::AXUIElementCreateApplication(pid) });
+        bound_activation_ax(&app).ok()?;
+        let window = background_ax_attribute(&app, "AXFocusedWindow").ok()?;
+        let candidate = ReadyOrdinaryWindow { app, window };
+        candidate
+            .has_ordinary_identity(pid, window_id)
+            .then_some(candidate)
+    })();
+    // Unavailable AX attributes may decline this optimization, but must never
+    // hide an activity/owner change or restart the publication budget.
+    check_exact_activation_owner(pid, window_id, &mut check)?;
+    anyhow::ensure!(
+        publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
+        "ordinary window discovery exceeded the foreground activation budget"
+    );
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let ready = probe_already_ready_with(
+        window_id,
+        target_psn,
+        || check_exact_activation_owner(pid, window_id, &mut check),
+        || {
+            (
+                current_front_process_psn(),
+                candidate.focused_id(pid),
+                exact_window_on_screen(pid, window_id),
+            )
+        },
+        || publication_started.elapsed(),
+        || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
+    )?;
+    Ok(ready.then_some(candidate))
+}
+
+fn check_ready_ordinary_window(
+    proof: &ReadyOrdinaryWindow,
+    pid: i32,
+    window_id: u32,
+    target_psn: [u8; 8],
+    publication_started: std::time::Instant,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    check_exact_activation_owner(pid, window_id, &mut check)?;
+    let still_ready = proof.has_ordinary_identity(pid, window_id)
+        && exact_window_is_ready(
+            current_front_process_psn(),
+            target_psn,
+            proof.focused_id(pid),
+            window_id,
+            exact_window_on_screen(pid, window_id),
+        );
+    check_exact_activation_owner(pid, window_id, &mut check)?;
+    anyhow::ensure!(
+        still_ready && publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
+        "selected ordinary readiness proof changed or expired; activation will not be retried"
+    );
+    Ok(())
+}
+
 /// Block until WindowServer and Accessibility agree that the exact target is
 /// active, and require two consecutive samples so a stale AX value cannot make
 /// an asynchronous foreground transition look complete.
@@ -3201,22 +3351,50 @@ pub(crate) fn with_foreground_hid_activation_delegated(
 /// Preserve the original guarded write order. A positively proven standard
 /// attached dialog omits only kCPSUserGenerated; exact key-window records and
 /// the later AX/readiness checks remain mandatory. An error never retries the
-/// other preparation path.
+/// other preparation path. A ready ordinary window may also omit 0x200, but
+/// only after a positive probe following 0x400. The returned bool selects that
+/// path irrevocably; it never counts as the final readiness/HID authorization.
 fn foreground_activation_preparation_steps(
     standard_dialog_proven: bool,
     mut check: impl FnMut() -> anyhow::Result<()>,
     mut set_front: impl FnMut(u32) -> i32,
     mut post_key_records: impl FnMut(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    mut ready_ordinary_probe: Option<&mut dyn FnMut() -> anyhow::Result<bool>>,
+) -> anyhow::Result<bool> {
     check()?;
     if set_front(0x400) != 0 {
         anyhow::bail!("WindowServer rejected foreground HID activation");
     }
     check()?;
-    if !standard_dialog_proven && set_front(0x200) != 0 {
+    let ready_ordinary = if !standard_dialog_proven {
+        if let Some(probe) = ready_ordinary_probe.as_mut() {
+            let ready = probe()?;
+            check()?;
+            ready
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !standard_dialog_proven && !ready_ordinary && set_front(0x200) != 0 {
         anyhow::bail!("WindowServer rejected exact foreground key-window activation");
     }
-    post_key_records(&mut check)
+    post_key_records(&mut check)?;
+    Ok(ready_ordinary)
+}
+
+fn complete_after_ordinary_probe(
+    ready_ordinary: bool,
+    check_selected: impl FnOnce() -> anyhow::Result<()>,
+    complete_original: impl FnOnce() -> anyhow::Result<[i32; 3]>,
+) -> anyhow::Result<Option<[i32; 3]>> {
+    if ready_ordinary {
+        check_selected()?;
+        Ok(None) // No AX write receipts: the redundant writes were skipped.
+    } else {
+        complete_original().map(Some)
+    }
 }
 
 fn complete_proven_standard_dialog_activation(
@@ -3302,13 +3480,41 @@ fn with_foreground_hid_activation_inner(
                     "standard dialog discovery exceeded the foreground activation budget");
                 host
             } else { None };
-            foreground_activation_preparation_steps(
-                standard_dialog_host.is_some(),
-                || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
-                |flags| unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, flags) },
-                |check| post_exact_key_window_records_guarded(target_psn, target_wid, check),
-            )?;
-            let ax_statuses = if let Some(host_id) = standard_dialog_host {
+            let ordinary_probe_allowed = ordinary_activation_probe_allowed(
+                keyboard_target, hidden_panel, standard_dialog_host.is_some(),
+            );
+            let mut ready_ordinary_proof = None;
+            let ready_ordinary = {
+                let mut probe = || {
+                    ready_ordinary_proof = probe_ready_ordinary_window(
+                        target_pid, target_wid, target_psn, publication_started, || episode.check(),
+                    )?;
+                    Ok(ready_ordinary_proof.is_some())
+                };
+                foreground_activation_preparation_steps(
+                    standard_dialog_host.is_some(),
+                    || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
+                    |flags| unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, flags) },
+                    |check| post_exact_key_window_records_guarded(target_psn, target_wid, check),
+                    if ordinary_probe_allowed {
+                        Some(&mut probe)
+                    } else { None },
+                )?
+            };
+            // Content-free branch evidence, after key records and before the
+            // next guarded phase; no logging between a final check and HID.
+            if ordinary_probe_allowed {
+                tracing::debug!(target_pid, target_wid, ready_ordinary,
+                    publication_elapsed_ms = publication_started.elapsed().as_millis(),
+                    "foreground ordinary readiness probe selected");
+            }
+            let check_selected_ordinary = || {
+                let proof = ready_ordinary_proof.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("selected ordinary readiness proof is unavailable"))?;
+                check_ready_ordinary_window(proof, target_pid, target_wid, target_psn,
+                    publication_started, || episode.check())
+            };
+            let complete_original = || if let Some(host_id) = standard_dialog_host {
                 // A selected proof that fails is terminal. Do not attempt the
                 // old 0x200 path, ordinary-sheet admission or Cocoa recovery.
                 complete_proven_standard_dialog_activation(
@@ -3318,7 +3524,7 @@ fn with_foreground_hid_activation_inner(
                         target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
                     ),
                     || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
-                )?
+                )
             } else { complete_activation_with_bounded_cocoa_request(
                 hidden_panel,
                 || {
@@ -3339,13 +3545,24 @@ fn with_foreground_hid_activation_inner(
                 || episode.check(),
                 || publication_started.elapsed(),
                 || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
-            )? };
+            ) };
+            let ax_statuses = complete_after_ordinary_probe(
+                ready_ordinary, &check_selected_ordinary, complete_original,
+            )?;
             await_exact_window_ready_guarded(target_pid, target_wid, target_psn, || {
                 episode.check()
             })
-            .map_err(|error| anyhow::anyhow!("{error}; ax_activation_statuses={ax_statuses:?}"))?;
+            .map_err(|error| match ax_statuses {
+                Some(statuses) => anyhow::anyhow!("{error}; ax_activation_statuses={statuses:?}"),
+                None => anyhow::anyhow!("{error}; ax_activation_statuses=skipped_ready_ordinary"),
+            })?;
             if keyboard_sheet.as_ref().is_some_and(|sheet| !sheet.revalidate("before_pointer_priming")) {
                 anyhow::bail!("ordinary sheet keyboard attachment changed before input");
+            }
+            if ready_ordinary {
+                // Losing the selected proof is terminal, even when the old
+                // activation path could have reacquired focus. Never replay it.
+                check_selected_ordinary()?;
             }
             crate::foreground_activity::check_input()?;
             let result = action(keyboard_sheet.as_ref());
@@ -4765,6 +4982,306 @@ mod tests {
     }
 
     #[test]
+    fn foreground_ready_ordinary_excludes_dialogs_panels_and_unknown_shapes() {
+        for keyboard in [false, true] {
+            for hidden in [false, true] {
+                for dialog in [false, true] {
+                    assert_eq!(
+                        super::ordinary_activation_probe_allowed(keyboard, hidden, dialog),
+                        keyboard && !hidden && !dialog
+                    );
+                }
+            }
+        }
+        assert!(super::ordinary_activation_shape(
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+            Some(false)
+        ));
+        for (role, subrole, modal) in [
+            (None, Some("AXStandardWindow"), Some(false)),
+            (Some("AXSheet"), Some("AXStandardWindow"), Some(false)),
+            (Some("AXWindow"), None, Some(false)),
+            (Some("AXWindow"), Some("AXDialog"), Some(false)),
+            (Some("AXWindow"), Some("AXSystemDialog"), Some(false)),
+            (Some("AXWindow"), Some("AXStandardWindow"), None),
+            (Some("AXWindow"), Some("AXStandardWindow"), Some(true)),
+        ] {
+            assert!(!super::ordinary_activation_shape(role, subrole, modal));
+        }
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_probe_uses_two_exact_samples_and_declines_unknown() {
+        let ready = (Some([1; 8]), Some(42), Some(true));
+        for bad in [
+            (None, Some(42), Some(true)),
+            (Some([2; 8]), Some(42), Some(true)),
+            (Some([1; 8]), None, Some(true)),
+            (Some([1; 8]), Some(41), Some(true)),
+            (Some([1; 8]), Some(42), None),
+            (Some([1; 8]), Some(42), Some(false)),
+        ] {
+            for first_ready in [false, true] {
+                let samples = Cell::new(0);
+                let pauses = Cell::new(0);
+                assert!(!super::probe_already_ready_with(
+                    42,
+                    [1; 8],
+                    || Ok(()),
+                    || {
+                        samples.set(samples.get() + 1);
+                        if first_ready && samples.get() == 1 {
+                            ready
+                        } else {
+                            bad
+                        }
+                    },
+                    || Duration::ZERO,
+                    || pauses.set(pauses.get() + 1),
+                )
+                .unwrap());
+                assert_eq!(samples.get(), if first_ready { 2 } else { 1 });
+                assert_eq!(pauses.get(), usize::from(first_ready));
+            }
+        }
+        let samples = Cell::new(0);
+        let pauses = Cell::new(0);
+        assert!(super::probe_already_ready_with(
+            42,
+            [1; 8],
+            || Ok(()),
+            || {
+                samples.set(samples.get() + 1);
+                ready
+            },
+            || Duration::ZERO,
+            || pauses.set(pauses.get() + 1),
+        )
+        .unwrap());
+        assert_eq!(samples.get(), 2);
+        assert_eq!(pauses.get(), 1);
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_probe_never_turns_guard_loss_or_expiry_into_fallback() {
+        for lost_check in 0..4 {
+            let checks = Cell::new(0);
+            let result = super::probe_already_ready_with(
+                42,
+                [1; 8],
+                || {
+                    let n = checks.get();
+                    checks.set(n + 1);
+                    anyhow::ensure!(n != lost_check, "lease changed");
+                    Ok(())
+                },
+                || (Some([1; 8]), Some(42), Some(true)),
+                || Duration::ZERO,
+                || {},
+            );
+            assert!(result.unwrap_err().to_string().contains("lease changed"));
+        }
+        // Expiry before sample one, during a synchronous read, or during the
+        // single pause all stop. In particular, a late matching read cannot win.
+        for expire_at in [0, 1, 2] {
+            let elapsed = Cell::new(if expire_at == 0 {
+                ACTIVATION_WAIT_TIMEOUT
+            } else {
+                Duration::ZERO
+            });
+            let samples = Cell::new(0);
+            let result = super::probe_already_ready_with(
+                42,
+                [1; 8],
+                || Ok(()),
+                || {
+                    samples.set(samples.get() + 1);
+                    if expire_at == 1 {
+                        elapsed.set(ACTIVATION_WAIT_TIMEOUT);
+                    }
+                    (Some([1; 8]), Some(42), Some(true))
+                },
+                || elapsed.get(),
+                || {
+                    if expire_at == 2 {
+                        elapsed.set(ACTIVATION_WAIT_TIMEOUT);
+                    }
+                },
+            );
+            assert!(result.unwrap_err().to_string().contains("budget"));
+            assert_eq!(samples.get(), usize::from(expire_at != 0));
+        }
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_preparation_skips_redundant_writes_only_after_positive_probe() {
+        for ready in [false, true] {
+            let writes = std::cell::RefCell::new(Vec::new());
+            let mut probe = || {
+                writes.borrow_mut().push("probe");
+                Ok(ready)
+            };
+            let selected = super::foreground_activation_preparation_steps(
+                false,
+                || Ok(()),
+                |flags| {
+                    writes
+                        .borrow_mut()
+                        .push(if flags == 0x400 { "0x400" } else { "0x200" });
+                    0
+                },
+                |check| {
+                    for kind in ["key1", "key2"] {
+                        check()?;
+                        writes.borrow_mut().push(kind);
+                    }
+                    Ok(())
+                },
+                Some(&mut probe),
+            )
+            .unwrap();
+            let statuses = super::complete_after_ordinary_probe(
+                selected,
+                || Ok(()),
+                || {
+                    exact_ax_activation_steps(
+                        || Ok(()),
+                        |op| {
+                            writes.borrow_mut().push(op);
+                            0
+                        },
+                        || panic!("no uncertain writes"),
+                    )
+                },
+            )
+            .unwrap();
+            if ready {
+                assert_eq!(*writes.borrow(), ["0x400", "probe", "key1", "key2"]);
+                assert_eq!(statuses, None);
+            } else {
+                assert_eq!(
+                    *writes.borrow(),
+                    [
+                        "0x400",
+                        "probe",
+                        "0x200",
+                        "key1",
+                        "key2",
+                        "AXRaise",
+                        "AXMain",
+                        "AXFocused"
+                    ]
+                );
+                assert_eq!(statuses, Some([0; 3]));
+            }
+        }
+        // An already proven dialog does not even invoke the ordinary probe.
+        let mut forbidden_probe =
+            || -> anyhow::Result<bool> { panic!("dialog must retain its own proof") };
+        assert!(!super::foreground_activation_preparation_steps(
+            true,
+            || Ok(()),
+            |flags| {
+                assert_eq!(flags, 0x400);
+                0
+            },
+            |check| check(),
+            Some(&mut forbidden_probe),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_selection_loss_stops_without_activation_replay() {
+        // The check immediately after selection and each key-record check must
+        // stop remaining writes, rather than promote through the old path.
+        for lose_at in 2..5 {
+            let checks = Cell::new(0);
+            let writes = std::cell::RefCell::new(Vec::new());
+            let mut probe = || Ok(true);
+            let result = super::foreground_activation_preparation_steps(
+                false,
+                || {
+                    let n = checks.get();
+                    checks.set(n + 1);
+                    anyhow::ensure!(n != lose_at, "lease lost");
+                    Ok(())
+                },
+                |flags| {
+                    writes.borrow_mut().push(flags);
+                    0
+                },
+                |check| {
+                    for _ in 0..2 {
+                        check()?;
+                        writes.borrow_mut().push(1);
+                    }
+                    Ok(())
+                },
+                Some(&mut probe),
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                *writes.borrow(),
+                if lose_at == 4 {
+                    vec![0x400, 1]
+                } else {
+                    vec![0x400]
+                }
+            );
+        }
+        let mut interrupted_probe =
+            || -> anyhow::Result<bool> { anyhow::bail!("lease changed during sample") };
+        let writes = std::cell::RefCell::new(Vec::new());
+        assert!(super::foreground_activation_preparation_steps(
+            false,
+            || Ok(()),
+            |flags| {
+                writes.borrow_mut().push(flags);
+                0
+            },
+            |_| panic!("no records after probe error"),
+            Some(&mut interrupted_probe),
+        )
+        .is_err());
+        assert_eq!(*writes.borrow(), [0x400]);
+        assert!(super::complete_after_ordinary_probe(
+            true,
+            || anyhow::bail!("retained focus changed"),
+            || panic!("selected proof cannot reacquire through AX or Cocoa"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn foreground_ready_ordinary_selection_does_not_replace_final_hid_readiness() {
+        let hid = Cell::new(false);
+        let elapsed = Cell::new(Duration::ZERO);
+        let selected = super::foreground_activation_preparation_steps(
+            false,
+            || Ok(()),
+            |_| 0,
+            |check| check(),
+            Some(&mut || Ok(true)),
+        )
+        .unwrap();
+        super::complete_after_ordinary_probe(selected, || Ok(()), || panic!("no AX writes"))
+            .unwrap();
+        let result = await_exact_window_ready_with(
+            42,
+            [1; 8],
+            || Ok(()),
+            || (Some([1; 8]), Some(99), Some(true)),
+            || elapsed.get(),
+            || elapsed.set(elapsed.get() + Duration::from_millis(100)),
+        )
+        .map(|_| hid.set(true));
+        assert!(result.is_err());
+        assert!(!hid.get());
+    }
+
+    #[test]
     fn foreground_standard_dialog_preparation_omits_only_user_generated_write() {
         for proven in [false, true] {
             let events = std::cell::RefCell::new(Vec::new());
@@ -4779,6 +5296,7 @@ mod tests {
                     }
                     Ok(())
                 },
+                None,
             ).unwrap();
             let mut expected = vec![("check", 0), ("front", 0x400), ("check", 0)];
             if !proven { expected.push(("front", 0x200)); }
@@ -4809,6 +5327,7 @@ mod tests {
                         }
                         Ok(())
                     },
+                    None,
                 ).map(|_| hid.set(true));
                 assert!(result.is_err());
                 assert!(!hid.get());
@@ -4833,6 +5352,7 @@ mod tests {
                     if flags == fail_at { -1 } else { 0 }
                 },
                 |_| { records.set(records.get() + 1); Ok(()) },
+                None,
             );
             assert!(result.is_err());
             assert_eq!(records.get(), 0);
@@ -4842,6 +5362,7 @@ mod tests {
         let result = super::foreground_activation_preparation_steps(
             true, || Ok(()), |flags| { writes.borrow_mut().push(flags); 0 },
             |check| { check()?; anyhow::bail!("key-window record failed with OSStatus -1") },
+            None,
         );
         assert_eq!(*writes.borrow(), [0x400]);
         assert!(result.unwrap_err().to_string().contains("key-window record failed"));
