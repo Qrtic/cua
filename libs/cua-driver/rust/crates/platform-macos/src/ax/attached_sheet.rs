@@ -267,6 +267,27 @@ fn keyboard_activation_matches<T: SheetTree>(
         .is_some_and(|current| same_attachment(tree, expected, &current) && tree.within_budget())
 }
 
+fn keyboard_revalidation_diagnostic_status(
+    started: Instant,
+    finished: Instant,
+    deadline: Instant,
+    proven: bool,
+) -> &'static str {
+    if started >= deadline {
+        "deadline_expired_before_revalidation"
+    } else if proven {
+        // A logging timestamp after expiry must not relabel an accepted proof
+        // or add a new authority check after the existing final budget check.
+        "proven"
+    } else if finished >= deadline {
+        // Expiry can coexist with an unreadable or changed AX relation. This
+        // records budget exhaustion, not which predicate failed first.
+        "deadline_expired_after_revalidation"
+    } else {
+        "proof_unproven"
+    }
+}
+
 /// Retained native evidence for one ordinary sheet's keyboard activation.
 /// This grants neither file-dialog/segment authority nor input to its host.
 pub(crate) struct KeyboardSheetActivation {
@@ -291,19 +312,35 @@ impl KeyboardSheetActivation {
 
     /// Re-read every reciprocal edge and compare retained native identities.
     /// All checks share the caller's activation deadline; it is never renewed.
-    pub(crate) fn revalidate(&self) -> bool {
-        if Instant::now() >= self.deadline {
-            return false;
-        }
-        let Some(app) = (unsafe { Node::owned(AXUIElementCreateApplication(self.pid)) }) else {
-            return false;
+    pub(crate) fn revalidate(&self, phase: &'static str) -> bool {
+        let started = Instant::now();
+        let proven = if started >= self.deadline {
+            false
+        } else if let Some(app) = unsafe { Node::owned(AXUIElementCreateApplication(self.pid)) } {
+            keyboard_activation_matches(
+                &NativeTree { app, deadline: self.deadline },
+                self.pid,
+                self.window_id,
+                &self.chain,
+            )
+        } else {
+            false
         };
-        keyboard_activation_matches(
-            &NativeTree { app, deadline: self.deadline },
-            self.pid,
-            self.window_id,
-            &self.chain,
-        )
+        let finished = Instant::now();
+        tracing::debug!(
+            target: "cua_focus_restore",
+            pid = self.pid,
+            window_id = self.window_id,
+            phase,
+            status = keyboard_revalidation_diagnostic_status(started, finished, self.deadline, proven),
+            proven,
+            elapsed_us = finished.duration_since(started).as_micros() as u64,
+            remaining_before_us = self.deadline.saturating_duration_since(started).as_micros() as u64,
+            remaining_after_us = self.deadline.saturating_duration_since(finished).as_micros() as u64,
+            deadline_expired_after = finished >= self.deadline,
+            "Ordinary sheet keyboard attachment revalidation"
+        );
+        proven
     }
 }
 

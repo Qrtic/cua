@@ -1587,7 +1587,7 @@ fn complete_keyboard_sheet_activation(
         || {
             check_exact_activation_owner(pid, window_id, &mut check_activity)?;
             check_exact_activation_owner(pid, sheet.host_id(), &mut check_activity)?;
-            if !sheet.revalidate() {
+            if !sheet.revalidate("ax_activation_guard") {
                 anyhow::bail!("ordinary sheet keyboard attachment changed or its activation budget expired");
             }
             check_activity()
@@ -3293,7 +3293,7 @@ fn with_foreground_hid_activation_inner(
                 episode.check()
             })
             .map_err(|error| anyhow::anyhow!("{error}; ax_activation_statuses={ax_statuses:?}"))?;
-            if keyboard_sheet.as_ref().is_some_and(|sheet| !sheet.revalidate()) {
+            if keyboard_sheet.as_ref().is_some_and(|sheet| !sheet.revalidate("before_pointer_priming")) {
                 anyhow::bail!("ordinary sheet keyboard attachment changed before input");
             }
             crate::foreground_activity::check_input()?;
@@ -3502,7 +3502,7 @@ fn with_foreground_keyboard_context_activation_inner(
             // after that wait, without adding queries to existing routes.
             let action = keyboard_action_after_priming(
                 sheet.map(|sheet| move || {
-                    if !sheet.revalidate() {
+                    if !sheet.revalidate("after_pointer_priming") {
                         anyhow::bail!("ordinary sheet keyboard attachment changed after pointer priming");
                     }
                     crate::foreground_activity::check_input()

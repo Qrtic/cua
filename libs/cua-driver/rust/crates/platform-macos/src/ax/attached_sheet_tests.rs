@@ -417,3 +417,34 @@ fn changed_focus_unlisted_host_and_exhausted_reads_never_grant_nested_target() {
         assert!(prove(&tree, 42, 950).is_none());
     }
 }
+#[test]
+fn keyboard_revalidation_diagnostics_distinguish_budget_from_unproven_evidence() {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(400);
+    assert_eq!(
+        super::keyboard_revalidation_diagnostic_status(deadline, deadline, deadline, false),
+        "deadline_expired_before_revalidation"
+    );
+    assert_eq!(
+        super::keyboard_revalidation_diagnostic_status(start, deadline, deadline, false),
+        "deadline_expired_after_revalidation"
+    );
+    assert_eq!(
+        super::keyboard_revalidation_diagnostic_status(
+            start, deadline - std::time::Duration::from_micros(1), deadline, false,
+        ),
+        "proof_unproven"
+    );
+}
+
+#[test]
+fn keyboard_revalidation_diagnostics_do_not_revoke_an_accepted_proof() {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(400);
+    // The existing proof's final check can succeed just before expiry while
+    // the subsequent diagnostic clock read falls on the boundary.
+    assert_eq!(
+        super::keyboard_revalidation_diagnostic_status(start, deadline, deadline, true),
+        "proven"
+    );
+}
