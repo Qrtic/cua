@@ -161,7 +161,7 @@ impl InvocationContext {
         Ok(())
     }
 
-    fn check(&self) -> anyhow::Result<()> {
+    fn check_ownership(&self) -> anyhow::Result<()> {
         self.check_liveness()?;
         if let Some(desktop) = &self.desktop {
             if let Err(error) = desktop.check() {
@@ -169,8 +169,28 @@ impl InvocationContext {
                 return Err(error);
             }
         }
+        Ok(())
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        self.check_segment(false)
+    }
+
+    // Only the terminal post-call check may consume a completed failure
+    // cleanup. check()/check_input() continue to reject every further input.
+    fn check_after_call(&self) -> anyhow::Result<()> {
+        self.check_segment(true)
+    }
+
+    fn check_segment(&self, settling: bool) -> anyhow::Result<()> {
+        self.check_ownership()?;
         if let Some(call) = &self.segment_call {
-            if let Err(error) = call.check() {
+            let checked = if settling && call.failed_preparation_cleanup_started() {
+                call.check_failed_preparation_settled()
+            } else {
+                call.check()
+            };
+            if let Err(error) = checked {
                 if call.cleanup_is_unknown() {
                     self.mark_cleanup_unknown();
                 }
@@ -679,7 +699,7 @@ impl Tool for ActivityGuardedTool {
                         let call = Arc::clone(call);
                         let checked = Arc::clone(&context);
                         let settled = spawn_blocking(move || {
-                            call.settle_dialog_return(|| checked.check_liveness())
+                            call.settle_after_dialog_call(|| checked.check_liveness())
                         })
                         .await;
                         if !matches!(settled, Ok(Ok(true))) {
@@ -693,7 +713,7 @@ impl Tool for ActivityGuardedTool {
                 result
             })
             .await;
-        let _ = context.check();
+        let _ = context.check_after_call();
         cancel_on_exit.completed = true;
         context.finish_invocation();
         if context.workers.load(Ordering::Acquire) != 0 {

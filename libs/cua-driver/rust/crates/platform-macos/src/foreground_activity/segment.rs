@@ -15,6 +15,13 @@ struct Resources {
     _foreground: tokio::sync::OwnedMutexGuard<()>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparationCleanup {
+    NotStarted,
+    Running,
+    Confirmed,
+}
+
 struct Inner {
     policy: Segment,
     resources: Option<Resources>,
@@ -29,6 +36,9 @@ struct Inner {
     // Look). This proof permits normal restoration only, never another input
     // call or replacement of the segment's immutable target binding.
     completed_return_source: Option<ExactWindowTarget>,
+    // Only the original prepare call may clean up its normal failure. This
+    // latch ends input admission without replacing its lease or reservation.
+    preparation_cleanup: PreparationCleanup,
     cleanup_unknown: bool,
     summary: Option<Value>,
 }
@@ -357,6 +367,10 @@ impl NativeSegment {
         tool: &str,
         target: ExactWindowTarget,
     ) -> Result<(), ToolResult> {
+        if self.preparation_cleanup_started() {
+            return Err(failure("foreground_segment_not_available",
+                "Dialog preparation ended; abort this segment before further input", true));
+        }
         if self.completed_return_source().is_some() {
             return Err(failure(
                 "foreground_segment_not_available",
@@ -431,6 +445,9 @@ impl NativeSegment {
     }
 
     fn check(&self) -> anyhow::Result<()> {
+        if self.preparation_cleanup_started() {
+            anyhow::bail!("foreground_segment_not_available: failed preparation ended input");
+        }
         self.check_liveness()?;
         let expected = self.expected_front();
         let focus_live =
@@ -446,6 +463,11 @@ impl NativeSegment {
                 .revoke();
         }
         self.check_liveness()
+    }
+
+    fn preparation_cleanup_started(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).preparation_cleanup
+            != PreparationCleanup::NotStarted
     }
 
     fn summary(&self, restoration: &str) -> Value {
@@ -521,6 +543,7 @@ pub(super) struct Call {
     target: ExactWindowTarget,
     dialog_transition: Mutex<Option<Value>>,
     reservation: Mutex<Option<Reservation>>,
+    prepares_dialog: bool,
 }
 
 impl Call {
@@ -537,6 +560,119 @@ impl Call {
     }
     pub(super) fn check(&self) -> anyhow::Result<()> {
         self.segment.check()
+    }
+
+    fn claim_failed_preparation(&self, now: u64, activity: Snapshot) -> bool {
+        if !self.prepares_dialog || !self.is_dialog() || !self.segment.owner_live()
+            || self.target != self.segment.current_target()
+            || self.reservation.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        {
+            return false;
+        }
+        let mut inner = self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.activated || inner.resources.is_none() || inner.cleanup_unknown
+            || inner.ending || inner.restoring || !inner.policy.in_flight()
+            || inner.policy.calls_reserved() != 1 || inner.policy.steps_reserved() != 0
+            || inner.preparation_cleanup != PreparationCleanup::NotStarted
+            || inner.policy.check(&self.segment.binding, now, activity).is_err()
+        {
+            return false;
+        }
+        inner.preparation_cleanup = PreparationCleanup::Running;
+        true
+    }
+
+    pub(super) fn failed_preparation_cleanup_started(&self) -> bool {
+        self.prepares_dialog && self.segment.preparation_cleanup_started()
+    }
+
+    // This is a read-only settlement check, deliberately separate from check():
+    // the same call can report its original error, but cannot send more input.
+    pub(super) fn check_failed_preparation_settled(&self) -> anyhow::Result<()> {
+        let confirmed = self.prepares_dialog
+            && self.segment.inner.lock().unwrap_or_else(|e| e.into_inner()).preparation_cleanup
+                == PreparationCleanup::Confirmed;
+        failed_preparation_settled_with(confirmed,
+            || self.segment.check_liveness(), || owned_exact_front(self.segment.original))
+    }
+
+    pub(super) fn settle_after_dialog_call(
+        &self, mut check_live: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        if self.failed_preparation_cleanup_started() {
+            check_live()?;
+            self.check_failed_preparation_settled()?;
+            check_live()?;
+            Ok(true)
+        } else {
+            self.settle_dialog_return(check_live)
+        }
+    }
+
+    fn cleanup_failed_preparation(self: &Arc<Self>, context: &InvocationContext) {
+        if !context.segment_call.as_ref().is_some_and(|call| Arc::ptr_eq(call, self))
+            || !self.prepares_dialog || self.segment.preparation_cleanup_started()
+            || !self.segment.inner.lock().unwrap_or_else(|e| e.into_inner()).activated
+        {
+            return;
+        }
+        let source = self.segment.restoration_source();
+        let original = self.segment.original;
+        let live = || -> anyhow::Result<()> {
+            context.check_ownership()?;
+            self.segment.check_liveness()?;
+            if self.segment.restoration_source() != source {
+                anyhow::bail!("failed preparation restoration source changed");
+            }
+            Ok(())
+        };
+        if live().is_err() { return; }
+        let Ok(focus) = crate::input::skylight::FailedPreparationFocus::capture(source, original) else { return; };
+        let phase = Cell::new(crate::input::skylight::ExactRestorationPhase::BeforeFrontRequest);
+        let check = || focus.check(phase.get(), || live());
+        // No activation/AX attempt after cancellation, expiry or unknown focus.
+        if check().is_err() || !self.claim_failed_preparation(clock_ms(), snapshot()) {
+            return;
+        }
+        struct UnwoundRestore<'a>(&'a Call, bool);
+        impl Drop for UnwoundRestore<'_> {
+            fn drop(&mut self) {
+                if !self.1 { self.0.cleanup_unknown(); }
+            }
+        }
+        let mut unwind = UnwoundRestore(self, false);
+        let restored = failed_preparation_restore_with(
+            check,
+            || owned_exact_front(original),
+            |guard| crate::input::skylight::restore_exact_window_guarded_with_phase(
+                original.pid, original.window_id, |next| {
+                    // Only the native restorer can signal successful 0x200.
+                    phase.set(next);
+                    guard()
+                }),
+        );
+        unwind.1 = true;
+        let confirmed = matches!(restored, Ok(true))
+            && self.confirm_failed_preparation(clock_ms(), snapshot());
+        tracing::debug!(target: "cua_foreground_segment", ?restored, confirmed,
+            source_pid = source.pid, source_window = source.window_id,
+            original_pid = original.pid, original_window = original.window_id,
+            "Same-call failed dialog preparation cleanup settled; input remains disabled");
+        // Keep the reservation/resources until the actual worker exits. The
+        // wrapper still aborts normally; this is neither end_segment nor finish.
+    }
+
+    fn confirm_failed_preparation(&self, now: u64, activity: Snapshot) -> bool {
+        let mut inner = self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.prepares_dialog || !self.segment.owner_live() || inner.cleanup_unknown
+            || inner.ending || inner.restoring || !inner.policy.in_flight()
+            || inner.preparation_cleanup != PreparationCleanup::Running
+            || inner.policy.check(&self.segment.binding, now, activity).is_err()
+        {
+            return false;
+        }
+        inner.preparation_cleanup = PreparationCleanup::Confirmed;
+        true
     }
     pub(super) fn revoke(&self) {
         self.segment.revoke();
@@ -1081,7 +1217,47 @@ pub(super) fn admit_call(args: &Value, tool: &str) -> Result<Option<Arc<Call>>, 
         target,
         dialog_transition: Mutex::new(None),
         reservation: Mutex::new(Some(reservation)),
+        prepares_dialog: tool == "prepare_dialog",
     })))
+}
+
+fn owned_exact_front(target: ExactWindowTarget) -> bool {
+    matches!(crate::windows::resolve_window_owner(target.pid, target.window_id),
+        crate::windows::WindowOwner::SamePid) && exact_front(target)
+}
+
+fn failed_preparation_restore_with(
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut original_front: impl FnMut() -> bool,
+    restore: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> bool,
+) -> anyhow::Result<bool> {
+    check()?;
+    if original_front() {
+        check()?;
+        return Ok(true);
+    }
+    if !restore(&mut check) {
+        return Ok(false);
+    }
+    check()?;
+    let restored = original_front();
+    check()?;
+    Ok(restored)
+}
+
+fn failed_preparation_settled_with(
+    confirmed: bool,
+    mut check: impl FnMut() -> anyhow::Result<()>,
+    mut original_front: impl FnMut() -> bool,
+) -> anyhow::Result<()> {
+    if !confirmed {
+        anyhow::bail!("failed dialog preparation cleanup was not confirmed");
+    }
+    check()?;
+    if !original_front() {
+        anyhow::bail!("failed dialog preparation return is no longer exact");
+    }
+    check()
 }
 
 fn exact_front(target: ExactWindowTarget) -> bool {
@@ -1251,6 +1427,7 @@ pub(crate) async fn begin_segment(args: Value) -> ToolResult {
             dialog_target: attachment,
             dialog_observation_required: false,
             completed_return_source: None,
+            preparation_cleanup: PreparationCleanup::NotStarted,
             cleanup_unknown: false,
             summary: None,
         }),
@@ -1317,7 +1494,8 @@ pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
         Ok(target) => target,
         Err(result) => return result,
     };
-    let Some(call) = current_invocation().and_then(|context| context.segment_call.clone()) else {
+    let context = current_invocation();
+    let Some(call) = context.as_ref().and_then(|context| context.segment_call.clone()) else {
         return failure(
             "foreground_dialog_required",
             "A live native dialog segment is required",
@@ -1332,16 +1510,27 @@ pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
         );
     }
     let expected_host = call.segment.dialog_host.unwrap();
+    let context = context.unwrap();
+    let prepared_call = Arc::clone(&call);
     let prepared = spawn_blocking(move || {
-        check_request()?;
-        if crate::ax::attached_sheet::focused_dialog_host(target.pid, target.window_id)
-            != Some(expected_host.window_id)
-        {
-            anyhow::bail!("dialog attachment changed before activation");
+        let result = (|| {
+            check_request()?;
+            if crate::ax::attached_sheet::focused_dialog_host(target.pid, target.window_id)
+                != Some(expected_host.window_id)
+            {
+                anyhow::bail!("dialog attachment changed before activation");
+            }
+            crate::input::skylight::with_foreground_hid_activation(target.pid, target.window_id, || {
+                Ok(())
+            })
+        })();
+        // Only a normal returned error enters cleanup, after Episode has
+        // released its owned controls. Cancellation/unwind never substitutes
+        // an end/finish or receives a fresh activity lease.
+        if result.is_err() {
+            prepared_call.cleanup_failed_preparation(&context);
         }
-        crate::input::skylight::with_foreground_hid_activation(target.pid, target.window_id, || {
-            Ok(())
-        })
+        result
     })
     .await;
     match prepared {
@@ -1918,6 +2107,7 @@ mod tests {
                 dialog_target: None,
                 dialog_observation_required: false,
                 completed_return_source: None,
+                preparation_cleanup: PreparationCleanup::NotStarted,
                 cleanup_unknown: false,
                 summary: None,
             }),
@@ -1939,6 +2129,7 @@ mod tests {
             target: segment.current_target(),
             dialog_transition: Mutex::new(None),
             reservation: Mutex::new(Some(reservation)),
+            prepares_dialog: false,
         })
     }
 
@@ -1960,6 +2151,196 @@ mod tests {
             workers: AtomicUsize::new(0),
             invocation_done: AtomicBool::new(false),
         })
+    }
+
+    async fn preparation_fixture() -> (Arc<NativeSegment>, Arc<Call>) {
+        let (mut segment, _, _) = fixture().await;
+        Arc::get_mut(&mut segment).unwrap().dialog_host = Some(ExactWindowTarget {
+            pid: 42, window_id: 70,
+        });
+        let reservation = segment.inner.lock().unwrap().policy
+            .reserve(&segment.binding, 5_000, idle(), CallKind::Activation).unwrap();
+        let ticket = Arc::new(Call {
+            segment: Arc::clone(&segment), target: segment.current_target(),
+            dialog_transition: Mutex::new(None), reservation: Mutex::new(Some(reservation)),
+            prepares_dialog: true,
+        });
+        ticket.mark_activated();
+        (segment, ticket)
+    }
+
+    #[tokio::test]
+    async fn failed_prepare_cleanup_blocks_input_without_renewing_or_settling_its_call() {
+        let (segment, ticket) = preparation_fixture().await;
+        let deadline = segment.inner.lock().unwrap().policy.deadline_ms();
+        let target = segment.expected_front();
+        assert!(ticket.claim_failed_preparation(5_001, idle()));
+        assert!(!ticket.claim_failed_preparation(5_001, idle()));
+        assert!(ticket.check().is_err()); // latch rejects before any native focus query
+        for tool in ["prepare_dialog", "get_window_state", "press_key", "set_value"] {
+            assert!(segment.validate_dialog_call(tool, ticket.target()).is_err());
+        }
+        assert!(ticket.confirm_failed_preparation(5_002, idle()));
+        assert!(ticket.check().is_err()); // confirmed cleanup still grants no input
+        assert_eq!(segment.expected_front(), target); // never fake activated=false
+        {
+            let mut inner = segment.inner.lock().unwrap();
+            assert_eq!(inner.policy.deadline_ms(), deadline);
+            assert_eq!(inner.policy.state(), SegmentState::Open);
+            assert!(inner.policy.reserve(&segment.binding, 5_003, idle(), CallKind::Mutation).is_err());
+            assert!(inner.resources.is_some());
+        }
+        ticket.settle();
+        assert!(segment.inner.lock().unwrap().resources.is_some()); // await existing abort
+        assert!(!ticket.claim_failed_preparation(5_003, idle()));
+        segment.revoke();
+        assert!(segment.cleanup_is_settled());
+    }
+
+    #[tokio::test]
+    async fn concurrent_abort_stops_failed_prepare_cleanup_without_releasing_live_worker() {
+        let (segment, ticket) = preparation_fixture().await;
+        assert!(ticket.claim_failed_preparation(5_001, idle()));
+        {
+            let mut inner = segment.inner.lock().unwrap();
+            claim_end(&mut inner, &segment.binding, false).unwrap();
+            assert!(claim_end(&mut inner, &segment.binding, true).is_err());
+            assert_eq!(inner.policy.state(), SegmentState::Revoked);
+        }
+        assert!(!ticket.confirm_failed_preparation(5_002, idle()));
+        segment.settle_revoked();
+        assert!(segment.inner.lock().unwrap().resources.is_some());
+        assert!(segment.inner.lock().unwrap().policy.in_flight());
+        ticket.settle();
+        assert!(segment.cleanup_is_settled());
+        assert_eq!(ticket.closed_summary().unwrap()["restoration"], "skipped_interrupted");
+    }
+
+    #[tokio::test]
+    async fn failed_prepare_claim_retains_original_owner_activity_and_reservation_guards() {
+        for case in 0..10 {
+            let (segment, mut ticket) = preparation_fixture().await;
+            let mut now = 5_001;
+            let mut activity = idle();
+            match case {
+                0 => Arc::get_mut(&mut ticket).unwrap().prepares_dialog = false,
+                1 => segment.inner.lock().unwrap().activated = false,
+                2 => { segment.owner.close(cua_driver_core::session::SessionEndReason::ProcessExit); },
+                3 => now = u64::MAX,
+                4 => activity.generation += 1,
+                5 => activity.reliable = false,
+                6 => segment.inner.lock().unwrap().cleanup_unknown = true,
+                7 => segment.inner.lock().unwrap().ending = true,
+                8 => segment.inner.lock().unwrap().restoring = true,
+                _ => ticket.settle(),
+            }
+            assert!(!ticket.claim_failed_preparation(now, activity), "case {case}");
+            assert!(!segment.preparation_cleanup_started(), "case {case}");
+            {
+                let mut inner = segment.inner.lock().unwrap();
+                inner.cleanup_unknown = false;
+                inner.ending = false;
+                inner.restoring = false;
+            }
+            ticket.revoke();
+            ticket.settle();
+        }
+    }
+
+    #[tokio::test]
+    async fn expiry_after_restore_does_not_confirm_failed_preparation_cleanup() {
+        let (segment, ticket) = preparation_fixture().await;
+        assert!(ticket.claim_failed_preparation(5_001, idle()));
+        assert!(!ticket.confirm_failed_preparation(u64::MAX, idle()));
+        assert!(segment.inner.lock().unwrap().preparation_cleanup == PreparationCleanup::Running);
+        assert!(ticket.check().is_err());
+        ticket.settle();
+    }
+
+    #[test]
+    fn failed_prepare_restore_checks_before_first_and_every_later_write() {
+        // The injected revocation represents cancel/owner loss/expiry or a
+        // source/original-window mismatch at each actual guarded write point.
+        for denied_at in 0usize..4 {
+            let checks = Cell::new(0);
+            let writes = Cell::new(0);
+            let original = Cell::new(false);
+            let result = failed_preparation_restore_with(
+                || {
+                    let n = checks.get();
+                    checks.set(n + 1);
+                    if n == denied_at { anyhow::bail!("original authority ended"); }
+                    Ok(())
+                },
+                || original.get(),
+                |guard| {
+                    for _ in 0..3 {
+                        if guard().is_err() { return false; }
+                        writes.set(writes.get() + 1);
+                    }
+                    original.set(true);
+                    true
+                },
+            );
+            assert!(!matches!(result, Ok(true)));
+            assert_eq!(writes.get(), denied_at.saturating_sub(1));
+        }
+    }
+
+    #[test]
+    fn failed_prepare_restore_requires_exact_readback_and_preserves_guard_failure() {
+        let original = Cell::new(false);
+        let calls = Cell::new(0);
+        assert!(failed_preparation_restore_with(|| Ok(()), || original.get(), |guard| {
+            guard().unwrap();
+            calls.set(calls.get() + 1);
+            original.set(true);
+            true
+        }).unwrap());
+        assert_eq!(calls.get(), 1);
+        assert!(failed_preparation_restore_with(|| Ok(()), || true,
+            |_| panic!("already-original must not restore again")).unwrap());
+        for native_result in [false, true] {
+            assert!(!failed_preparation_restore_with(|| Ok(()), || false,
+                |_| native_result).unwrap());
+        }
+        let changed = Cell::new(false);
+        assert!(failed_preparation_restore_with(
+            || if changed.get() { anyhow::bail!("lease expired"); } else { Ok(()) },
+            || { changed.set(true); true },
+            |_| panic!("expired read must not write"),
+        ).is_err());
+    }
+
+    #[test]
+    fn failed_prepare_restore_unwind_cannot_produce_confirmed_readback() {
+        let checked_after_write = Cell::new(false);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            failed_preparation_restore_with(|| Ok(()), || {
+                checked_after_write.set(true);
+                false
+            }, |_| {
+                checked_after_write.set(false);
+                panic!("native restoration unwound");
+            })
+        }));
+        assert!(unwind.is_err());
+        assert!(!checked_after_write.get());
+        // The production caller's UnwoundRestore marks cleanup unknown; no
+        // return value can reach confirm_failed_preparation on this path.
+    }
+
+    #[test]
+    fn failed_prepare_settlement_is_not_an_error_or_focus_bypass() {
+        assert!(failed_preparation_settled_with(false,
+            || panic!("unconfirmed cleanup must not bypass old checks"),
+            || panic!("unconfirmed cleanup must not query native focus")).is_err());
+        assert!(failed_preparation_settled_with(true, || Ok(()), || true).is_ok());
+        assert!(failed_preparation_settled_with(true, || Ok(()), || false).is_err());
+        let changed = Cell::new(false);
+        assert!(failed_preparation_settled_with(true,
+            || if changed.get() { anyhow::bail!("owner lost"); } else { Ok(()) },
+            || { changed.set(true); true }).is_err());
     }
 
     #[test]

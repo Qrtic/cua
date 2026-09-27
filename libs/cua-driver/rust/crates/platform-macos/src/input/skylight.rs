@@ -1195,36 +1195,167 @@ pub(crate) fn restore_exact_window_guarded(
     window: u32,
     mut check_activity: impl FnMut() -> anyhow::Result<()>,
 ) -> bool {
+    restore_exact_window_guarded_with_phase(pid, window, |_| check_activity())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactRestorationPhase {
+    BeforeFrontRequest,
+    Handoff,
+}
+
+// The native request closure returns true only after SetFrontProcess(0x200)
+// succeeds. No guard-call count, AX observation or elapsed time advances phase.
+fn exact_restoration_sequence(
+    mut check: impl FnMut(ExactRestorationPhase) -> anyhow::Result<()>,
+    request: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> bool,
+    key_records: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> bool,
+    complete: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> bool,
+    ready: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> bool,
+) -> bool {
+    if !request(&mut || check(ExactRestorationPhase::BeforeFrontRequest)) {
+        return false;
+    }
+    let mut handoff = || check(ExactRestorationPhase::Handoff);
+    key_records(&mut handoff) && complete(&mut handoff) && ready(&mut handoff)
+}
+
+pub(crate) fn restore_exact_window_guarded_with_phase(
+    pid: i32,
+    window: u32,
+    check_activity: impl FnMut(ExactRestorationPhase) -> anyhow::Result<()>,
+) -> bool {
     let Some(set_front) = set_front_process_fn() else {
         return false;
     };
     let mut psn = [0_u8; 8];
-    if !get_process_psn_for_window(window, pid, &mut psn)
-        || check_exact_activation_owner(pid, window, &mut check_activity).is_err()
-    {
+    if !get_process_psn_for_window(window, pid, &mut psn) {
         return false;
     }
-    if unsafe { set_front(psn.as_ptr() as *const c_void, window, 0x200) } != 0 {
-        return false;
+    exact_restoration_sequence(
+        check_activity,
+        |check| {
+            check_exact_activation_owner(pid, window, check).is_ok()
+                && unsafe { set_front(psn.as_ptr() as *const c_void, window, 0x200) } == 0
+        },
+        |mut check| post_exact_key_window_records_guarded(psn, window, || {
+            check_exact_activation_owner(pid, window, &mut check)
+        }).is_ok(),
+        |check| match complete_exact_ax_window_activation(pid, window, check) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(pid, window, %error, "exact foreground restoration AX completion failed");
+                false
+            }
+        },
+        |check| match await_exact_window_ready_guarded(pid, window, psn, check) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(pid, window, %error, "exact foreground restoration readiness failed");
+                false
+            }
+        },
+    )
+}
+
+/// Private, same-call restoration evidence. This never admits input and is not
+/// used by ordinary episodes or any successful prepare path.
+pub(crate) struct FailedPreparationFocus {
+    source: cua_driver_core::background_input::ExactWindowTarget,
+    original: cua_driver_core::background_input::ExactWindowTarget,
+    source_psn: [u8; 8],
+    original_psn: [u8; 8],
+}
+
+fn failed_preparation_owner_psn(
+    target: cua_driver_core::background_input::ExactWindowTarget,
+) -> anyhow::Result<[u8; 8]> {
+    let mut psn = [0; 8];
+    anyhow::ensure!(matches!(crate::windows::resolve_window_owner(target.pid, target.window_id),
+        crate::windows::WindowOwner::SamePid)
+        && get_process_psn_for_window(target.window_id, target.pid, &mut psn)
+        && psn != [0; 8], "failed preparation window/process identity unavailable");
+    Ok(psn)
+}
+
+impl FailedPreparationFocus {
+    pub(crate) fn capture(
+        source: cua_driver_core::background_input::ExactWindowTarget,
+        original: cua_driver_core::background_input::ExactWindowTarget,
+    ) -> anyhow::Result<Self> {
+        let source_psn = failed_preparation_owner_psn(source)?;
+        let original_psn = failed_preparation_owner_psn(original)?;
+        anyhow::ensure!((source.pid == original.pid) == (source_psn == original_psn),
+            "failed preparation process bindings disagree");
+        Ok(Self { source, original, source_psn, original_psn })
     }
-    if post_exact_key_window_records_guarded(psn, window, || {
-        check_exact_activation_owner(pid, window, &mut check_activity)
-    })
-    .is_err()
-    {
-        return false;
+
+    pub(crate) fn check(&self, phase: ExactRestorationPhase,
+        check_live: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.check_with(phase, check_live, failed_preparation_owner_psn,
+            || current_front_process_psn().ok_or_else(|| anyhow::anyhow!("restoration foreground unavailable")),
+            failed_preparation_focused_window)
     }
-    if let Err(error) = complete_exact_ax_window_activation(pid, window, &mut check_activity) {
-        tracing::warn!(pid, window, %error, "exact foreground restoration AX completion failed");
-        return false;
+
+    fn check_with(&self, phase: ExactRestorationPhase,
+        mut check_live: impl FnMut() -> anyhow::Result<()>,
+        mut identity: impl FnMut(cua_driver_core::background_input::ExactWindowTarget) -> anyhow::Result<[u8; 8]>,
+        mut front: impl FnMut() -> anyhow::Result<[u8; 8]>,
+        mut focus: impl FnMut(i32) -> anyhow::Result<Option<u32>>,
+    ) -> anyhow::Result<()> {
+        check_live()?;
+        anyhow::ensure!(identity(self.source)? == self.source_psn
+            && identity(self.original)? == self.original_psn, "restoration identity changed");
+        let before = front()?;
+        let pid = if before == self.source_psn { self.source.pid }
+            else if before == self.original_psn { self.original.pid }
+            else { anyhow::bail!("restoration foreground changed to another process"); };
+        let focused = focus(pid)?;
+        anyhow::ensure!(match focused {
+            Some(window) => (pid == self.source.pid && window == self.source.window_id)
+                || (pid == self.original.pid && window == self.original.window_id),
+            None => phase == ExactRestorationPhase::Handoff,
+        }, "restoration focus is absent before handoff or belongs to another window");
+        // A blocking AX read cannot carry its earlier process/lease evidence
+        // forward. Recheck both fixed owners and the same front PSN afterward.
+        anyhow::ensure!(identity(self.source)? == self.source_psn
+            && identity(self.original)? == self.original_psn && front()? == before,
+            "restoration identity or foreground changed during AX read");
+        check_live()
     }
-    match await_exact_window_ready_guarded(pid, window, psn, check_activity) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(pid, window, %error, "exact foreground restoration readiness failed");
-            false
+}
+
+fn failed_preparation_focus_status(status: i32, has_value: bool, valid_type: bool) -> anyhow::Result<bool> {
+    use crate::ax::bindings::{kAXErrorNoValue, kAXErrorSuccess};
+    if status == kAXErrorNoValue && !has_value { return Ok(false); }
+    anyhow::ensure!(status == kAXErrorSuccess && has_value && valid_type,
+        "restoration AXFocusedWindow read failed: AXError={status}, value={has_value}, valid_type={valid_type}");
+    Ok(true)
+}
+
+fn failed_preparation_focused_window(pid: i32) -> anyhow::Result<Option<u32>> {
+    use crate::ax::bindings::*;
+    use core_foundation::{base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType}, string::CFString};
+    let app = OwnedActivationAx(unsafe { AXUIElementCreateApplication(pid) });
+    bound_activation_ax(&app)?;
+    let name = CFString::new("AXFocusedWindow");
+    let mut value: CFTypeRef = std::ptr::null();
+    let status = unsafe { AXUIElementCopyAttributeValue(app.0, name.as_concrete_TypeRef(), &mut value) };
+    let valid_type = !value.is_null() && unsafe { CFGetTypeID(value) == AXUIElementGetTypeID() };
+    match failed_preparation_focus_status(status, !value.is_null(), valid_type) {
+        Ok(true) => {},
+        outcome => {
+            if !value.is_null() { unsafe { CFRelease(value) }; }
+            return outcome.map(|_| None);
         }
     }
+    let window = OwnedActivationAx(value as AXUIElementRef);
+    bound_activation_ax(&window)?;
+    background_ax_owner(&window, pid)?;
+    let id = unsafe { ax_get_window_id(window.0) }.filter(|id| *id != 0)
+        .ok_or_else(|| anyhow::anyhow!("restoration AX window identity unavailable"))?;
+    Ok(Some(id))
 }
 
 const FOREGROUND_AX_TIMEOUT_SECONDS: f32 = 0.1;
@@ -3925,6 +4056,153 @@ mod tests {
         complete_activation_with_bounded_cocoa_request, ExactActivationWindowUnavailable,
         ACTIVATION_WAIT_TIMEOUT,
     };
+
+    fn failed_preparation_model(fault: Option<(&str, usize)>) -> (bool, Vec<&'static str>) {
+        use super::{exact_restoration_sequence, ExactRestorationPhase, FailedPreparationFocus};
+        use cua_driver_core::background_input::ExactWindowTarget;
+        use std::cell::{Cell, RefCell};
+        let source = ExactWindowTarget { pid: 7, window_id: 70 };
+        let original = ExactWindowTarget { pid: 8, window_id: 80 };
+        let proof = FailedPreparationFocus { source, original, source_psn: [7; 8], original_psn: [8; 8] };
+        let front = Cell::new([7; 8]);
+        let focus = Cell::new(Some(70));
+        let live = Cell::new(true);
+        let stable_identity = Cell::new(true);
+        let ax_error = Cell::new(false);
+        let writes = RefCell::new(Vec::new());
+        let check = |phase| {
+            if let Some((kind, at)) = fault {
+                if writes.borrow().len() == at {
+                    match kind {
+                        "cancel" | "expired" => live.set(false),
+                        "third_process" => front.set([9; 8]),
+                        "sibling" => focus.set(Some(81)),
+                        "owner_changed" => stable_identity.set(false),
+                        "AX_error" => ax_error.set(true),
+                        _ => panic!("unknown fault"),
+                    }
+                }
+            }
+            proof.check_with(phase,
+                || { anyhow::ensure!(live.get(), "original lease/call ended"); Ok(()) },
+                |target| { anyhow::ensure!(stable_identity.get(), "owner changed"); Ok([target.pid as u8; 8]) },
+                || Ok(front.get()),
+                |pid| {
+                    assert_eq!([pid as u8; 8], front.get()); // AX queried for actual fixed front endpoint
+                    anyhow::ensure!(!ax_error.get(), "AX read failed");
+                    Ok(focus.get())
+                })
+        };
+        if check(ExactRestorationPhase::BeforeFrontRequest).is_err() { return (false, writes.into_inner()); }
+        let ok = exact_restoration_sequence(check,
+            |guard| {
+                if guard().is_err() { return false; }
+                writes.borrow_mut().push("0x200");
+                front.set([8; 8]);
+                focus.set(None); // real asynchronous process-before-AX transition
+                true
+            },
+            |guard| {
+                for label in ["key01", "key02"] {
+                    if guard().is_err() { return false; }
+                    writes.borrow_mut().push(label);
+                }
+                true
+            },
+            |guard| super::exact_ax_activation_steps(guard, |operation| {
+                writes.borrow_mut().push(operation);
+                if operation == "AXFocused" { focus.set(Some(80)); }
+                0
+            }, || panic!("no ambiguous AX write in this model")).is_ok(),
+            |guard| guard().is_ok() && front.get() == [8; 8] && focus.get() == Some(80));
+        (ok, writes.into_inner())
+    }
+
+    #[test]
+    fn failed_preparation_handoff_reaches_key_records_and_exact_ax_completion() {
+        let (ok, writes) = failed_preparation_model(None);
+        assert!(ok);
+        assert_eq!(writes, ["0x200", "key01", "key02", "AXRaise", "AXMain", "AXFocused"]);
+    }
+
+    #[test]
+    fn failed_preparation_handoff_stops_before_each_write_on_revocation_or_takeover() {
+        for kind in ["cancel", "expired", "third_process", "sibling", "owner_changed", "AX_error"] {
+            for at in 0..=6 {
+                let (ok, writes) = failed_preparation_model(Some((kind, at)));
+                assert!(!ok, "{kind} at {at}");
+                assert_eq!(writes.len(), at, "{kind} at {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_preparation_failed_front_request_never_enters_handoff() {
+        use super::{exact_restoration_sequence, ExactRestorationPhase};
+        use std::cell::RefCell;
+        let phases = RefCell::new(Vec::new());
+        assert!(!exact_restoration_sequence(|phase| { phases.borrow_mut().push(phase); Ok(()) },
+            |guard| { guard().unwrap(); false },
+            |_| panic!("failed process request must not post key records"),
+            |_| panic!("failed process request must not complete AX"),
+            |_| panic!("failed process request must not poll readiness")));
+        assert_eq!(*phases.borrow(), [ExactRestorationPhase::BeforeFrontRequest]);
+    }
+
+    #[test]
+    fn failed_preparation_handoff_rechecks_evidence_after_blocking_ax_read() {
+        use super::{ExactRestorationPhase, FailedPreparationFocus};
+        use cua_driver_core::background_input::ExactWindowTarget;
+        use std::cell::Cell;
+        for changed in ["front", "owner", "PSN", "lease"] {
+            let proof = FailedPreparationFocus {
+                source: ExactWindowTarget { pid: 7, window_id: 70 },
+                original: ExactWindowTarget { pid: 8, window_id: 80 },
+                source_psn: [7; 8], original_psn: [8; 8],
+            };
+            let read = Cell::new(false);
+            assert!(proof.check_with(ExactRestorationPhase::Handoff,
+                || { anyhow::ensure!(!(read.get() && changed == "lease"), "lease ended"); Ok(()) },
+                |target| {
+                    anyhow::ensure!(!(read.get() && changed == "owner"), "owner lost");
+                    Ok(if read.get() && changed == "PSN" { [9; 8] } else { [target.pid as u8; 8] })
+                },
+                || Ok(if read.get() && changed == "front" { [9; 8] } else { [8; 8] }),
+                |pid| { assert_eq!(pid, 8); read.set(true); Ok(None) }).is_err(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn failed_preparation_handoff_does_not_admit_siblings_or_cross_pid_window_ids() {
+        use super::{ExactRestorationPhase, FailedPreparationFocus};
+        use cua_driver_core::background_input::ExactWindowTarget;
+        for same_pid in [false, true] {
+            let pid = if same_pid { 7 } else { 8 };
+            let proof = FailedPreparationFocus {
+                source: ExactWindowTarget { pid: 7, window_id: 70 },
+                original: ExactWindowTarget { pid, window_id: 80 },
+                source_psn: [7; 8], original_psn: [pid as u8; 8],
+            };
+            for phase in [ExactRestorationPhase::BeforeFrontRequest, ExactRestorationPhase::Handoff] {
+                for (focused, allowed) in [(Some(70), same_pid), (Some(80), true), (Some(81), false),
+                    (None, phase == ExactRestorationPhase::Handoff)] {
+                    assert_eq!(proof.check_with(phase, || Ok(()), |target| Ok([target.pid as u8; 8]),
+                        || Ok([pid as u8; 8]), |queried| { assert_eq!(queried, pid); Ok(focused) }).is_ok(), allowed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_preparation_focus_status_accepts_only_explicit_empty_no_value() {
+        use super::failed_preparation_focus_status;
+        assert!(!failed_preparation_focus_status(-25212, false, false).unwrap());
+        assert!(failed_preparation_focus_status(0, true, true).unwrap());
+        for (status, value, correct_type) in [(0, false, false), (0, true, false),
+            (-25212, true, true), (-25205, false, false), (-25204, false, false), (-25202, false, false)] {
+            assert!(failed_preparation_focus_status(status, value, correct_type).is_err());
+        }
+    }
 
     #[test]
     fn restoration_completion_accepts_only_original_visible_foreground_window() {
