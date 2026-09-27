@@ -3450,6 +3450,34 @@ fn complete_proven_standard_dialog_activation(
     complete()
 }
 
+// Observe only the result and clock values of an already completed probe.
+// Expiry can coexist with an AX failure/change; it is not its first-cause proof.
+// In particular, never turn a returned Some into None because this log is late.
+fn trace_standard_dialog_probe(
+    target_pid: i32,
+    target_wid: u32,
+    phase: &'static str,
+    publication_started: std::time::Instant,
+    started: std::time::Instant,
+    finished: std::time::Instant,
+    host_id: Option<u32>,
+    expected_host_id: Option<u32>,
+) {
+    let deadline = publication_started + ACTIVATION_WAIT_TIMEOUT;
+    tracing::debug!(
+        target: "cua_focus_restore",
+        target_pid, target_wid, phase, host_id = ?host_id, expected_host_id = ?expected_host_id,
+        start_elapsed_us = started.duration_since(publication_started).as_micros() as u64,
+        end_elapsed_us = finished.duration_since(publication_started).as_micros() as u64,
+        elapsed_us = finished.duration_since(started).as_micros() as u64,
+        remaining_before_us = deadline.saturating_duration_since(started).as_micros() as u64,
+        remaining_after_us = deadline.saturating_duration_since(finished).as_micros() as u64,
+        deadline_expired_before = started >= deadline,
+        deadline_expired_after = finished >= deadline,
+        "Standard dialog activation proof probe"
+    );
+}
+
 fn with_foreground_hid_activation_inner(
     target_pid: libc::pid_t,
     target_wid: u32,
@@ -3512,9 +3540,13 @@ fn with_foreground_hid_activation_inner(
             // original later AX phase. Never start a fresh discovery budget.
             let standard_dialog_probe = if keyboard_target && !hidden_panel {
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
+                let probe_started = std::time::Instant::now();
                 let probe = crate::ax::attached_sheet::probe_standard_dialog_before(
                     target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
                 );
+                let probe_finished = std::time::Instant::now();
+                trace_standard_dialog_probe(target_pid, target_wid, "initial_discovery",
+                    publication_started, probe_started, probe_finished, probe.host_id, None);
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
                 anyhow::ensure!(publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
                     "standard dialog discovery exceeded the foreground activation budget");
@@ -3571,9 +3603,16 @@ fn with_foreground_hid_activation_inner(
                 complete_proven_standard_dialog_activation(
                     host_id,
                     || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
-                    || crate::ax::attached_sheet::focused_dialog_host_before(
-                        target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
-                    ),
+                    || {
+                        let probe_started = std::time::Instant::now();
+                        let current_host = crate::ax::attached_sheet::focused_dialog_host_before(
+                            target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
+                        );
+                        let probe_finished = std::time::Instant::now();
+                        trace_standard_dialog_probe(target_pid, target_wid, "before_ax_activation",
+                            publication_started, probe_started, probe_finished, current_host, Some(host_id));
+                        current_host
+                    },
                     || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
                 )
             } else { complete_activation_with_bounded_cocoa_request(
