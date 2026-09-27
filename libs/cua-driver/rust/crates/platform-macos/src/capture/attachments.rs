@@ -6,8 +6,8 @@
 use crate::ax::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, element_screen_rect,
     kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXErrorSuccess, AXError,
-    AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementGetTypeID, AXUIElementRef,
-    AXUIElementSetMessagingTimeout,
+    AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementGetPid,
+    AXUIElementGetTypeID, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use crate::windows::WindowInfo;
 use core_foundation::{
@@ -55,6 +55,9 @@ trait Tree {
     fn frame(&self, node: &Self::Node) -> Option<[f64; 4]>;
     fn parent(&self, node: &Self::Node) -> Option<Self::Node>;
     fn window(&self, node: &Self::Node) -> Option<Self::Node>;
+    // Only the Outline-menu route permits an explicitly absent leaf AXWindow.
+    // Unlike window(), an error or malformed value must never become absence.
+    fn menu_window(&self, node: &Self::Node) -> Result<Option<Self::Node>, DiscoveryStop>;
     fn children(&self, node: &Self::Node) -> Result<Vec<Self::Node>, DiscoveryStop>;
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn popover(&self, node: &Self::Node, pid: i32, host: u32) -> bool;
@@ -577,6 +580,213 @@ fn collect_focused_collection_popover<T: Tree>(
     result
 }
 
+fn outline_structure(role: &str) -> bool {
+    matches!(role, "AXGroup" | "AXSplitGroup" | "AXLayoutArea" | "AXScrollArea")
+}
+
+fn charge_outline_node<T: Tree>(
+    tree: &T,
+    visited: &mut Vec<T::Node>,
+    node: &T::Node,
+) -> Result<(), DiscoveryStop> {
+    budget(tree)?;
+    if !visited.iter().any(|prior| tree.same(prior, node)) {
+        if visited.len() >= MAX_NODES {
+            return Err(DiscoveryStop::NodeLimit);
+        }
+        visited.push(node.clone());
+    }
+    Ok(())
+}
+
+// No row/cell/button/provider traversal. Every structural node, including the
+// terminal Outline, must positively inherit this exact physical and AX host.
+fn outline_path_members<T: Tree>(
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    path: &[T::Node],
+) -> Result<Option<Vec<(i32, String)>>, DiscoveryStop> {
+    budget(tree)?;
+    if path.len() < 2 || path.len() > MAX_DEPTH || !surface_matches(tree, &path[0], host) {
+        budget(tree)?;
+        return Ok(None);
+    }
+    let mut members = Vec::new();
+    for (index, node) in path.iter().enumerate() {
+        budget(tree)?;
+        if path[..index].iter().any(|prior| tree.same(prior, node)) {
+            return Err(DiscoveryStop::Cycle);
+        }
+        let Some(role) = tree.role(node) else { return Err(DiscoveryStop::AxUnavailable) };
+        let allowed = if index == 0 { role == "AXWindow" } else {
+            outline_structure(&role) || (index + 1 == path.len() && role == "AXOutline")
+        };
+        if !allowed || tree.owner(node) != Some(pid) || tree.id(node) != Some(host.window_id) {
+            budget(tree)?;
+            return Ok(None);
+        }
+        if index > 0 && (!tree.window(node).is_some_and(|root| tree.same(&root, &path[0]))
+            || !reciprocal_edge(tree, &path[index - 1], node)?)
+        {
+            budget(tree)?;
+            return Ok(None);
+        }
+        members.push((pid, role));
+    }
+    budget(tree)?;
+    Ok(Some(members))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OutlineMenuProof {
+    menu: MenuProof,
+    leaf_window_present: bool,
+}
+
+fn prove_outline_menu<T: Tree>(
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    path: &[T::Node],
+    windows: &[WindowInfo],
+) -> Result<Option<OutlineMenuProof>, DiscoveryStop> {
+    budget(tree)?;
+    if path.len() < 3 || path.len() > MAX_DEPTH { return Ok(None) }
+    let prefix = &path[..path.len() - 1];
+    let Some(mut members) = outline_path_members(tree, pid, host, prefix)? else { return Ok(None) };
+    if members.last().map(|(_, role)| role.as_str()) != Some("AXOutline") { return Ok(None) }
+    let leaf = path.last().expect("nonempty Outline menu path");
+    if tree.role(leaf).as_deref() != Some("AXMenu") || tree.owner(leaf) != Some(pid)
+        || tree.id(leaf) != Some(host.window_id)
+        || prefix.iter().any(|node| tree.same(node, leaf))
+        || !reciprocal_edge(tree, prefix.last().expect("Outline anchor"), leaf)?
+    {
+        budget(tree)?;
+        return Ok(None);
+    }
+    let logical = tree.menu_window(leaf)?;
+    if logical.as_ref().is_some_and(|root| !tree.same(root, &path[0])) { return Ok(None) }
+    let Some(frame) = tree.frame(leaf) else { budget(tree)?; return Ok(None) };
+    if !frame.iter().all(|v| v.is_finite()) || frame[2] <= 0.0 || frame[3] <= 0.0 { return Ok(None) }
+    let mut matches = windows.iter().filter(|window| {
+        let b = &window.bounds;
+        window.pid == pid && window.window_id != 0 && window.window_id != host.window_id
+            && matches!(window.layer, 0 | 101) && window.is_on_screen
+            && window.on_current_space != Some(false)
+            && frame.iter().zip([b.x, b.y, b.width, b.height])
+                .all(|(ax, cg)| cg.is_finite() && (ax - cg).abs() <= 0.5)
+    });
+    let Some(menu) = matches.next() else { budget(tree)?; return Ok(None) };
+    if menu.layer != 101 || matches.next().is_some()
+        || exact_window(windows, pid, menu.window_id).is_none()
+        || !tree.current_space(menu.window_id)
+    {
+        budget(tree)?;
+        return Ok(None);
+    }
+    members.push((pid, "AXMenu".into()));
+    budget(tree)?;
+    Ok(Some(OutlineMenuProof {
+        menu: MenuProof { id: menu.window_id, members, frame: frame.map(f64::to_bits) },
+        leaf_window_present: logical.is_some(),
+    }))
+}
+
+fn collect_outline_menus<T: Tree>(
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    root: &T::Node,
+    windows: &[WindowInfo],
+    visited: &mut Vec<T::Node>,
+    seeds: &[Vec<T::Node>],
+) -> Result<Vec<u32>, DiscoveryStop> {
+    if seeds.is_empty() || !windows.iter().any(|window| window.pid == pid
+        && window.window_id != 0 && window.window_id != host.window_id && window.layer == 101
+        && window.is_on_screen && window.on_current_space != Some(false))
+    {
+        return Ok(Vec::new());
+    }
+    let mut queue = VecDeque::from(seeds.to_vec());
+    let mut entered = Vec::new();
+    let mut admitted: Vec<(Vec<T::Node>, OutlineMenuProof)> = Vec::new();
+    while let Some(path) = queue.pop_front() {
+        budget(tree)?;
+        if path.len() > MAX_DEPTH { return Err(DiscoveryStop::DepthLimit) }
+        let node = path.last().ok_or(DiscoveryStop::Changed)?;
+        charge_outline_node(tree, visited, node)?;
+        if entered.iter().any(|prior| tree.same(prior, node)) { return Err(DiscoveryStop::Cycle) }
+        entered.push(node.clone());
+        let Some(members) = outline_path_members(tree, pid, host, &path)? else {
+            // An unproven retained prefix never becomes a search authority.
+            return Ok(Vec::new());
+        };
+        let is_outline = members.last().map(|(_, role)| role.as_str()) == Some("AXOutline");
+        let children = tree.children(node)?;
+        if children.len() > MAX_CHILDREN { return Err(DiscoveryStop::ChildLimit) }
+        for child in children {
+            charge_outline_node(tree, visited, &child)?;
+            let role = tree.role(&child).ok_or(DiscoveryStop::AxUnavailable)?;
+            if role.is_empty() || role == "AXUnknown" { return Err(DiscoveryStop::AxUnavailable) }
+            if is_outline {
+                if role != "AXMenu" { continue } // Never read rows/cells or submenu contents.
+                if path.len() == MAX_DEPTH { return Err(DiscoveryStop::DepthLimit) }
+                let mut candidate = path.clone(); candidate.push(child);
+                if let Some(proof) = prove_outline_menu(tree, pid, host, &candidate, windows)? {
+                    if admitted.len() >= MAX_ATTACHMENTS { return Err(DiscoveryStop::AttachmentLimit) }
+                    if admitted.iter().any(|(_, prior)| prior.menu.id == proof.menu.id) {
+                        return Err(DiscoveryStop::Changed);
+                    }
+                    admitted.push((candidate, proof));
+                }
+            } else if outline_structure(&role) || role == "AXOutline" {
+                if path.len() == MAX_DEPTH { return Err(DiscoveryStop::DepthLimit) }
+                if !reciprocal_edge(tree, node, &child)? { return Err(DiscoveryStop::Changed) }
+                let mut next = path.clone(); next.push(child); queue.push_back(next);
+            }
+        }
+    }
+    budget(tree)?;
+    if admitted.is_empty() { return Ok(Vec::new()) }
+    let fresh = tree.fresh_windows().ok_or(DiscoveryStop::Changed)?;
+    let live_host = exact_window(&fresh, pid, host.window_id).ok_or(DiscoveryStop::Changed)?;
+    if !same_identity(host, live_host) || !tree.same(root, &exact_root(tree, live_host)?) {
+        return Err(DiscoveryStop::Changed);
+    }
+    let mut ids = Vec::new();
+    for (path, proof) in admitted {
+        let id = proof.menu.id;
+        let before = exact_window(windows, pid, id).ok_or(DiscoveryStop::Changed)?;
+        let after = exact_window(&fresh, pid, id).ok_or(DiscoveryStop::Changed)?;
+        if !same_identity(before, after)
+            || prove_outline_menu(tree, pid, live_host, &path, &fresh)? != Some(proof)
+        {
+            return Err(DiscoveryStop::Changed);
+        }
+        ids.push(id);
+    }
+    budget(tree)?;
+    ids.sort_unstable(); ids.dedup();
+    Ok(ids)
+}
+
+fn collect_after_legacy_empty<T: Tree>(
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    root: &T::Node,
+    windows: &[WindowInfo],
+    visited: &mut Vec<T::Node>,
+    seeds: &[Vec<T::Node>],
+) -> Result<Vec<u32>, DiscoveryStop> {
+    let ids = collect_focused_collection_popover(tree, pid, host, root, windows, visited)?;
+    if !ids.is_empty() { return Ok(ids) }
+    let result = collect_outline_menus(tree, pid, host, root, windows, visited, seeds);
+    budget(tree)?;
+    result
+}
+
 fn collect<T: Tree>(
     tree: &T,
     pid: i32,
@@ -590,6 +800,9 @@ fn collect<T: Tree>(
     // result is returned unchanged; unrelated menu/provider work cannot lose it.
     let mut queue = VecDeque::from([(vec![root.clone()], false)]);
     let mut deferred = Vec::new();
+    // Retain existing stop points without querying anything new. They are used
+    // only after all established attachment routes have returned empty.
+    let mut outline_seeds = Vec::new();
     let mut menu_phase = false;
     let mut provider_menu_phase = false;
     let mut visited: Vec<T::Node> = Vec::new();
@@ -630,6 +843,9 @@ fn collect<T: Tree>(
             let Some(role) = tree.role(node) else {
                 continue;
             };
+            if !menu_phase && matches!(role.as_str(), "AXOutline" | "AXLayoutArea") {
+                outline_seeds.push(path.clone());
+            }
             if role == "AXMenu" {
                 if !menu_phase {
                     deferred.push((path, false));
@@ -713,7 +929,7 @@ fn collect<T: Tree>(
                 && window.is_on_screen && window.on_current_space != Some(false))
         {
             return if ids.is_empty() {
-                collect_focused_collection_popover(tree, pid, host, &root, windows, &mut visited)
+                collect_after_legacy_empty(tree, pid, host, &root, windows, &mut visited, &outline_seeds)
             } else {
                 Ok(ids)
             };
@@ -731,7 +947,7 @@ fn collect<T: Tree>(
             .filter(|(_, foreign)| provider_menu_phase || !foreign)
             .map(|(path, _)| (path, true)).collect();
         if queue.is_empty() {
-            return collect_focused_collection_popover(tree, pid, host, &root, windows, &mut visited);
+            return collect_after_legacy_empty(tree, pid, host, &root, windows, &mut visited, &outline_seeds);
         }
     }
 }
@@ -772,6 +988,15 @@ struct Native {
     deadline: Instant,
     spaces: crate::input::skylight::SpaceQuery,
 }
+
+fn menu_window_value_kind(status: AXError, has_value: bool, is_element: bool) -> Result<bool, DiscoveryStop> {
+    match (status, has_value, is_element) {
+        (kAXErrorSuccess, true, true) => Ok(true),
+        (kAXErrorNoValue, false, _) => Ok(false),
+        _ => Err(DiscoveryStop::AxUnavailable),
+    }
+}
+
 impl Native {
     fn ready(&self, node: &Node) -> bool {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
@@ -898,6 +1123,22 @@ impl Tree for Native {
     fn window(&self, node: &Node) -> Option<Node> {
         self.relation(node, "AXWindow")
     }
+    fn menu_window(&self, node: &Node) -> Result<Option<Node>, DiscoveryStop> {
+        if !self.ready(node) { return Err(DiscoveryStop::Deadline) }
+        let attribute = CFString::new("AXWindow");
+        let mut raw: CFTypeRef = std::ptr::null();
+        let status = unsafe { AXUIElementCopyAttributeValue(node.0, attribute.as_concrete_TypeRef(), &mut raw) };
+        let kind = menu_window_value_kind(status, !raw.is_null(), !raw.is_null()
+            && unsafe { CFGetTypeID(raw) == AXUIElementGetTypeID() });
+        if kind == Ok(true) {
+            let retained = Node(raw as AXUIElementRef);
+            budget(self)?;
+            return Ok(Some(retained));
+        }
+        if !raw.is_null() { unsafe { CFRelease(raw) }; }
+        budget(self)?;
+        kind.map(|_| None)
+    }
     fn children(&self, node: &Node) -> Result<Vec<Node>, DiscoveryStop> {
         self.array(node, "AXChildren", MAX_CHILDREN)
     }
@@ -1020,6 +1261,8 @@ mod tests {
         focused: Option<u32>,
         focused_calls: Cell<usize>,
         expire_on_focus: bool,
+        menu_window_calls: Cell<usize>,
+        menu_window_errors: HashSet<u32>,
     }
     fn window(id: u32) -> WindowInfo {
         WindowInfo {
@@ -1112,6 +1355,8 @@ mod tests {
             focused: None,
             focused_calls: Cell::new(0),
             expire_on_focus: false,
+            menu_window_calls: Cell::new(0),
+            menu_window_errors: HashSet::new(),
         }
     }
     impl Fake {
@@ -1173,6 +1418,11 @@ mod tests {
         }
         fn window(&self, n: &u32) -> Option<u32> {
             self.fact(n)?.window
+        }
+        fn menu_window(&self, n: &u32) -> Result<Option<u32>, DiscoveryStop> {
+            self.menu_window_calls.set(self.menu_window_calls.get() + 1);
+            if self.menu_window_errors.contains(n) { return Err(DiscoveryStop::AxUnavailable) }
+            Ok(self.fact(n).ok_or(DiscoveryStop::AxUnavailable)?.window)
         }
         fn children(&self, n: &u32) -> Result<Vec<u32>, DiscoveryStop> {
             self.children_calls.borrow_mut().push(*n);
@@ -2108,5 +2358,191 @@ mod tests {
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
             assert_eq!(t.proof_calls.get(), 0);
         }
+    }
+
+    fn outline_menu() -> Fake {
+        let mut t = popover();
+        t.nodes.remove(&3);
+        for (id, role, parent, children) in [
+            (2, "AXSplitGroup", 1, vec![5, 6]),
+            (5, "AXScrollArea", 2, vec![7]),
+            (7, "AXOutline", 5, vec![8, 4]),
+            (8, "AXRow", 7, vec![]),
+            (6, "AXLayoutArea", 2, vec![9]),
+            (9, "AXScrollArea", 6, vec![11]),
+            (11, "AXOutline", 9, vec![]),
+        ] {
+            t.nodes.insert(id, Fact { role, owner: 42, id: 10,
+                parent: Some(parent), window: Some(1), children });
+        }
+        t.nodes.insert(4, Fact { role: "AXMenu", owner: 42, id: 10,
+            parent: Some(7), window: None, children: vec![] });
+        t.frames.insert(4, [130.0, 140.0, 90.0, 80.0]);
+        let menu = &mut t.windows[1];
+        menu.layer = 101;
+        menu.bounds.x = 130.0; menu.bounds.y = 140.0;
+        menu.bounds.width = 90.0; menu.bounds.height = 80.0;
+        // Actual focus may remain in the other content Outline. It is no
+        // authority for selecting the sidebar menu.
+        t.focused = Some(11);
+        t
+    }
+
+    #[test]
+    fn outline_menu_is_reachable_with_content_outline_focused_and_absent_leaf_window() {
+        for logical in [None, Some(1)] {
+            let mut t = outline_menu();
+            t.nodes.get_mut(&4).unwrap().window = logical;
+            t.children_errors.extend([8, 4]); // No row or menu-item traversal.
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
+            assert_eq!(t.menu_window_calls.get(), 2, "fresh leaf relationship each proof");
+            assert_eq!(t.refresh_count.get(), 2);
+            assert!(!t.children_calls.borrow().iter().any(|node| [8, 4].contains(node)));
+        }
+        assert!(!container("AXOutline"));
+        assert!(!container("AXLayoutArea"));
+    }
+
+    #[test]
+    fn outline_menu_leaf_absence_never_swallows_ax_errors_or_malformed_values() {
+        assert_eq!(menu_window_value_kind(kAXErrorNoValue, false, false), Ok(false));
+        assert_eq!(menu_window_value_kind(kAXErrorSuccess, true, true), Ok(true));
+        for (status, has_value, is_element) in [
+            (kAXErrorSuccess, false, false), (kAXErrorSuccess, true, false),
+            (kAXErrorNoValue, true, true), (kAXErrorAttributeUnsupported, false, false),
+            (-25204, false, false),
+        ] {
+            assert_eq!(menu_window_value_kind(status, has_value, is_element), Err(DiscoveryStop::AxUnavailable));
+        }
+        let mut t = outline_menu(); t.menu_window_errors.insert(4);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
+    }
+
+    #[test]
+    fn outline_menu_requires_every_host_identity_and_reciprocal_edge() {
+        for node in [2, 5, 7, 4] {
+            for case in 0..5 {
+                let mut t = outline_menu(); let fact = t.nodes.get_mut(&node).unwrap();
+                match case {
+                    0 => fact.owner = 77,
+                    1 => fact.id = 20,
+                    2 => fact.id = 0,
+                    3 => fact.window = Some(5), // A same-PID node is not the retained root.
+                    _ => fact.parent = Some(1),
+                }
+                // Node2 is already a direct host child; use a genuinely changed edge.
+                if case == 4 && node == 2 { t.nodes.get_mut(&node).unwrap().parent = Some(7); }
+                assert!(!matches!(collect(&t, 42, 10, &t.windows), Ok(ids) if !ids.is_empty()), "node {node} case {case}");
+            }
+        }
+        for role in ["AXCell", "AXRow", "AXWebArea", "AXTable", "AXButton", "AXSheet", "AXWindow"] {
+            let mut t = outline_menu(); t.nodes.get_mut(&5).unwrap().role = role;
+            assert!(!matches!(collect(&t, 42, 10, &t.windows), Ok(ids) if !ids.is_empty()), "role {role}");
+        }
+        let mut t = outline_menu(); t.nodes.get_mut(&7).unwrap().children.push(4);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]));
+    }
+
+    #[test]
+    fn outline_menu_requires_unique_visible_current_space_layer101_geometry() {
+        for case in 0..8 {
+            let mut t = outline_menu();
+            match case {
+                0 => t.windows[1].layer = 0,
+                1 => t.windows[1].pid = 77,
+                2 => t.windows[1].is_on_screen = false,
+                3 => t.windows[1].on_current_space = Some(false),
+                4 => { t.current.remove(&20); }
+                5 => t.windows[1].bounds.width += 1.0,
+                6 => { let mut duplicate = t.windows[1].clone(); duplicate.window_id = 30; t.windows.push(duplicate); }
+                _ => { let mut duplicate = t.windows[1].clone(); duplicate.window_id = 30; duplicate.layer = 0; t.windows.push(duplicate); }
+            }
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
+        }
+        let mut t = outline_menu(); let mut duplicate = t.nodes[&4].clone();
+        duplicate.parent = Some(7); t.nodes.insert(30, duplicate);
+        t.frames.insert(30, t.frames[&4]); t.nodes.get_mut(&7).unwrap().children.push(30);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Changed));
+    }
+
+    #[test]
+    fn outline_menu_shares_node_child_depth_and_deadline_limits() {
+        let t = outline_menu(); let mut visited = (100..100 + MAX_NODES as u32).collect();
+        assert_eq!(collect_outline_menus(&t, 42, &t.windows[0], &1, &t.windows,
+            &mut visited, &[vec![1, 2, 5, 7]]), Err(DiscoveryStop::NodeLimit));
+        assert_eq!(collect_outline_menus(&t, 42, &t.windows[0], &1, &t.windows,
+            &mut vec![1, 2], &[vec![1, 2, 2]]), Err(DiscoveryStop::Cycle));
+        let mut t = outline_menu(); t.nodes.get_mut(&7).unwrap().children = vec![4; MAX_CHILDREN + 1];
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::ChildLimit));
+        let mut t = outline_menu(); t.expire_on_id = Some(7);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Deadline));
+        let mut t = outline_menu(); t.nodes.get_mut(&6).unwrap().children = vec![100];
+        for n in 100..112 {
+            t.nodes.insert(n, Fact { role: "AXGroup", owner: 42, id: 10,
+                parent: Some(if n == 100 { 6 } else { n - 1 }), window: Some(1),
+                children: if n == 111 { vec![] } else { vec![n + 1] } });
+        }
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::DepthLimit));
+    }
+
+    #[test]
+    fn outline_menu_discards_proven_ids_on_incomplete_other_structural_branch() {
+        // The original BFS retains Layout6 before Outline7. Reorder the retained
+        // seeds explicitly so this checks failure AFTER a menu was proven.
+        for read_error in [false, true] {
+            let mut t = outline_menu();
+            let expected = if read_error {
+                t.children_errors.insert(6);
+                Err(DiscoveryStop::AxUnavailable)
+            } else {
+                t.nodes.get_mut(&6).unwrap().window = Some(2);
+                Ok(vec![])
+            };
+            assert_eq!(collect_outline_menus(&t, 42, &t.windows[0], &1, &t.windows,
+                &mut vec![1, 2, 5, 7, 6], &[vec![1, 2, 5, 7], vec![1, 2, 6]]), expected);
+            assert_eq!(t.menu_window_calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn outline_menu_revalidates_leaf_edges_role_root_and_cg_after_discovery() {
+        for case in 0..8 {
+            let mut t = outline_menu(); t.change_on_refresh = 2;
+            match case {
+                0 => { let mut leaf = t.nodes[&4].clone(); leaf.parent = Some(1); t.changed_node = Some((4, leaf)); }
+                1 => { let mut leaf = t.nodes[&4].clone(); leaf.window = Some(1); t.changed_node = Some((4, leaf)); }
+                2 => { let mut anchor = t.nodes[&7].clone(); anchor.children.clear(); t.changed_node = Some((7, anchor)); }
+                3 => { let mut prefix = t.nodes[&5].clone(); prefix.role = "AXGroup"; t.changed_node = Some((5, prefix)); }
+                4 => t.changed_frame = Some((4, [130.0, 140.0, 91.0, 80.0])),
+                5 => { let mut windows = t.windows.clone(); windows[1].bounds.x += 1.0; t.changed_windows = Some(windows); }
+                6 => { t.nodes.insert(31, t.nodes[&1].clone()); t.changed_roots = Some(vec![31]); }
+                _ => t.expire_after_refresh = true,
+            }
+            let result = collect(&t, 42, 10, &t.windows);
+            assert_eq!(result, Err(if case == 7 { DiscoveryStop::Deadline } else { DiscoveryStop::Changed }), "case {case}");
+        }
+    }
+
+    #[test]
+    fn outline_fallback_adds_no_queries_after_existing_success_or_error() {
+        for kind in 0..4 {
+            let mut t = match kind { 0 => popover(), 1 => native_menu(), 2 => collection_popover(), _ => layer_zero_menu() };
+            t.nodes.get_mut(&1).unwrap().children.push(50);
+            t.nodes.insert(50, Fact { role: "AXLayoutArea", owner: 42, id: 10,
+                parent: Some(1), window: Some(1), children: vec![51] });
+            t.children_errors.insert(50); t.expire_on_id = Some(50);
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]), "route {kind}");
+            assert_eq!(t.menu_window_calls.get(), 0);
+            assert!(!t.children_calls.borrow().contains(&50));
+        }
+        let mut t = outline_menu(); t.children_errors.insert(1);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
+        assert_eq!(t.menu_window_calls.get(), 0);
+        assert!(!t.children_calls.borrow().contains(&7));
+        let mut t = collection_popover();
+        t.windows[1].layer = 101;
+        t.children_errors.insert(9);
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
+        assert_eq!(t.menu_window_calls.get(), 0, "H141 errors also retain priority");
     }
 }
