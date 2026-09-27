@@ -1397,6 +1397,46 @@ struct ExternalEventEvidence {
     event_type: u32,
     source_pid: i64,
     driver_marker_matches: bool,
+    target_hints: Option<EventTargetHints>,
+}
+
+/// Fixed-size raw hints from the existing Session/head/listen-only tap, not
+/// proof of the receiving window or actor. Zero is retained, never promoted to
+/// identity evidence (source-state zero can also be a defined CG state).
+/// Under-pointer fields are inapplicable to keyboard/control events. Nothing
+/// here participates in classification, activity accounting or admission.
+#[derive(Clone, Copy)]
+struct EventTargetHints {
+    target_psn_raw: i64,
+    target_pid_raw: i64,
+    source_state_raw: i64,
+    window_under_pointer_raw: Option<i64>,
+    window_that_can_handle_raw: Option<i64>,
+    generation_after_event: u64,
+    non_motion_generation_after_event: u64,
+}
+
+impl EventTargetHints {
+    fn capture(
+        event_type: u32,
+        activity: OrderingSnapshot,
+        mut read: impl FnMut(u32) -> i64,
+    ) -> Self {
+        // Public CGEventType mouse buttons/moves/drags and scroll wheel only.
+        let pointer_event = matches!(event_type, 1..=7 | 22 | 25..=27);
+        Self {
+            target_psn_raw: read(EventField::EVENT_TARGET_PROCESS_SERIAL_NUMBER),
+            target_pid_raw: read(EventField::EVENT_TARGET_UNIX_PROCESS_ID),
+            source_state_raw: read(EventField::EVENT_SOURCE_STATE_ID),
+            window_under_pointer_raw: pointer_event
+                .then(|| read(EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER)),
+            window_that_can_handle_raw: pointer_event.then(|| {
+                read(EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER_THAT_CAN_HANDLE_THIS_EVENT)
+            }),
+            generation_after_event: activity.activity.generation,
+            non_motion_generation_after_event: activity.non_motion_generation,
+        }
+    }
 }
 
 impl ExternalEventEvidence {
@@ -1412,6 +1452,7 @@ impl ExternalEventEvidence {
             event_type,
             source_pid,
             driver_marker_matches,
+            target_hints: None,
         })
     }
 
@@ -1422,6 +1463,25 @@ impl ExternalEventEvidence {
             "source_pid": self.source_pid,
             "driver_marker_matches": self.driver_marker_matches,
         })
+    }
+
+    /// Internal failure-log projection only. Keep `diagnostic` unchanged for
+    /// existing callers/returns. This is still the latest event, not necessarily
+    /// the first event that revoked a guard; later monitor gaps can also revoke it.
+    fn ordering_diagnostic(self, now_ms: u64) -> serde_json::Value {
+        let mut result = self.diagnostic(now_ms);
+        if let Some(hints) = self.target_hints {
+            result["session_tap_target_hints"] = serde_json::json!({
+                "target_psn_raw": hints.target_psn_raw,
+                "target_pid_raw": hints.target_pid_raw,
+                "source_state_raw": hints.source_state_raw,
+                "window_under_pointer_raw": hints.window_under_pointer_raw,
+                "window_that_can_handle_raw": hints.window_that_can_handle_raw,
+                "generation_after_event": hints.generation_after_event,
+                "non_motion_generation_after_event": hints.non_motion_generation_after_event,
+            });
+        }
+        result
     }
 }
 
@@ -1641,7 +1701,15 @@ unsafe extern "C" fn observe_event(
                 Source::Unknown
             },
         );
-        if let Some(external) = external {
+        if let Some(mut external) = external {
+            // Classification and accounting above are complete and unchanged.
+            // Read only scalar event fields: no AX, hit-test, allocation, or log
+            // I/O in the tap. Both counters are read under the existing lock.
+            external.target_hints = Some(EventTargetHints::capture(
+                kind,
+                state.ordering_snapshot(now_ms),
+                |field| CGEventGetIntegerValueField(event.cast(), field),
+            ));
             *external_event_evidence()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = Some(external);
@@ -1798,6 +1866,15 @@ pub(crate) fn generation_is_current(generation: u64) -> bool {
 }
 
 pub(crate) fn diagnostic_state() -> serde_json::Value {
+    diagnostic_state_with_target_hints(false)
+}
+
+/// Used only by background-order veto logging, never policy or public results.
+pub(crate) fn ordering_diagnostic_state() -> serde_json::Value {
+    diagnostic_state_with_target_hints(true)
+}
+
+fn diagnostic_state_with_target_hints(include_target_hints: bool) -> serde_json::Value {
     let current = snapshot();
     let mut result = diagnostic_state_from_snapshot(current);
     result["generation"] = serde_json::json!(current.generation);
@@ -1805,14 +1882,27 @@ pub(crate) fn diagnostic_state() -> serde_json::Value {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
     {
-        result["last_external_event"] = last.diagnostic(clock_ms());
+        result["last_external_event"] = if include_target_hints {
+            last.ordering_diagnostic(clock_ms())
+        } else {
+            last.diagnostic(clock_ms())
+        };
     }
     result
 }
 
 #[cfg(test)]
 mod external_event_diagnostic_tests {
-    use super::ExternalEventEvidence;
+    use super::{record_native_activity, EventTargetHints, ExternalEventEvidence};
+    use cua_driver_core::foreground_activity::{Activity, EpisodeLease, Source};
+
+    fn covered() -> Activity {
+        let mut state = Activity::default();
+        for time in (0..=5_000).step_by(100) {
+            state.health(time, true);
+        }
+        state
+    }
 
     #[test]
     fn own_tagged_input_does_not_replace_external_evidence() {
@@ -1838,6 +1928,87 @@ mod external_event_diagnostic_tests {
                 "driver_marker_matches": false,
             })
         );
+    }
+
+    #[test]
+    fn target_hint_reads_are_bounded_and_exclude_mouse_fields_on_other_events() {
+        let activity = covered().ordering_snapshot(5_000);
+        for kind in [1, 2, 3, 4, 5, 6, 7, 22, 25, 26, 27, 0, 10, 11, 12, 23, 24, u32::MAX] {
+            let mut reads = Vec::new();
+            let hints = EventTargetHints::capture(kind, activity, |field| {
+                reads.push(field);
+                i64::from(field)
+            });
+            let pointer = matches!(kind, 1..=7 | 22 | 25..=27);
+            assert_eq!(reads, if pointer { vec![39, 40, 45, 91, 92] } else { vec![39, 40, 45] });
+            assert_eq!(hints.window_under_pointer_raw, pointer.then_some(91));
+            assert_eq!(hints.window_that_can_handle_raw, pointer.then_some(92));
+        }
+    }
+
+    #[test]
+    fn raw_zero_and_unusual_hints_do_not_expand_existing_diagnostic_returns() {
+        let mut event = ExternalEventEvidence::from_event(100, 10, 0, 42, false).unwrap();
+        let existing = event.diagnostic(110);
+        event.target_hints = Some(EventTargetHints::capture(
+            10,
+            covered().ordering_snapshot(5_000),
+            |field| match field { 39 => i64::MAX, 40 => 0, 45 => -1, _ => panic!("unexpected field") },
+        ));
+        assert_eq!(event.diagnostic(110), existing);
+        let internal = event.ordering_diagnostic(110);
+        assert_eq!(internal.as_object().unwrap().len(), 5);
+        assert_eq!(internal["session_tap_target_hints"], serde_json::json!({
+            "target_psn_raw": i64::MAX, "target_pid_raw": 0, "source_state_raw": -1,
+            "window_under_pointer_raw": null, "window_that_can_handle_raw": null,
+            "generation_after_event": 0, "non_motion_generation_after_event": 0,
+        }));
+        let hints = EventTargetHints::capture(5, covered().ordering_snapshot(5_000), |_| 0);
+        assert_eq!(hints.source_state_raw, 0);
+        assert_eq!(hints.window_under_pointer_raw, Some(0));
+        assert_eq!(hints.window_that_can_handle_raw, Some(0));
+    }
+
+    #[test]
+    fn latest_target_hints_never_rescue_an_intervening_non_motion_event() {
+        let mut state = covered();
+        let before = state.ordering_snapshot(5_000);
+        let lease = EpisodeLease::begin(5_000, before.activity).unwrap();
+        // Driver PID without its marker still has the unchanged Unknown classification.
+        let mut event = ExternalEventEvidence::from_event(5_001, 10, 42, 42, false).unwrap();
+        record_native_activity(&mut state, 5_001, 10, 0, Source::Unknown);
+        event.target_hints = Some(EventTargetHints::capture(
+            10, state.ordering_snapshot(5_001), |_| 42,
+        ));
+        assert_eq!(event.target_hints.unwrap().non_motion_generation_after_event, 1);
+        // The single last-event record can later describe only pointer motion.
+        let mut latest = ExternalEventEvidence::from_event(5_002, 5, 42, 42, false).unwrap();
+        record_native_activity(&mut state, 5_002, 5, 0, Source::Unknown);
+        latest.target_hints = Some(EventTargetHints::capture(
+            5, state.ordering_snapshot(5_002), |_| 42,
+        ));
+        let captured = latest.target_hints.unwrap();
+        assert_eq!(captured.generation_after_event, 2);
+        assert_eq!(captured.non_motion_generation_after_event, 1);
+        assert_ne!(captured.non_motion_generation_after_event, before.non_motion_generation);
+        assert!(!lease.permits(5_002, state.snapshot(5_002)));
+        state.invalidate();
+        assert_ne!(captured.non_motion_generation_after_event,
+            state.ordering_snapshot(5_003).non_motion_generation);
+        assert!(!lease.permits(5_003, state.snapshot(5_003)));
+    }
+
+    #[test]
+    fn own_pid_and_marker_skip_even_diagnostic_field_reads() {
+        let mut reads = 0;
+        let external = ExternalEventEvidence::from_event(100, 5, 42, 42, true).map(|mut event| {
+            event.target_hints = Some(EventTargetHints::capture(
+                5, covered().ordering_snapshot(5_000), |_| { reads += 1; 42 },
+            ));
+            event
+        });
+        assert!(external.is_none());
+        assert_eq!(reads, 0);
     }
 }
 

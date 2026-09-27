@@ -320,7 +320,7 @@ impl BackgroundOrderGuard {
                 current_non_motion_generation=activity.non_motion_generation,
                 current_front_pid=?front_pid, current_focused_window=?focused,
                 elapsed_ms=elapsed.as_millis(),
-                activity_diagnostic=?crate::foreground_activity::diagnostic_state(),
+                activity_diagnostic=?crate::foreground_activity::ordering_diagnostic_state(),
                 "Window ordering guard veto evidence");
         }
         valid.then_some(activity)
