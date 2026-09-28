@@ -39,9 +39,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.trycua.driver</string>
     <key>CFBundleName</key>
-    <string>cua</string>
+    <string>Computer Use</string>
     <key>CFBundleDisplayName</key>
-    <string>cua</string>
+    <string>Computer Use</string>
     <key>CFBundleExecutable</key>
     <string>cua-driver</string>
     <!-- No custom icon in this development build; use the system default. -->
@@ -65,9 +65,9 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>cua captures the screen so agents can see and interact with the interface you ask them to control.</string>
+    <string>Computer Use captures the screen so agents can see and interact with the interface you ask them to control.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>cua uses Automation only when a requested action needs to communicate with another app.</string>
+    <string>Computer Use uses Automation only when a requested action needs to communicate with another app.</string>
     <key>NSSupportsAutomaticTermination</key>
     <true/>
 </dict>
