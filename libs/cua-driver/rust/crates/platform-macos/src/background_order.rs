@@ -356,6 +356,10 @@ impl BackgroundOrderGuard {
             // freshly establish visibility, standard-window ownership and
             // unchanged foreground/activity before it can enroll this one ID.
             self.pending_tab = Some(proof);
+            tracing::debug!(target: "cua_window_order", pid, source, id,
+                order_trace_id = self.trace.id(),
+                remaining_ms = self.expires_at.saturating_duration_since(Instant::now()).as_millis(),
+                "retained native tab proof attached");
         }
     }
 
