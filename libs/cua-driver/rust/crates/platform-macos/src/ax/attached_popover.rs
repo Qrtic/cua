@@ -64,7 +64,7 @@ fn container_role(role: &str) -> bool {
 // These are host-side anchors, never controls or an expanded path inside a
 // popover. They require the exact host's logical and physical identity below.
 fn host_collection_role(role: &str) -> bool {
-    matches!(role, "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea")
+    matches!(role, "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea" | "AXTabGroup")
 }
 
 trait PopoverTree {
@@ -1810,6 +1810,99 @@ mod tests {
             assert!(prove(&tree, 42, 700, &0));
             assert_eq!(tree.unique_reads.get(), 0);
             assert_eq!(tree.late_reads.get(), 0);
+        }
+    }
+
+    fn tab_group_host(logical_host: bool, with_inner_list: bool) -> Tree {
+        let mut tree = if with_inner_list { inner_list(logical_host) } else { wrapped_toolbar_popover() };
+        tree.nodes.get_mut(&0).unwrap().window = Some(if logical_host { 6 } else { 2 });
+        // Exact native outer shape: popup -> button -> tab group -> split -> host.
+        tree.nodes.get_mut(&4).unwrap().role = "AXTabGroup";
+        tree.budget.set(500);
+        tree
+    }
+
+    #[test]
+    fn host_tab_group_proves_outer_chain_with_and_without_inner_list() {
+        for logical_host in [false, true] {
+            for with_inner_list in [false, true] {
+                let tree = tab_group_host(logical_host, with_inner_list);
+                assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
+                assert_eq!(prove_checked(&tree, 42, 700, &2), Ok(()), "popup root");
+                assert!(!prove(&tree, 42, 701, &0));
+            }
+        }
+    }
+
+    #[test]
+    fn host_tab_group_does_not_widen_inner_roles_actions_or_host_boundaries() {
+        assert!(!container_role("AXTabGroup"));
+        assert!(!native_control_role(Some("AXTabGroup")));
+        for action in ["press", "click", "show_menu", "confirm", "cancel"] {
+            assert_eq!(advertised_action(Some("AXTabGroup"), action,
+                &["AXPress".into(), "AXShowMenu".into(), "AXConfirm".into(), "AXCancel".into()]), None);
+        }
+        for logical_host in [false, true] {
+            let mut tree = tab_group_host(logical_host, false);
+            assert!(!prove(&tree, 42, 700, &4), "tab group is not an action target");
+            tree.nodes.get_mut(&1).unwrap().role = "AXTabGroup";
+            assert!(!prove(&tree, 42, 700, &0), "tab group inside popup");
+            for role in ["AXList", "AXWebArea", "AXTable", "AXWindow", "AXPopover", "AXUnknown"] {
+                let mut tree = tab_group_host(logical_host, true);
+                tree.nodes.get_mut(&4).unwrap().role = role;
+                assert!(!prove(&tree, 42, 700, &0), "outer boundary {role}");
+            }
+        }
+    }
+
+    #[test]
+    fn host_tab_group_requires_exact_host_facts_and_unique_reciprocal_edges() {
+        for logical_host in [false, true] {
+            for node in [3, 4, 5] {
+                for kind in 0..5 {
+                    let mut tree = tab_group_host(logical_host, true);
+                    tree.nodes.insert(9, tree.nodes[&6].clone());
+                    tree.nodes.get_mut(&9).unwrap().identity = 9;
+                    let entry = tree.nodes.get_mut(&node).unwrap();
+                    match kind {
+                        0 => entry.owner = 99,
+                        1 => entry.id = None,
+                        2 => entry.id = Some(900),
+                        3 => entry.window = None,
+                        _ => entry.window = Some(9), // Same-ID sibling is not the retained host.
+                    }
+                    assert!(!prove(&tree, 42, 700, &0), "node={node} kind={kind}");
+                }
+            }
+            for parent in 3..=6 {
+                for duplicate in [false, true] {
+                    let mut tree = tab_group_host(logical_host, true);
+                    let entry = tree.nodes.get_mut(&parent).unwrap();
+                    if duplicate { entry.children.push(parent - 1); } else { entry.children.clear(); }
+                    assert!(!prove(&tree, 42, 700, &0), "parent={parent} duplicate={duplicate}");
+                }
+            }
+            let mut tree = tab_group_host(logical_host, true);
+            tree.nodes.get_mut(&4).unwrap().parent = Some(6);
+            assert!(!prove(&tree, 42, 700, &0), "one-way reparent");
+            let tree = ChangingHost::new(tab_group_host(logical_host, false), 4, "deadline");
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"));
+            assert_eq!(tree.unique_reads.get(), 1, "existing final proof deadline");
+        }
+    }
+
+    #[test]
+    fn host_tab_group_revalidates_live_identity_roles_and_edges_at_end() {
+        for logical_host in [false, true] {
+            for with_inner_list in [false, true] {
+                for field in ["role", "owner", "window", "id", "parent", "children"] {
+                    let node = if field == "children" { 5 } else { 4 };
+                    let tree = ChangingHost::new(tab_group_host(logical_host, with_inner_list), node, field);
+                    assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "late {field}");
+                    assert!(tree.reads.get() >= 2, "late {field} re-read must occur");
+                    assert!(tree.unique_reads.get() > 0, "must reach final retained proof");
+                }
+            }
         }
     }
 
