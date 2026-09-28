@@ -1020,6 +1020,8 @@ impl Tool for ClickTool {
                 WindowChangeDetector::snapshot_targeted(prior_front, pid)
             };
             let order_trace = snapshot.diagnostic_trace().unwrap_or_else(crate::order_diagnostics::Trace::new);
+            let native_tab = native_tab_action_is_plain(&effective_action, &button_str, count, foreground, &modifiers)
+                .then(|| snapshot.native_tab_handoff()).flatten();
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -1082,6 +1084,8 @@ impl Tool for ClickTool {
                                     foreground,
                                     !async_click_feedback,
                                     order_trace,
+                                    None,
+                                    || Ok(()),
                                 )?);
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
@@ -1140,6 +1144,8 @@ impl Tool for ClickTool {
                                 false,
                                 !async_click_feedback,
                                 order_trace,
+                                native_tab.as_ref(),
+                                || element_guard.validate_observation_scope(),
                             )
                             .map(|outcome| (outcome, false))
                         }
@@ -2267,6 +2273,10 @@ fn perform_attached_popover_action(
     Ok(native)
 }
 
+fn native_tab_action_is_plain(action: &str, button: &str, count: usize, foreground: bool, modifiers: &[String]) -> bool {
+    !foreground && count == 1 && button == "left" && modifiers.is_empty() && matches!(action, "press" | "click")
+}
+
 /// Returns `(summary_text, needs_text_input_settle, suspected_noop,
 /// selection_verified, selection_via_pixel)`. An unadvertised action's AX
 /// acceptance is only a suspected no-op, not a verified visible effect.
@@ -2282,6 +2292,8 @@ fn perform_ax_click(
     foreground: bool,
     emit_click_pulse: bool,
     order_trace: crate::order_diagnostics::Trace,
+    native_tab: Option<&crate::window_change_detector::NativeTabHandoff>,
+    revalidate_observation: impl Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
@@ -2433,6 +2445,13 @@ fn perform_ax_click(
         }
     }
 
+    let tab_proof = if !foreground && modifiers.is_empty() && ax_action == "AXPress"
+        && role == "AXRadioButton" && advertised.iter().any(|a| a == "AXPress") {
+        let proof = native_tab.and_then(|handoff| handoff.capture(element, pid, window_id));
+        // Extra read-only proof work never exempts a consumed observation.
+        if native_tab.is_some() { revalidate_observation()?; }
+        proof
+    } else { None };
     crate::foreground_activity::check_request()?;
     let err = order_trace.measure(crate::order_diagnostics::Phase::AxDispatch, None, || unsafe {
         crate::ax::bindings::perform_action(element, ax_action)
@@ -2458,6 +2477,10 @@ fn perform_ax_click(
             }
         }
         anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+    }
+
+    if let (Some(handoff), Some(proof)) = (native_tab, tab_proof) {
+        if let Some(destination) = proof.confirm(err) { handoff.confirm(destination); }
     }
 
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
@@ -2550,7 +2573,19 @@ fn perform_ax_click(
 
 #[cfg(test)]
 mod selection_fallback_tests {
-    use super::selection_readback_confirms;
+    use super::{selection_readback_confirms, native_tab_action_is_plain};
+
+    #[test]
+    fn native_tab_handoff_excludes_foreground_pointer_button_modified_and_other_actions() {
+        assert!(native_tab_action_is_plain("press", "left", 1, false, &[]));
+        assert!(native_tab_action_is_plain("click", "left", 1, false, &[]));
+        for (action, button, count, foreground) in [
+            ("press", "left", 1, true), ("press", "right", 1, false), ("press", "middle", 1, false),
+            ("press", "left", 2, false), ("show_menu", "left", 1, false),
+            ("select", "left", 1, false), ("unknown", "left", 1, false),
+        ] { assert!(!native_tab_action_is_plain(action, button, count, foreground, &[])); }
+        assert!(!native_tab_action_is_plain("press", "left", 1, false, &["shift".into()]));
+    }
 
     #[test]
     fn plain_click_requires_selected_readback() {

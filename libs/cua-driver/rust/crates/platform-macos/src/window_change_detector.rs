@@ -87,6 +87,21 @@ pub struct Snapshot {
     ordering_trace: Option<crate::order_diagnostics::Trace>,
 }
 
+/// The AX thread retains its objects; this handle carries only the original
+/// shared order guard. No second snapshot, lease, poller or input actuator.
+pub(crate) struct NativeTabHandoff(Arc<Mutex<crate::background_order::BackgroundOrderGuard>>);
+impl NativeTabHandoff {
+    pub(crate) fn capture(&self, element: crate::ax::bindings::AXUIElementRef, pid: i32, source: u32)
+        -> Option<crate::ax::window_tabs::retained::Pending> {
+        let scope = self.0.lock().ok()?.native_tab_scope(pid, source)?;
+        // Release the guard lock before any retained proof or AXPress.
+        crate::ax::window_tabs::retained::Pending::capture(element, scope)
+    }
+    pub(crate) fn confirm(&self, proof: crate::ax::window_tabs::retained::Destination) {
+        if let Ok(mut guard) = self.0.lock() { guard.confirm_native_tab(proof); }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SuppressionScope {
     None,
@@ -331,6 +346,11 @@ impl Snapshot {
         self.ordering_trace
     }
 
+    pub(crate) fn native_tab_handoff(&self) -> Option<NativeTabHandoff> {
+        self._lease.as_ref()?.targeted_deadline()?;
+        Some(NativeTabHandoff(Arc::clone(self.ordering.as_ref()?)))
+    }
+
     /// Frontmost pid at snapshot time, if any.
     pub fn front_pid(&self) -> Option<i32> {
         self.front_pid
@@ -530,6 +550,19 @@ impl Snapshot {
 mod tests {
     use super::*;
     use crate::windows::WindowBounds;
+
+    #[test]
+    fn native_tab_handoff_cannot_outlive_or_invent_a_targeted_lease() {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(checks)));
+        let snapshot = Snapshot { window_ids: HashSet::new(), front_pid: None, _lease: None,
+            hold_targeted_lease_until_deadline: false, suppression_scope: SuppressionScope::Target(-2),
+            ordering_trace: None, ordering: Some(Arc::clone(&guard)) };
+        assert!(snapshot.native_tab_handoff().is_none());
+        // An unqualified guard stops before attempting any AX pointer read.
+        let handoff = NativeTabHandoff(guard);
+        assert!(handoff.capture(std::ptr::null_mut(), -2, 1).is_none());
+    }
 
     #[test]
     fn ordinary_input_reports_within_one_hundred_milliseconds() {

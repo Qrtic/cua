@@ -153,6 +153,57 @@ fn proven_new_documents(pid: i32, candidates: &[u32], deadline: Instant) -> Hash
     proven
 }
 
+// A separate membership proof for retained native-tab switches. It never
+// changes NewWindowEvidence.known or authorizes arbitrary newly visible IDs.
+fn inactive_tab_windows(target: i32, complete: &WindowEnumeration, visible: &WindowEnumeration) -> HashSet<u32> {
+    if !complete.succeeded || !visible.succeeded { return HashSet::new(); }
+    complete.windows.iter().filter(|w| w.pid == target && w.layer == 0
+        && complete.windows.iter().filter(|n| n.window_id == w.window_id).count() == 1
+        && !visible.windows.iter().any(|n| n.window_id == w.window_id))
+        .map(|w| w.window_id).collect()
+}
+
+fn known_tab_destination(proof: &crate::ax::window_tabs::retained::Destination, target: i32,
+                         before: &NewWindowEvidence, visible: &HashSet<u32>, inactive: &HashSet<u32>,
+                         deadline: Instant) -> Option<u32> {
+    let (pid, source, id, start, original_deadline) = proof.parts();
+    (pid == target && id != source && before.known.contains(&source) && visible.contains(&source)
+        && before.known.contains(&id) && inactive.contains(&id) && !visible.contains(&id)
+        && before.process_start == start && deadline == original_deadline && Instant::now() < deadline)
+        .then_some(id)
+}
+
+fn tab_crosses(windows: &[WindowInfo], front_pid: i32, front_id: u32, target: i32, id: u32) -> bool {
+    let Some(front) = exact_visible(windows, front_pid, front_id) else { return false; };
+    let matches: Vec<_> = windows.iter().filter(|w| w.window_id == id).collect();
+    matches.len() == 1 && matches[0].pid == target && matches[0].layer == 0
+        && matches[0].is_on_screen && matches[0].on_current_space == Some(true)
+        && matches[0].z_index > front.z_index && overlaps(&matches[0].bounds, &front.bounds)
+}
+
+fn tab_document_visible(pid: i32, id: u32, deadline: Instant) -> bool {
+    let Some(app) = OwnedAx::bounded(unsafe { ax::AXUIElementCreateApplication(pid) }) else { return false; };
+    if Instant::now() >= deadline || unsafe { ax::copy_bool_attr(app.0, "AXHidden") } != Some(false) { return false; }
+    let Ok(snapshot) = (unsafe { ax::try_copy_ax_windows(app.0) }) else { return false; };
+    let Some(windows) = snapshot.windows.into_iter().map(OwnedAx::bounded).collect::<Option<Vec<_>>>() else { return false; };
+    if !snapshot.complete || windows.len() > 32 { return false; }
+    let mut matches = 0;
+    for window in windows {
+        if Instant::now() >= deadline { return false; }
+        let Some(current_id) = (unsafe { ax::ax_get_window_id(window.0) }) else { return false; };
+        if current_id != id { continue; }
+        matches += 1;
+        let mut owner = 0;
+        let modal = unsafe { ax::copy_bool_attr(window.0, "AXModal") };
+        if unsafe { ax::AXUIElementGetPid(window.0, &mut owner) } != ax::kAXErrorSuccess || owner != pid
+            || unsafe { ax::copy_bool_attr(window.0, "AXMinimized") } != Some(false)
+            || modal != Some(false)
+            || !standard_document(unsafe { ax::copy_string_attr(window.0, "AXRole") }.as_deref(),
+                unsafe { ax::copy_string_attr(window.0, "AXSubrole") }.as_deref(), modal) { return false; }
+    }
+    matches == 1 && Instant::now() < deadline
+}
+
 fn crossed(windows: &[WindowInfo], front_pid: i32, front_id: u32,
            target: i32, candidates: &HashSet<u32>) -> bool {
     let Some(front) = exact_visible(windows, front_pid, front_id) else { return false };
@@ -174,6 +225,9 @@ pub(crate) struct BackgroundOrderGuard {
     target_pid: i32,
     candidates: HashSet<u32>,
     new_windows: Option<NewWindowEvidence>,
+    tab_inactive: HashSet<u32>,
+    tab_sources_below: HashSet<u32>,
+    pending_tab: Option<crate::ax::window_tabs::retained::Destination>,
     generation: u64,
     non_motion_generation: u64,
     started: Instant,
@@ -194,7 +248,15 @@ impl BackgroundOrderGuard {
         // Ordinary input does not authorize unhiding an existing document.
         // New-window membership is captured before dispatch; fresh AX ownership,
         // standard-window role and unchanged context are still required later.
-        Self::capture_evidence(target_pid, &visible.windows, false, new_windows)
+        let inactive = inactive_tab_windows(target_pid, complete, visible);
+        Self::capture_evidence(target_pid, &visible.windows, false, new_windows).map(|mut guard| {
+            guard.tab_inactive = inactive;
+            guard.tab_sources_below = visible.windows.iter().filter(|w| w.pid == target_pid && w.layer == 0
+                && w.is_on_screen && w.on_current_space == Some(true) && guard.candidates.contains(&w.window_id)
+                && visible.windows.iter().filter(|n| n.window_id == w.window_id).count() == 1)
+                .map(|w| w.window_id).collect();
+            guard
+        })
     }
 
     pub(crate) fn capture_before_file_open(target_pid: i32, complete: &WindowEnumeration,
@@ -242,6 +304,7 @@ impl BackgroundOrderGuard {
         }
         let started = Instant::now();
         let result = Self { pid, window, target_pid, candidates, new_windows,
+            tab_inactive: HashSet::new(), tab_sources_below: HashSet::new(), pending_tab: None,
             generation: activity.activity.generation, non_motion_generation: activity.non_motion_generation,
             started, expires_at: started + MAX_AGE, attempted: false,
             trace: Trace::new(),
@@ -262,6 +325,7 @@ impl BackgroundOrderGuard {
         // No candidate can cross: lifecycle tests observe the real polling
         // path without authorizing any accessibility mutation on the desktop.
         Self { pid: -1, window: 0, target_pid: -2, candidates: HashSet::new(), new_windows: None,
+            tab_inactive: HashSet::new(), tab_sources_below: HashSet::new(), pending_tab: None,
             generation: 0, non_motion_generation: 0, started, expires_at: started + MAX_AGE, attempted: false,
             trace: Trace::new(),
             observed_checks: Some(checks) }
@@ -269,6 +333,30 @@ impl BackgroundOrderGuard {
 
     pub(crate) fn limit_deadline(&mut self, deadline: Instant) {
         self.expires_at = self.expires_at.min(deadline);
+    }
+
+    pub(crate) fn native_tab_scope(&self, pid: i32, source: u32) -> Option<crate::ax::window_tabs::retained::Scope> {
+        let before = self.new_windows.as_ref()?;
+        if self.attempted || self.pending_tab.is_some() || pid != self.target_pid
+            || !before.known.contains(&source) || !self.tab_sources_below.contains(&source)
+            || self.tab_inactive.is_empty() || !self.current() { return None; }
+        Some(crate::ax::window_tabs::retained::Scope {
+            pid, source, start: before.process_start, deadline: self.expires_at,
+        })
+    }
+
+    pub(crate) fn confirm_native_tab(&mut self, proof: crate::ax::window_tabs::retained::Destination) {
+        let (pid, source, id, start, deadline) = proof.parts();
+        let Some(scope) = self.native_tab_scope(pid, source) else { return; };
+        if start == scope.start && deadline == scope.deadline
+            && self.new_windows.as_ref().and_then(|before| known_tab_destination(&proof, self.target_pid,
+                before, &self.tab_sources_below, &self.tab_inactive, self.expires_at)) == Some(id)
+            && self.current() {
+            // Pending evidence only. The existing guarded poll/report must
+            // freshly establish visibility, standard-window ownership and
+            // unchanged foreground/activity before it can enroll this one ID.
+            self.pending_tab = Some(proof);
+        }
     }
 
     pub(crate) fn diagnostic_trace(&self) -> Trace { self.trace }
@@ -348,9 +436,17 @@ impl BackgroundOrderGuard {
                 }
             }
         }
-        if !crossed(windows, self.pid, self.window, self.target_pid, &self.candidates) {
-            return;
+        let mut tab_candidate = None;
+        if let Some(proof) = &self.pending_tab {
+            let (pid, _, id, start, deadline) = proof.parts();
+            if self.tab_inactive.contains(&id) && self.new_windows.as_ref().is_some_and(|n| n.process_start == start)
+                && deadline == self.expires_at && tab_crosses(windows, self.pid, self.window, pid, id)
+                && self.current() && tab_document_visible(pid, id, self.expires_at) && self.current() {
+                tab_candidate = Some(id);
+            }
         }
+        if !crossed(windows, self.pid, self.window, self.target_pid, &self.candidates)
+            && tab_candidate.is_none() { return; }
         self.attempted = true;
         if !self.current() {
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
@@ -372,10 +468,12 @@ impl BackgroundOrderGuard {
         // Re-read ordering after the AX identity queries. A stale before/after
         // comparison never authorizes a raise after the target has moved away.
         let latest = crate::windows::visible_windows_with_space_snapshot();
-        if !latest.succeeded || !crossed(&latest.windows, self.pid, self.window, self.target_pid, &self.candidates) {
+        if !latest.succeeded || (!crossed(&latest.windows, self.pid, self.window, self.target_pid, &self.candidates)
+            && !tab_candidate.is_some_and(|id| tab_crosses(&latest.windows, self.pid, self.window, self.target_pid, id))) {
             return;
         }
         let Some(admission) = self.current_evidence() else { return; };
+        if tab_candidate.is_some() && Instant::now() >= self.expires_at { return; }
         let status = self.trace.measure(Phase::OrderingRaise, Some(source), || unsafe {
             ax::perform_action(window.0, "AXRaise")
         });
@@ -644,4 +742,53 @@ mod tests {
         activity.pointer_motion_event(5_003, Source::Unknown);
         assert!(!permits(Some(1), Some(10), activity.ordering_snapshot(5_003)));
     }
+    #[test]
+    fn native_tab_membership_uses_the_retained_success_proof_not_new_document_heuristics() {
+        let proof = crate::ax::window_tabs::retained::destination_for_guard_test();
+        let (_, source, id, start, deadline) = proof.parts();
+        let before = NewWindowEvidence { known: HashSet::from([source, id, 30]), process_start: start };
+        let visible = HashSet::from([source]); let inactive = HashSet::from([id, 30]);
+        assert_eq!(known_tab_destination(&proof, 42, &before, &visible, &inactive, deadline), Some(id));
+        // Simultaneously revealed old30 remains excluded, as does the original
+        // known-id set from the new-document route.
+        let after = vec![window(1, 1, 10), window(42, id, 11), window(42, 30, 12)];
+        assert!(newly_crossing_windows(&after, 1, 1, 42, &before.known).is_empty());
+        assert!(tab_crosses(&after, 1, 1, 42, id));
+        assert!(!tab_crosses(&[window(1, 1, 10), window(42, id, 9), window(42, 30, 12)], 1, 1, 42, id));
+        for fault in 0..7 {
+            let mut before = NewWindowEvidence { known: HashSet::from([source, id]), process_start: start };
+            let mut visible = HashSet::from([source]); let mut inactive = HashSet::from([id]);
+            let mut target = 42; let mut limit = deadline;
+            match fault { 0 => { before.known.remove(&id); }, 1 => { visible.insert(id); },
+                2 => { inactive.clear(); }, 3 => before.process_start = (9, 9),
+                4 => target = 99, 5 => limit = deadline - Duration::from_millis(1), _ => visible.clear() }
+            assert!(known_tab_destination(&proof, target, &before, &visible, &inactive, limit).is_none());
+        }
+    }
+
+    #[test]
+    fn native_tab_inactive_membership_needs_complete_success_and_unique_before_ids() {
+        let mut hidden = window(42, 20, 1); hidden.is_on_screen = false;
+        let mut complete = WindowEnumeration { succeeded: true, current_space_id: Some(1), windows: vec![window(42, 10, 3), hidden.clone()] };
+        let mut visible = WindowEnumeration { succeeded: true, current_space_id: Some(1), windows: vec![window(42, 10, 3)] };
+        assert_eq!(inactive_tab_windows(42, &complete, &visible), HashSet::from([20]));
+        visible.succeeded = false; assert!(inactive_tab_windows(42, &complete, &visible).is_empty());
+        visible.succeeded = true; complete.succeeded = false;
+        assert!(inactive_tab_windows(42, &complete, &visible).is_empty());
+        complete.succeeded = true; complete.windows.push(hidden);
+        assert!(inactive_tab_windows(42, &complete, &visible).is_empty());
+    }
+
+    #[test]
+    fn native_tab_current_crossing_refuses_foreign_unknown_space_duplicate_and_peer_only_order() {
+        for fault in 0..9 {
+            let mut target = window(42, 20, 11); let mut windows = vec![window(1, 1, 10)];
+            match fault { 0 => target.pid = 99, 1 => target.layer = 1, 2 => target.is_on_screen = false,
+                3 => target.on_current_space = None, 4 => target.on_current_space = Some(false),
+                5 => target.bounds.x = 1000.0, 6 => target.bounds.width = f64::NAN,
+                7 => windows.push(target.clone()), _ => target.z_index = 9 }
+            windows.push(target); assert!(!tab_crosses(&windows, 1, 1, 42, 20), "fault {fault}");
+        }
+    }
+
 }
