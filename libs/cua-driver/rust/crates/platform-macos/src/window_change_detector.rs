@@ -294,7 +294,11 @@ impl WindowChangeDetector {
             SuppressionScope::Target(pid) => crate::ax::enablement::process_start_stamp(pid),
             _ => None,
         };
+        let order_query = crate::background_order::OrderQueryTiming::begin(
+            matches!(suppression_scope, SuppressionScope::Target(_))
+                && lease.is_some());
         let visible = windows::visible_windows_with_space_snapshot();
+        let order_query = order_query.finish();
         let mut ordering_trace = None;
         let ordering = match (suppression_scope, lease.as_ref().and_then(SuppressionLease::targeted_deadline)) {
             (SuppressionScope::Target(pid), Some(deadline)) => {
@@ -306,6 +310,7 @@ impl WindowChangeDetector {
                 let complete = windows::all_windows_including_accessory_layers_with_snapshot();
                 crate::background_order::BackgroundOrderGuard::capture_before_input(pid, target_start, &complete, &visible).map(|mut guard| {
                     guard.limit_deadline(deadline);
+                    guard.record_initial_query_timing(order_query);
                     ordering_trace = Some(guard.diagnostic_trace());
                     Arc::new(Mutex::new(guard))
                 })
@@ -441,14 +446,16 @@ impl Snapshot {
             // The action has completed before entering this loop. Inspect and
             // restore an already-raised background window immediately; wait
             // only between later samples for an asynchronous AppKit change.
+            let order_query = crate::background_order::OrderQueryTiming::begin(self.ordering.is_some());
             let current: Vec<WindowInfo> = windows::visible_windows()
                 .into_iter()
                 .filter(|w| w.layer == 0)
                 .collect();
+            let order_query = order_query.finish();
             let current_ids: HashSet<u32> = current.iter().map(|w| w.window_id).collect();
             if let Some(ordering) = self.ordering.as_ref() {
                 if let Ok(mut guard) = ordering.lock() {
-                    guard.restore_if_crossed(&current, diagnostic_source);
+                    guard.restore_if_crossed(&current, diagnostic_source, order_query);
                 }
             }
 

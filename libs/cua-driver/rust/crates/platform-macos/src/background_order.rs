@@ -22,10 +22,143 @@ use cua_driver_core::foreground_activity::OrderingSnapshot;
 
 use crate::ax::bindings::{self as ax, AXUIElementRef};
 use crate::windows::{WindowBounds, WindowEnumeration, WindowInfo};
-use crate::order_diagnostics::{CheckSource, Phase, PollDiagnostics, Trace};
+use crate::order_diagnostics::{diagnostic_only, CallMeasurement, CheckSource, LimitedCallsite,
+    Phase, PollDiagnostics, Trace};
 
 const MAX_AGE: Duration = Duration::from_secs(5);
 const AX_TIMEOUT: f32 = 0.1;
+
+/// Bounds the existing enumeration (including its Space queries), not the
+/// instant WindowServer changed order. No query or authority comes from this.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OrderQueryTiming {
+    requested: bool,
+    started_ns: Option<u64>,
+    finished_ns: Option<u64>,
+    #[allow(dead_code)] // Explicit alignment validity in the diagnostic output.
+    clock_valid: bool,
+}
+
+impl OrderQueryTiming {
+    pub(crate) fn begin(enabled: bool) -> Self {
+        diagnostic_only(|| {
+            let requested = enabled
+                && tracing::enabled!(target: "cua_window_order", tracing::Level::DEBUG);
+            Self { requested, started_ns: requested.then(crate::order_diagnostics::uptime_ns).flatten(),
+                ..Self::default() }
+        }).unwrap_or_default()
+    }
+
+    pub(crate) fn finish(mut self) -> Self {
+        if self.requested {
+            self.finished_ns = diagnostic_only(crate::order_diagnostics::uptime_ns).flatten();
+            self.clock_valid = matches!((self.started_ns, self.finished_ns), (Some(a), Some(b)) if b >= a);
+        }
+        self
+    }
+}
+
+// Fixed scalar metadata only: no title, AX role query, object or content read.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Fields are intentionally consumed by bounded Debug output.
+struct OrderWindowWitness {
+    pid: i32,
+    window_id: u32,
+    layer: i32,
+    bounds_xywh: [f64; 4],
+    z_index: usize,
+    is_on_screen: bool,
+    current_space_id: Option<u64>,
+    on_current_space: Option<bool>,
+}
+
+impl From<&WindowInfo> for OrderWindowWitness {
+    fn from(w: &WindowInfo) -> Self {
+        Self { pid: w.pid, window_id: w.window_id, layer: w.layer,
+            bounds_xywh: [w.bounds.x, w.bounds.y, w.bounds.width, w.bounds.height],
+            z_index: w.z_index, is_on_screen: w.is_on_screen,
+            current_space_id: w.current_space_id, on_current_space: w.on_current_space }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CrossingWitness {
+    #[allow(dead_code)] // Retained query bounds are consumed by Debug output.
+    query: OrderQueryTiming,
+    evaluated: bool,
+    foreground: Option<OrderWindowWitness>,
+    matched: Option<OrderWindowWitness>,
+}
+
+const ORDER_CANDIDATE_ROW_LIMIT: usize = 8;
+
+struct OrderWitness {
+    measurement: Option<CallMeasurement>,
+    trace_id: u64,
+    target_pid: i32,
+    initial_query: OrderQueryTiming,
+    initial_foreground: Option<OrderWindowWitness>,
+    initial_candidates: [Option<OrderWindowWitness>; ORDER_CANDIDATE_ROW_LIMIT],
+    initial_candidate_count: usize,
+    initial_rows_truncated: bool,
+    source: Option<CheckSource>,
+    first: Option<CrossingWitness>,
+    final_check: Option<CrossingWitness>,
+    final_snapshot_succeeded: Option<bool>,
+    tab_candidate: Option<u32>,
+    ax_status: Option<i32>,
+}
+
+impl OrderWitness {
+    fn capture(guard: &BackgroundOrderGuard, windows: &[WindowInfo]) -> Option<Self> {
+        static SITE: LimitedCallsite = LimitedCallsite::new("background_order_witness");
+        let measurement = SITE.begin()?;
+        let mut result = Self { measurement: Some(measurement), trace_id: guard.trace.id(),
+            target_pid: guard.target_pid, initial_query: OrderQueryTiming::default(),
+            initial_foreground: None, initial_candidates: [None; ORDER_CANDIDATE_ROW_LIMIT],
+            initial_candidate_count: guard.candidates.len(), initial_rows_truncated: false,
+            source: None, first: None, final_check: None, final_snapshot_succeeded: None,
+            tab_candidate: None, ax_status: None };
+        if result.enabled() {
+            // Preserve supplied snapshot order; never iterate the HashSet as
+            // though it represented stack order. This is only a bounded copy.
+            result.initial_foreground = exact_visible(windows, guard.pid, guard.window).map(Into::into);
+            for (index, window) in windows.iter().filter(|w| w.pid == guard.target_pid
+                && guard.candidates.contains(&w.window_id)).take(ORDER_CANDIDATE_ROW_LIMIT + 1).enumerate() {
+                if index == ORDER_CANDIDATE_ROW_LIMIT { result.initial_rows_truncated = true; break; }
+                result.initial_candidates[index] = Some(window.into());
+            }
+        }
+        Some(result)
+    }
+
+    fn enabled(&self) -> bool {
+        self.measurement.as_ref().is_some_and(|m| m.sequence().is_some())
+    }
+}
+
+impl Drop for OrderWitness {
+    fn drop(&mut self) {
+        // One ticket per captured guard, never per negative poll. At most 128
+        // records + one saturation notice per process. Emit only after the
+        // attempt returns (or a never-attempted guard is dropped), including
+        // veto paths. Synchronous stderr and bounded copies still perturb time.
+        let _ = diagnostic_only(|| {
+            let Some(timing) = self.measurement.take().and_then(CallMeasurement::finish) else { return; };
+            tracing::debug!(target: "cua_window_order", diagnostic_site="background_order_witness",
+                sequence=timing.sequence, clock="CLOCK_UPTIME_RAW", started_ns=timing.started_ns,
+                finished_ns=timing.finished_ns, order_trace_id=self.trace_id, target_pid=self.target_pid,
+                check_source=self.source.map(CheckSource::label), initial_query=?self.initial_query,
+                initial_foreground=?self.initial_foreground, initial_candidates=?self.initial_candidates,
+                initial_candidate_count=self.initial_candidate_count,
+                initial_candidate_row_limit=ORDER_CANDIDATE_ROW_LIMIT,
+                initial_rows_truncated=self.initial_rows_truncated, first_crossed=?self.first,
+                final_crossed=?self.final_check, final_snapshot_succeeded=self.final_snapshot_succeeded,
+                tab_candidate=self.tab_candidate, ax_status=self.ax_status,
+                "Background ordering decision witnesses; AX status is not restoration confirmation");
+        });
+    }
+}
 
 struct OwnedAx(AXUIElementRef);
 
@@ -204,12 +337,27 @@ fn tab_document_visible(pid: i32, id: u32, deadline: Instant) -> bool {
     matches == 1 && Instant::now() < deadline
 }
 
+#[cfg(test)]
 fn crossed(windows: &[WindowInfo], front_pid: i32, front_id: u32,
            target: i32, candidates: &HashSet<u32>) -> bool {
+    crossed_with_witness(windows, front_pid, front_id, target, candidates, None)
+}
+
+fn crossed_with_witness(windows: &[WindowInfo], front_pid: i32, front_id: u32,
+                       target: i32, candidates: &HashSet<u32>,
+                       mut witness: Option<&mut CrossingWitness>) -> bool {
+    if let Some(record) = witness.as_deref_mut() { record.evaluated = true; }
     let Some(front) = exact_visible(windows, front_pid, front_id) else { return false };
-    windows.iter().any(|w| candidates.contains(&w.window_id) && w.pid == target
+    if let Some(record) = witness.as_deref_mut() { record.foreground = Some(front.into()); }
+    windows.iter().any(|w| {
+        let matched = candidates.contains(&w.window_id) && w.pid == target
         && w.layer == 0 && w.is_on_screen && w.on_current_space != Some(false)
-        && w.z_index > front.z_index && overlaps(&w.bounds, &front.bounds))
+        && w.z_index > front.z_index && overlaps(&w.bounds, &front.bounds);
+        if matched {
+            if let Some(record) = witness.as_deref_mut() { record.matched = Some(w.into()); }
+        }
+        matched
+    })
 }
 
 fn unchanged_context(reliable: bool, non_motion_generation: u64, original_non_motion_generation: u64,
@@ -234,6 +382,7 @@ pub(crate) struct BackgroundOrderGuard {
     expires_at: Instant,
     attempted: bool,
     trace: Trace,
+    witness: Option<OrderWitness>,
     #[cfg(test)]
     observed_checks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -303,11 +452,11 @@ impl BackgroundOrderGuard {
             return None;
         }
         let started = Instant::now();
-        let result = Self { pid, window, target_pid, candidates, new_windows,
+        let mut result = Self { pid, window, target_pid, candidates, new_windows,
             tab_inactive: HashSet::new(), tab_sources_below: HashSet::new(), pending_tab: None,
             generation: activity.activity.generation, non_motion_generation: activity.non_motion_generation,
             started, expires_at: started + MAX_AGE, attempted: false,
-            trace: Trace::new(),
+            trace: Trace::new(), witness: None,
             #[cfg(test)]
             observed_checks: None,
         };
@@ -316,6 +465,7 @@ impl BackgroundOrderGuard {
             order_trace_id=result.trace.id(),
             candidates=result.candidates.len(), protect_new_documents=result.new_windows.is_some(),
             "Captured background window-order protection");
+        result.witness = diagnostic_only(|| OrderWitness::capture(&result, windows)).flatten();
         Some(result)
     }
 
@@ -327,7 +477,7 @@ impl BackgroundOrderGuard {
         Self { pid: -1, window: 0, target_pid: -2, candidates: HashSet::new(), new_windows: None,
             tab_inactive: HashSet::new(), tab_sources_below: HashSet::new(), pending_tab: None,
             generation: 0, non_motion_generation: 0, started, expires_at: started + MAX_AGE, attempted: false,
-            trace: Trace::new(),
+            trace: Trace::new(), witness: None,
             observed_checks: Some(checks) }
     }
 
@@ -365,6 +515,10 @@ impl BackgroundOrderGuard {
 
     pub(crate) fn diagnostic_trace(&self) -> Trace { self.trace }
 
+    pub(crate) fn record_initial_query_timing(&mut self, timing: OrderQueryTiming) {
+        if let Some(witness) = &mut self.witness { witness.initial_query = timing; }
+    }
+
     /// AppKit may raise its document during a blocking AX call or after the
     /// action returns. Check only within the owning suppression lease; neither
     /// this guard nor its polling callback creates or extends that lease.
@@ -373,9 +527,11 @@ impl BackgroundOrderGuard {
         let _timing = self.trace.span(Phase::OrderingPoll, Some(diagnostics.source));
         self.limit_deadline(deadline);
         if self.attempted || Instant::now() >= self.expires_at { return false; }
+        let query = OrderQueryTiming::begin(self.witness.as_ref().is_some_and(OrderWitness::enabled));
         let latest = crate::windows::visible_windows_with_space_snapshot();
+        let query = query.finish();
         if !latest.succeeded { return false; }
-        self.restore_if_crossed(&latest.windows, diagnostics.source);
+        self.restore_if_crossed(&latest.windows, diagnostics.source, query);
         !self.attempted
     }
 
@@ -420,7 +576,8 @@ impl BackgroundOrderGuard {
 
     /// One cleanup attempt at most. Unlike focus restoration this must never
     /// activate an app or select a different window: a changed focus vetoes it.
-    pub(crate) fn restore_if_crossed(&mut self, windows: &[WindowInfo], source: CheckSource) {
+    pub(crate) fn restore_if_crossed(&mut self, windows: &[WindowInfo], source: CheckSource,
+                                   query: OrderQueryTiming) {
         let _timing = self.trace.span(Phase::OrderingCheck, Some(source));
         #[cfg(test)]
         if let Some(checks) = &self.observed_checks {
@@ -449,9 +606,16 @@ impl BackgroundOrderGuard {
                 tab_candidate = Some(id);
             }
         }
-        if !crossed(windows, self.pid, self.window, self.target_pid, &self.candidates)
+        let enabled = self.witness.as_ref().is_some_and(OrderWitness::enabled);
+        let mut first = CrossingWitness { query, ..CrossingWitness::default() };
+        if !crossed_with_witness(windows, self.pid, self.window, self.target_pid, &self.candidates,
+            enabled.then_some(&mut first))
             && tab_candidate.is_none() { return; }
         self.attempted = true;
+        let mut witness = self.witness.take();
+        if let Some(record) = witness.as_mut().filter(|w| w.enabled()) {
+            record.source = Some(source); record.first = Some(first); record.tab_candidate = tab_candidate;
+        }
         if !self.current() {
             tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
                 order_trace_id=self.trace.id(), check_source=source.label(),
@@ -471,8 +635,15 @@ impl BackgroundOrderGuard {
         if !identity_matches || !self.current() { return; }
         // Re-read ordering after the AX identity queries. A stale before/after
         // comparison never authorizes a raise after the target has moved away.
+        let query = OrderQueryTiming::begin(enabled);
         let latest = crate::windows::visible_windows_with_space_snapshot();
-        if !latest.succeeded || (!crossed(&latest.windows, self.pid, self.window, self.target_pid, &self.candidates)
+        let query = query.finish();
+        if let Some(record) = witness.as_mut().filter(|w| w.enabled()) {
+            record.final_snapshot_succeeded = Some(latest.succeeded);
+            record.final_check = Some(CrossingWitness { query, ..CrossingWitness::default() });
+        }
+        if !latest.succeeded || (!crossed_with_witness(&latest.windows, self.pid, self.window, self.target_pid, &self.candidates,
+            witness.as_mut().and_then(|w| w.final_check.as_mut()))
             && !tab_candidate.is_some_and(|id| tab_crosses(&latest.windows, self.pid, self.window, self.target_pid, id))) {
             return;
         }
@@ -481,6 +652,7 @@ impl BackgroundOrderGuard {
         let status = self.trace.measure(Phase::OrderingRaise, Some(source), || unsafe {
             ax::perform_action(window.0, "AXRaise")
         });
+        if let Some(record) = &mut witness { record.ax_status = Some(status); }
         tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
             order_trace_id=self.trace.id(), check_source=source.label(),
             target_pid=self.target_pid, ax_status=status,

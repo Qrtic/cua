@@ -156,7 +156,7 @@ fn checked_uptime(status: i32, seconds: i64, nanos: i64) -> Option<u64> {
 
 /// Process-independent CLOCK_UPTIME_RAW nanoseconds, also used by the
 /// independent sampler. Failure stays explicit; UTC is not a fallback.
-fn uptime_ns() -> Option<u64> {
+pub(crate) fn uptime_ns() -> Option<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
