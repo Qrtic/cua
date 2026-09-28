@@ -530,7 +530,11 @@ impl AxNode {
         if ptr.is_null() {
             return None;
         }
-        if AXUIElementSetMessagingTimeout(ptr, 0.2) != kAXErrorSuccess {
+        let timeout_status = AXUIElementSetMessagingTimeout(ptr, 0.2);
+        if timeout_status != kAXErrorSuccess {
+            tracing::debug!(target: "cua_popover_proof", ax_error = timeout_status,
+                timeout_seconds = 0.2,
+                "attached popover node messaging timeout setup failed");
             CFRelease(ptr as CFTypeRef);
             return None;
         }

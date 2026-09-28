@@ -564,21 +564,43 @@ pub(crate) unsafe fn try_copy_element_attr(
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err == kAXErrorNoValue {
+        if attr_name == "AXWindow" {
+            tracing::debug!(target: "cua_popover_proof", ax_error = err,
+                value_present = !value.is_null(), reason = "no_value",
+                "AXWindow element attribute read unavailable");
+        }
         if !value.is_null() {
             CFRelease(value);
         }
         return Ok(None);
     }
     if err != kAXErrorSuccess {
+        if attr_name == "AXWindow" {
+            tracing::debug!(target: "cua_popover_proof", ax_error = err,
+                value_present = !value.is_null(), reason = "ax_error",
+                "AXWindow element attribute read unavailable");
+        }
         if !value.is_null() {
             CFRelease(value);
         }
         return Err(err);
     }
     if value.is_null() {
+        if attr_name == "AXWindow" {
+            tracing::debug!(target: "cua_popover_proof", ax_error = err,
+                value_present = false, reason = "success_null",
+                "AXWindow element attribute read unavailable");
+        }
         return Ok(None);
     }
-    if core_foundation::base::CFGetTypeID(value) != AXUIElementGetTypeID() {
+    let actual_type_id = core_foundation::base::CFGetTypeID(value);
+    let expected_type_id = AXUIElementGetTypeID();
+    if actual_type_id != expected_type_id {
+        if attr_name == "AXWindow" {
+            tracing::debug!(target: "cua_popover_proof", ax_error = err,
+                value_present = true, actual_type_id, expected_type_id,
+                reason = "wrong_cf_type", "AXWindow element attribute read unavailable");
+        }
         CFRelease(value);
         return Err(kAXErrorFailure);
     }
