@@ -3327,26 +3327,94 @@ fn probe_ready_ordinary_window(
     Ok(ready.then_some(candidate))
 }
 
+#[derive(Clone, Copy)]
+enum OrdinaryValidationPhase {
+    BeforeAxSkip,
+    BeforeInput,
+}
+
 fn check_ready_ordinary_window(
     proof: &ReadyOrdinaryWindow,
     pid: i32,
     window_id: u32,
     target_psn: [u8; 8],
     publication_started: std::time::Instant,
+    phase: OrdinaryValidationPhase,
     mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     check_exact_activation_owner(pid, window_id, &mut check)?;
-    let still_ready = proof.has_ordinary_identity(pid, window_id, None)
-        && exact_window_is_ready(
-            current_front_process_psn(),
-            target_psn,
-            proof.focused_id(pid),
-            window_id,
-            exact_window_on_screen(pid, window_id),
-        );
+    let ordinary_identity = proof.has_ordinary_identity(pid, window_id, None);
+    let mut front_match = None;
+    let mut focused_window_id = None;
+    let mut on_screen = None;
+    let still_ready = ordinary_identity && {
+        // Preserve the original argument evaluation order and skip all three
+        // queries when ordinary identity failed. These locals are not authority.
+        let front = current_front_process_psn();
+        let focused = proof.focused_id(pid);
+        let visible = exact_window_on_screen(pid, window_id);
+        front_match = front.map(|value| value == target_psn);
+        focused_window_id = focused;
+        on_screen = visible;
+        exact_window_is_ready(front, target_psn, focused, window_id, visible)
+    };
     check_exact_activation_owner(pid, window_id, &mut check)?;
+    let mut gate_elapsed = None;
+    let accepted = still_ready && {
+        // The original deadline read is still short-circuited by still_ready.
+        let elapsed = publication_started.elapsed();
+        gate_elapsed = Some(elapsed);
+        elapsed < ACTIVATION_WAIT_TIMEOUT
+    };
+    if !accepted {
+        static BEFORE_AX_SKIP: crate::order_diagnostics::LimitedCallsite =
+            crate::order_diagnostics::LimitedCallsite::new("ordinary_readiness_before_ax_skip");
+        static BEFORE_INPUT: crate::order_diagnostics::LimitedCallsite =
+            crate::order_diagnostics::LimitedCallsite::new("ordinary_readiness_before_input");
+        let (phase, site) = match phase {
+            OrdinaryValidationPhase::BeforeAxSkip => ("before_ax_skip", &BEFORE_AX_SKIP),
+            OrdinaryValidationPhase::BeforeInput => ("before_input", &BEFORE_INPUT),
+        };
+        if let Some(measurement) = site.begin() {
+            // Refusal has already been decided. No log/extra clock is added to
+            // successful checks or between successful final readiness and HID.
+            // This later observation cannot identify expiry as the first cause
+            // when the original deadline predicate was short-circuited.
+            let _ = crate::order_diagnostics::diagnostic_only(|| {
+                let failure_observed_elapsed = publication_started.elapsed();
+                let Some(timing) = measurement.finish() else {
+                    return;
+                };
+                tracing::debug!(
+                    target: "cua_window_order",
+                    phase,
+                    target_pid = pid,
+                    target_wid = window_id,
+                    diagnostic_sequence = timing.sequence,
+                    clock = "CLOCK_UPTIME_RAW",
+                    diagnostic_started_ns = timing.started_ns,
+                    diagnostic_finished_ns = timing.finished_ns,
+                    ordinary_identity,
+                    readiness_triple_evaluated = ordinary_identity,
+                    front_match = ?front_match,
+                    focused_window_id = ?focused_window_id,
+                    on_screen = ?on_screen,
+                    still_ready,
+                    deadline_evaluated = gate_elapsed.is_some(),
+                    gate_elapsed_us = gate_elapsed.map(|value| value.as_micros() as u64),
+                    gate_remaining_us = gate_elapsed.map(|value| {
+                        ACTIVATION_WAIT_TIMEOUT.saturating_sub(value).as_micros() as u64
+                    }),
+                    failure_observed_elapsed_us = failure_observed_elapsed.as_micros() as u64,
+                    failure_observed_remaining_us = ACTIVATION_WAIT_TIMEOUT
+                        .saturating_sub(failure_observed_elapsed).as_micros() as u64,
+                    "Selected ordinary readiness proof refused"
+                );
+            });
+        }
+    }
     anyhow::ensure!(
-        still_ready && publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
+        accepted,
         "selected ordinary readiness proof changed or expired; activation will not be retried"
     );
     Ok(())
@@ -3749,11 +3817,11 @@ fn with_foreground_hid_activation_inner(
                     publication_elapsed_ms = publication_started.elapsed().as_millis(),
                     "foreground ordinary readiness probe selected");
             }
-            let check_selected_ordinary = || {
+            let check_selected_ordinary = |phase| {
                 let proof = ready_ordinary_proof.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("selected ordinary readiness proof is unavailable"))?;
                 check_ready_ordinary_window(proof, target_pid, target_wid, target_psn,
-                    publication_started, || episode.check())
+                    publication_started, phase, || episode.check())
             };
             let complete_original = || if let Some(host_id) = standard_dialog_host {
                 // A selected proof that fails is terminal. Do not attempt the
@@ -3795,7 +3863,9 @@ fn with_foreground_hid_activation_inner(
                 || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
             ) };
             let ax_statuses = complete_after_ordinary_probe(
-                ready_ordinary, &check_selected_ordinary, complete_original,
+                ready_ordinary,
+                || check_selected_ordinary(OrdinaryValidationPhase::BeforeAxSkip),
+                complete_original,
             )?;
             await_exact_window_ready_guarded(target_pid, target_wid, target_psn, || {
                 episode.check()
@@ -3810,7 +3880,7 @@ fn with_foreground_hid_activation_inner(
             if ready_ordinary {
                 // Losing the selected proof is terminal, even when the old
                 // activation path could have reacquired focus. Never replay it.
-                check_selected_ordinary()?;
+                check_selected_ordinary(OrdinaryValidationPhase::BeforeInput)?;
             }
             crate::foreground_activity::check_input()?;
             let result = action(keyboard_sheet.as_ref());
