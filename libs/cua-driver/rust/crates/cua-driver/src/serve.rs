@@ -778,6 +778,113 @@ fn remove_owned_socket(socket_path: &str, identity: SocketIdentity) {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct PidFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn pid_file_identity(pid_file_path: &str) -> anyhow::Result<PidFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(pid_file_path)?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("daemon PID path is not a regular file: {pid_file_path}");
+    }
+    Ok(PidFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn remove_owned_pid_file(pid_file_path: &str, identity: PidFileIdentity) {
+    let Ok(current) = pid_file_identity(pid_file_path) else {
+        return;
+    };
+    if current.device == identity.device && current.inode == identity.inode {
+        let _ = std::fs::remove_file(pid_file_path);
+    }
+}
+
+/// Publish the daemon PID without ever exposing a partial or group/world-readable
+/// lifecycle file. The temporary file lives beside the destination so rename is
+/// atomic, and rename replaces a pre-existing symlink rather than following it.
+#[cfg(unix)]
+fn write_private_pid_file(pid_file_path: &str, pid: u32) -> anyhow::Result<PidFileIdentity> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let destination = std::path::Path::new(pid_file_path);
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("daemon PID path has no file name: {pid_file_path}"))?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| anyhow::anyhow!("create daemon PID directory {parent:?}: {error}"))?;
+
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        pid,
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let publish_result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| {
+                anyhow::anyhow!("create private daemon PID file {temporary:?}: {error}")
+            })?;
+        file.write_all(pid.to_string().as_bytes())
+            .map_err(|error| anyhow::anyhow!("write daemon PID file {temporary:?}: {error}"))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| anyhow::anyhow!("secure daemon PID file {temporary:?}: {error}"))?;
+        file.sync_all()
+            .map_err(|error| anyhow::anyhow!("sync daemon PID file {temporary:?}: {error}"))?;
+
+        let metadata = file.metadata().map_err(|error| {
+            anyhow::anyhow!("inspect private daemon PID file {temporary:?}: {error}")
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+        {
+            anyhow::bail!("daemon PID file is not a current-user private regular file");
+        }
+        drop(file);
+
+        std::fs::rename(&temporary, destination).map_err(|error| {
+            anyhow::anyhow!(
+                "atomically publish daemon PID file {temporary:?} as {destination:?}: {error}"
+            )
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = publish_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    let metadata = std::fs::symlink_metadata(destination)
+        .map_err(|error| anyhow::anyhow!("inspect daemon PID file {destination:?}: {error}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+    {
+        let _ = std::fs::remove_file(destination);
+        anyhow::bail!("published daemon PID file is not a current-user private regular file");
+    }
+    pid_file_identity(pid_file_path)
+}
+
+#[cfg(unix)]
 fn secure_local_socket(socket_path: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     let permissions = std::fs::Permissions::from_mode(0o600);
@@ -1095,13 +1202,20 @@ pub async fn run_serve(
 
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
-    // Write PID file.
-    if let Some(pid_path) = pid_file_path {
-        if let Some(dir) = std::path::Path::new(pid_path).parent() {
-            let _ = std::fs::create_dir_all(dir);
+    // Publish the PID only after the socket is bound. A managed caller uses
+    // this file as lifecycle authority, so creation must fail closed rather
+    // than leave a readable, partial, or stale PID behind.
+    let pid_file_identity = if let Some(pid_path) = pid_file_path {
+        match write_private_pid_file(pid_path, std::process::id()) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                remove_owned_socket(socket_path, bound_socket);
+                return Err(error);
+            }
         }
-        let _ = std::fs::write(pid_path, std::process::id().to_string());
-    }
+    } else {
+        None
+    };
 
     // Shutdown channel.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1511,8 +1625,8 @@ pub async fn run_serve(
 
     // Do not unlink a replacement socket created after this listener was bound.
     remove_owned_socket(socket_path, bound_socket);
-    if let Some(pid_path) = pid_file_path {
-        let _ = std::fs::remove_file(pid_path);
+    if let (Some(pid_path), Some(identity)) = (pid_file_path, pid_file_identity) {
+        remove_owned_pid_file(pid_path, identity);
     }
     sdk.shutdown()
         .await
@@ -2564,8 +2678,11 @@ pub fn run_revoke_cmd(socket_path: &str, session: Option<&str>, all: bool) {
 
 #[cfg(all(test, unix))]
 mod socket_tests {
-    use super::{remove_owned_socket, secure_local_socket, socket_identity};
-    use std::os::unix::fs::PermissionsExt as _;
+    use super::{
+        remove_owned_pid_file, remove_owned_socket, secure_local_socket, socket_identity,
+        write_private_pid_file,
+    };
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     #[test]
     fn every_local_service_socket_is_forced_private() {
@@ -2594,6 +2711,62 @@ mod socket_tests {
 
         assert!(socket.exists());
         drop(first);
+    }
+
+    #[test]
+    fn pid_file_is_atomically_replaced_and_forced_private() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("driver.pid");
+        std::fs::write(&pid_file, "stale-partial-value").unwrap();
+        std::fs::set_permissions(&pid_file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let stale_inode = std::fs::metadata(&pid_file).unwrap().ino();
+
+        let identity = write_private_pid_file(pid_file.to_str().unwrap(), 4242).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&pid_file).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_ne!(
+            metadata.ino(),
+            stale_inode,
+            "PID file must be renamed, not truncated in place"
+        );
+        assert_eq!(metadata.ino(), identity.inode);
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "4242");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pid_file_publish_replaces_a_symlink_without_following_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        let pid_file = directory.path().join("driver.pid");
+        std::fs::write(&victim, "do-not-change").unwrap();
+        std::os::unix::fs::symlink(&victim, &pid_file).unwrap();
+
+        write_private_pid_file(pid_file.to_str().unwrap(), 4242).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do-not-change");
+        assert!(!std::fs::symlink_metadata(&pid_file)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "4242");
+    }
+
+    #[test]
+    fn pid_cleanup_preserves_a_replacement_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("driver.pid");
+        let original = directory.path().join("original.pid");
+        let identity = write_private_pid_file(pid_file.to_str().unwrap(), 4242).unwrap();
+        std::fs::rename(&pid_file, &original).unwrap();
+        std::fs::write(&pid_file, "4343").unwrap();
+
+        remove_owned_pid_file(pid_file.to_str().unwrap(), identity);
+
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "4343");
     }
 }
 
