@@ -67,6 +67,13 @@ fn host_collection_role(role: &str) -> bool {
     matches!(role, "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea" | "AXTabGroup")
 }
 
+// Only literal inner structural roles are candidates. Neither missing AXRole
+// nor a host-side/action node gains authority; each accepted node must retain
+// the exact popup physical ID, logical popup/host and unique reciprocal path.
+fn inner_structural_role(role: &str) -> bool {
+    matches!(role, "AXList" | "AXUnknown")
+}
+
 trait PopoverTree {
     type Node: Clone;
     fn role(&self, node: &Self::Node) -> Option<String>;
@@ -118,19 +125,19 @@ fn revalidate_host_collection<T: PopoverTree>(
         && tree.within_budget()
 }
 
-/// Only paths containing an inner AXList pay for this retained-segment check.
-/// Lists are structural, never host anchors or action targets. Their logical
-/// window must remain the same retained popup/host, not a sibling with its ID.
-fn revalidate_inner_list<T: PopoverTree>(
+/// Only paths containing a qualified inner structural node pay for this check.
+/// These nodes are never host anchors or action targets. Their logical window
+/// must remain the same retained popup/host, not a sibling with its ID.
+fn revalidate_inner_structure<T: PopoverTree>(
     tree: &T,
     pid: i32,
     popover_id: u32,
     popover: &T::Node,
     nodes: &[T::Node],
     roles: &[String],
-    list_windows: &[(T::Node, T::Node)],
+    structural_windows: &[(T::Node, T::Node)],
 ) -> bool {
-    if nodes.is_empty() || nodes.len() != roles.len() || list_windows.is_empty() {
+    if nodes.is_empty() || nodes.len() != roles.len() || structural_windows.is_empty() {
         return false;
     }
     for (index, (node, role)) in nodes.iter().zip(roles).enumerate() {
@@ -143,8 +150,8 @@ fn revalidate_inner_list<T: PopoverTree>(
         {
             return false;
         }
-        if role == "AXList" {
-            let Some((_, window)) = list_windows.iter().find(|(list, _)| tree.same(list, node)) else {
+        if inner_structural_role(role) {
+            let Some((_, window)) = structural_windows.iter().find(|(inner, _)| tree.same(inner, node)) else {
                 return false;
             };
             if tree.owner(window) != Some(pid)
@@ -260,8 +267,8 @@ fn containing_popover<T: PopoverTree>(
         match role.as_deref() {
             Some("AXPopover") => return Ok(current),
             // Candidate discovery only. The full walk below must bind each
-            // inner list to this exact popup and revalidate its retained path.
-            Some("AXList") => {}
+            // inner structural node to this exact popup and revalidate its path.
+            Some(role) if inner_structural_role(role) => {}
             Some(role) if native_control_role(Some(role)) || container_role(role) => {}
             _ => {
                 tracing::debug!(target: "cua_popover_proof", stage = "containing_popover",
@@ -364,7 +371,7 @@ fn prove_checked<T: PopoverTree>(
     let mut host_roles = Vec::new();
     let mut uses_host_collection = false;
     let mut inner_roles = Vec::new();
-    let mut list_windows = Vec::new();
+    let mut structural_windows = Vec::new();
     for depth in 0..MAX_DEPTH {
         if !tree.within_budget() {
             return Err("ancestry_deadline");
@@ -378,10 +385,10 @@ fn prove_checked<T: PopoverTree>(
         if tree.same(&current, &host) {
             // Re-read the attachment after traversal; an old AXParent alone
             // must not authorize a closed or reattached panel.
-            let unchanged = (list_windows.is_empty()
-                || revalidate_inner_list(
+            let unchanged = (structural_windows.is_empty()
+                || revalidate_inner_structure(
                     tree, pid, popover_id, &popover,
-                    &visited[..host_segment_start], &inner_roles, &list_windows,
+                    &visited[..host_segment_start], &inner_roles, &structural_windows,
                 ))
                 && crossed_popover
                 && tree.window_id(&current) == Some(host_id)
@@ -435,7 +442,7 @@ fn prove_checked<T: PopoverTree>(
                 crossed_popover = true;
                 host_segment_start = visited.len();
             }
-            Some("AXList") if !crossed_popover => {
+            Some(role) if !crossed_popover && inner_structural_role(role) => {
                 let window = tree.window(&current).ok_or("inner_list_window_missing")?;
                 if tree.owner(&window) != Some(pid)
                     || tree.window_id(&current) != Some(popover_id)
@@ -444,7 +451,7 @@ fn prove_checked<T: PopoverTree>(
                 {
                     return Err("inner_list_identity_mismatch");
                 }
-                list_windows.push((current.clone(), window));
+                structural_windows.push((current.clone(), window));
             }
             Some(role) if crossed_popover && host_collection_role(role) => {
                 if tree.window_id(&current) != Some(host_id)
@@ -469,7 +476,7 @@ fn prove_checked<T: PopoverTree>(
         let Some(parent) = tree.parent(&current) else {
             return Err("ancestor_parent_missing");
         };
-        let reciprocal = if role.as_deref() == Some("AXList") && !crossed_popover {
+        let reciprocal = if !crossed_popover && role.as_deref().is_some_and(inner_structural_role) {
             tree.contains_unique_child(&parent, &current)
         } else {
             tree.contains_child(&parent, &current)
@@ -1679,7 +1686,7 @@ mod tests {
                 }
                 assert!(!prove(&tree, 42, 700, &0), "logical_host={logical_host} kind={kind}");
             }
-            for role in ["AXWebArea", "AXTable", "AXIncrementor", "AXApplication", "AXUnknown", "AXPopover"] {
+            for role in ["AXWebArea", "AXTable", "AXIncrementor", "AXApplication", "AXPopover"] {
                 let mut tree = inner_list(logical_host);
                 tree.nodes.get_mut(&1).unwrap().role = role;
                 assert!(!prove(&tree, 42, 700, &0), "inner boundary {role}");
@@ -1754,6 +1761,10 @@ mod tests {
         fn role(&self, node: &u32) -> Option<String> {
             if (*node == 8 && self.changed("role")) || (*node == 1 && self.changed("prefix_role")) {
                 Some("AXGroup".into())
+            } else if *node == 8 && self.changed("role_to_list") {
+                Some("AXList".into())
+            } else if *node == 8 && self.changed("role_missing") {
+                None
             } else { self.tree.role(node) }
         }
         fn owner(&self, node: &u32) -> Option<i32> {
@@ -1820,6 +1831,187 @@ mod tests {
         tree.nodes.get_mut(&4).unwrap().role = "AXTabGroup";
         tree.budget.set(500);
         tree
+    }
+
+    fn inner_structural_chain(logical_host: bool) -> Tree {
+        // Complete observed ten-node chain, with normalized IDs:
+        // CheckBox(0) -> CheckBox(1) -> List(10) -> List(11) -> Unknown(8)
+        // -> Popover(2) -> Button(3) -> TabGroup(4) -> SplitGroup(5) -> Window(6).
+        // The first six share the popup physical ID; all non-host AXWindow
+        // attributes name the exact host in the observed logical_host variant.
+        let mut tree = tab_group_host(logical_host, true);
+        tree.nodes.get_mut(&1).unwrap().parent = Some(10);
+        tree.nodes.get_mut(&8).unwrap().role = "AXUnknown";
+        tree.nodes.get_mut(&8).unwrap().children = vec![11];
+        for (node, parent, child) in [(10, 11, 1), (11, 8, 10)] {
+            tree.nodes.insert(node, Node {
+                identity: node, role: "AXList", owner: 42,
+                window: Some(6), id: Some(900), parent: Some(parent), children: vec![child],
+            });
+        }
+        tree
+    }
+
+    #[test]
+    fn inner_structural_proves_complete_native_chain_and_qualified_unknown_prefix() {
+        for logical_host in [false, true] {
+            for logical_window in [2, 6] {
+                let mut tree = inner_structural_chain(logical_host);
+                for node in [8, 10, 11] {
+                    tree.nodes.get_mut(&node).unwrap().window = Some(logical_window);
+                }
+                assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
+            }
+            // This former blanket-negative node was already fully qualified:
+            // same popup physical ID, exact logical host, unique retained edges.
+            let mut tree = inner_list(logical_host);
+            tree.nodes.get_mut(&1).unwrap().role = "AXUnknown";
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
+            let mut tree = inner_structural_chain(logical_host);
+            for node in [10, 11] { tree.nodes.get_mut(&node).unwrap().role = "AXUnknown"; }
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()), "no List is needed to trigger revalidation");
+        }
+        let mut tree = inner_structural_chain(true);
+        tree.nodes.insert(9000, tree.nodes[&6].clone());
+        tree.nodes.get_mut(&8).unwrap().window = Some(9000);
+        assert!(prove(&tree, 42, 700, &0), "CF-equivalent retained host proxy");
+    }
+
+    #[test]
+    fn inner_structural_requires_exact_physical_logical_owner_and_real_role() {
+        for logical_host in [false, true] {
+            for node in [8, 10, 11] {
+                for kind in 0..9 {
+                    let mut tree = inner_structural_chain(logical_host);
+                    let source = if kind == 8 { 2 } else { 6 };
+                    tree.nodes.insert(9000, tree.nodes[&source].clone());
+                    tree.nodes.get_mut(&9000).unwrap().identity = 9000;
+                    let entry = tree.nodes.get_mut(&node).unwrap();
+                    match kind {
+                        0 => entry.owner = 99,
+                        1 => entry.id = None,
+                        2 => entry.id = Some(700),
+                        3 => entry.id = Some(901),
+                        4 => entry.window = None,
+                        5 => entry.window = Some(9),
+                        6 => entry.parent = None,
+                        _ => entry.window = Some(9000),
+                    }
+                    assert!(!prove(&tree, 42, 700, &0), "node={node} kind={kind}");
+                }
+            }
+            let tree = LateInnerChange { tree: inner_structural_chain(logical_host), field: "role_missing",
+                armed: Cell::new(true), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+            assert!(!prove(&tree, 42, 700, &0), "missing AXRole is not literal AXUnknown");
+            assert!(tree.late_reads.get() > 0);
+        }
+    }
+
+    #[test]
+    fn inner_structural_keeps_target_outer_web_and_container_boundaries() {
+        assert!(!native_control_role(Some("AXUnknown")));
+        assert!(!container_role("AXUnknown"));
+        assert!(!host_collection_role("AXUnknown"));
+        for action in ["press", "click", "pick", "show_menu", "confirm", "cancel"] {
+            assert_eq!(advertised_action(Some("AXUnknown"), action,
+                &["AXPress".into(), "AXPick".into(), "AXShowMenu".into(), "AXConfirm".into(), "AXCancel".into()]), None);
+        }
+        for logical_host in [false, true] {
+            assert!(!prove(&inner_structural_chain(logical_host), 42, 700, &8), "structure is not a target");
+            for node in [2, 3, 4, 5, 6] {
+                let mut tree = inner_structural_chain(logical_host);
+                tree.nodes.get_mut(&node).unwrap().role = "AXUnknown";
+                assert!(!prove(&tree, 42, 700, &0), "Unknown cannot replace popup/host or an outer node {node}");
+            }
+            for role in ["AXWebArea", "AXTable", "AXIncrementor", "AXApplication", "AXTabGroup", "AXOutline", "AXPopover"] {
+                let mut tree = inner_structural_chain(logical_host);
+                tree.nodes.get_mut(&8).unwrap().role = role;
+                assert!(!prove(&tree, 42, 700, &0), "inner boundary {role}");
+            }
+        }
+    }
+
+    #[test]
+    fn inner_structural_keeps_unique_edges_cycle_child_depth_and_deadline_limits() {
+        for logical_host in [false, true] {
+            for parent in [1, 10, 11, 8, 2] {
+                for duplicate in [false, true] {
+                    let mut tree = inner_structural_chain(logical_host);
+                    let entry = tree.nodes.get_mut(&parent).unwrap();
+                    if duplicate { entry.children.push(entry.children[0]); } else { entry.children.clear(); }
+                    assert!(!prove(&tree, 42, 700, &0), "parent={parent} duplicate={duplicate}");
+                }
+            }
+            let mut tree = inner_structural_chain(logical_host);
+            tree.nodes.get_mut(&8).unwrap().parent = Some(1);
+            tree.nodes.get_mut(&1).unwrap().children.push(8);
+            assert!(!prove(&tree, 42, 700, &0), "reciprocal cycle");
+            let tree = inner_structural_chain(logical_host);
+            tree.budget.set(0);
+            assert!(!prove(&tree, 42, 700, &0));
+            for extra in [MAX_DEPTH - 10, MAX_DEPTH - 9] {
+                let mut tree = inner_structural_chain(logical_host);
+                tree.budget.set(2000);
+                tree.nodes.get_mut(&8).unwrap().parent = Some(100);
+                let last = 100 + extra as u32 - 1;
+                tree.nodes.get_mut(&2).unwrap().children = vec![last];
+                for node in 100..=last {
+                    tree.nodes.insert(node, Node {
+                        identity: node, role: "AXUnknown", owner: 42,
+                        window: Some(6), id: Some(900),
+                        parent: Some(if node == last { 2 } else { node + 1 }),
+                        children: vec![if node == 100 { 8 } else { node - 1 }],
+                    });
+                }
+                let expected = if extra == MAX_DEPTH - 10 { Ok(()) } else { Err("ancestry_depth_limit") };
+                assert_eq!(prove_checked(&tree, 42, 700, &0), expected, "total depth {}", extra + 10);
+            }
+            for count in [MAX_CHILDREN as usize, MAX_CHILDREN as usize + 1] {
+                let mut tree = inner_structural_chain(logical_host);
+                for index in 1..count {
+                    let node = 1000 + index as u32;
+                    let mut sibling = tree.nodes[&11].clone();
+                    sibling.identity = node;
+                    tree.nodes.insert(node, sibling);
+                    tree.nodes.get_mut(&8).unwrap().children.push(node);
+                }
+                assert_eq!(prove(&tree, 42, 700, &0), count == MAX_CHILDREN as usize, "children={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn inner_structural_revalidates_unknown_and_prefix_after_the_complete_walk() {
+        for logical_host in [false, true] {
+            for field in ["role", "role_to_list", "role_missing", "owner", "window", "id", "parent", "children", "deadline", "prefix_role", "prefix_parent"] {
+                let tree = LateInnerChange { tree: inner_structural_chain(logical_host), field,
+                    armed: Cell::new(false), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+                assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "late {field}");
+                assert!(tree.armed.get());
+                assert!(tree.late_reads.get() > 0, "late {field} must be read");
+                assert!(tree.unique_reads.get() >= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn inner_structural_preserves_outer_revalidation_and_legacy_query_boundary() {
+        for logical_host in [false, true] {
+            for field in ["role", "owner", "window", "id", "parent", "children"] {
+                let node = if field == "children" { 5 } else { 4 };
+                let tree = ChangingHost::new(inner_structural_chain(logical_host), node, field);
+                assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "outer {field}");
+                assert!(tree.reads.get() >= 2);
+                assert!(tree.unique_reads.get() > 0);
+            }
+        }
+        for legacy in [pages(), wrapped_toolbar_popover()] {
+            let tree = LateInnerChange { tree: legacy, field: "role_missing",
+                armed: Cell::new(true), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+            assert!(prove(&tree, 42, 700, &0));
+            assert_eq!(tree.unique_reads.get(), 0, "legacy-only route never enters structural revalidation");
+            assert_eq!(tree.late_reads.get(), 0);
+        }
     }
 
     #[test]
