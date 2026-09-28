@@ -81,6 +81,143 @@ pub(crate) fn monotonic_us() -> u64 {
     micros(ORIGIN.get_or_init(Instant::now).elapsed())
 }
 
+const CALLSITE_RECORD_LIMIT: u64 = 128;
+
+/// Contain only diagnostic acquisition/emission, especially inside an extern
+/// C callback. This catches unwinding panics, not panic=abort or native faults.
+/// Never put an AppKit call, transport or other business operation inside it.
+pub(crate) fn diagnostic_only<T>(diagnostic: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(diagnostic)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            // A subscriber may panic with a payload whose destructor also
+            // panics. Do not let that destructor unwind across the FFI edge.
+            std::mem::forget(payload);
+            None
+        }
+    }
+}
+
+/// Diagnostic output only: never a limit on the operation being measured.
+/// Each site emits at most 128 records and one explicit saturation notice.
+pub(crate) struct LimitedCallsite {
+    name: &'static str,
+    count: AtomicU64,
+}
+
+impl LimitedCallsite {
+    pub(crate) const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn sequence_if_enabled(&self, enabled: bool) -> Option<u64> {
+        if !enabled {
+            return None;
+        }
+        self.count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                if count <= CALLSITE_RECORD_LIMIT {
+                    Some(count + 1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .map(|previous| previous + 1)
+    }
+
+    pub(crate) fn begin(&self) -> Option<CallMeasurement> {
+        diagnostic_only(|| {
+            let sequence = self.sequence_if_enabled(
+                tracing::enabled!(target: "cua_window_order", tracing::Level::DEBUG),
+            )?;
+            Some(CallMeasurement {
+                callsite: self.name,
+                sequence,
+                started_ns: uptime_ns(),
+            })
+        })
+        .flatten()
+    }
+}
+
+fn checked_uptime(status: i32, seconds: i64, nanos: i64) -> Option<u64> {
+    if status != 0 || !(0..1_000_000_000).contains(&nanos) {
+        return None;
+    }
+    u64::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(nanos as u64)
+}
+
+/// Process-independent CLOCK_UPTIME_RAW nanoseconds, also used by the
+/// independent sampler. Failure stays explicit; UTC is not a fallback.
+fn uptime_ns() -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut time) };
+    checked_uptime(status, time.tv_sec, time.tv_nsec)
+}
+
+pub(crate) struct CallMeasurement {
+    callsite: &'static str,
+    sequence: u64,
+    started_ns: Option<u64>,
+}
+
+impl CallMeasurement {
+    pub(crate) fn sequence(&self) -> Option<u64> {
+        (self.sequence <= CALLSITE_RECORD_LIMIT).then_some(self.sequence)
+    }
+
+    pub(crate) fn started_ns(&self) -> Option<u64> {
+        self.started_ns
+    }
+
+    pub(crate) fn timestamp(&self) -> Option<u64> {
+        self.sequence().and_then(|_| uptime_ns())
+    }
+
+    /// Call only after the existing operation. stderr is synchronous and can
+    /// still delay subsequent work; these diagnostics are not timing-neutral.
+    pub(crate) fn finish(self) -> Option<CallTiming> {
+        diagnostic_only(|| {
+            let finished_ns = uptime_ns();
+            if self.sequence > CALLSITE_RECORD_LIMIT {
+                tracing::debug!(
+                    target: "cua_window_order",
+                    diagnostic_site = self.callsite,
+                    diagnostic_saturated = true,
+                    record_limit = CALLSITE_RECORD_LIMIT,
+                    clock = "CLOCK_UPTIME_RAW",
+                    started_ns = self.started_ns,
+                    finished_ns,
+                    "Window/input diagnostic record limit reached"
+                );
+                return None;
+            }
+            Some(CallTiming {
+                sequence: self.sequence,
+                started_ns: self.started_ns,
+                finished_ns,
+            })
+        })
+        .flatten()
+    }
+}
+
+pub(crate) struct CallTiming {
+    pub(crate) sequence: u64,
+    pub(crate) started_ns: Option<u64>,
+    pub(crate) finished_ns: Option<u64>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Trace {
     id: u64,
@@ -189,6 +326,42 @@ mod tests {
         CLOCK.with(|clock| clock.set(value));
     }
 
+    #[test]
+    fn limited_callsite_has_one_saturation_ticket_then_stops() {
+        let site = LimitedCallsite::new("test.limit");
+        for expected in 1..=CALLSITE_RECORD_LIMIT + 1 {
+            assert_eq!(site.sequence_if_enabled(true), Some(expected));
+        }
+        for _ in 0..16 {
+            assert_eq!(site.sequence_if_enabled(true), None);
+        }
+        assert_eq!(site.count.load(Ordering::Relaxed), CALLSITE_RECORD_LIMIT + 1);
+    }
+
+    #[test]
+    fn disabled_callsite_does_not_consume_its_diagnostic_budget() {
+        let site = LimitedCallsite::new("test.disabled");
+        for _ in 0..16 {
+            assert_eq!(site.sequence_if_enabled(false), None);
+        }
+        assert_eq!(site.count.load(Ordering::Relaxed), 0);
+        assert_eq!(site.sequence_if_enabled(true), Some(1));
+    }
+
+    #[test]
+    fn shared_uptime_rejects_failure_invalid_fields_and_overflow() {
+        assert_eq!(checked_uptime(0, 12, 34), Some(12_000_000_034));
+        for (status, seconds, nanos) in [
+            (-1, 12, 34),
+            (0, -1, 0),
+            (0, 0, -1),
+            (0, 0, 1_000_000_000),
+            (0, i64::MAX, 0),
+        ] {
+            assert_eq!(checked_uptime(status, seconds, nanos), None);
+        }
+    }
+
     #[derive(Clone, Default)]
     struct Events(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
     struct Fields(BTreeMap<String, String>);
@@ -216,6 +389,89 @@ mod tests {
         }
         fn enter(&self, _: &Id) {}
         fn exit(&self, _: &Id) {}
+    }
+
+    struct PanickingSubscriber {
+        panic_when_enabled: bool,
+    }
+
+    impl Subscriber for PanickingSubscriber {
+        fn register_callsite(
+            &self,
+            _: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            // Keep subscriber installation non-panicking. Exercise the real
+            // protected enabled/event calls rather than callsite registration.
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            assert!(!self.panic_when_enabled, "diagnostic enabled panic");
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, _: &Event<'_>) {
+            panic!("diagnostic event panic");
+        }
+
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn subscriber_panics_are_contained_by_real_diagnostic_entry_points() {
+        let site = LimitedCallsite::new("test.panic");
+        tracing::subscriber::with_default(
+            PanickingSubscriber {
+                panic_when_enabled: true,
+            },
+            || assert!(site.begin().is_none()),
+        );
+        assert_eq!(site.count.load(Ordering::Relaxed), 0);
+
+        tracing::subscriber::with_default(
+            PanickingSubscriber {
+                panic_when_enabled: false,
+            },
+            || {
+                let measurement = CallMeasurement {
+                    callsite: "test.panic",
+                    sequence: CALLSITE_RECORD_LIMIT + 1,
+                    started_ns: Some(1),
+                };
+                assert!(measurement.finish().is_none());
+                assert!(diagnostic_only(|| {
+                    tracing::debug!(target: "cua_window_order", "diagnostic emission probe");
+                })
+                .is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn saturation_notice_is_emitted_only_when_the_operation_finishes() {
+        let events = Events::default();
+        tracing::subscriber::with_default(events.clone(), || {
+            let measurement = CallMeasurement {
+                callsite: "test.saturation",
+                sequence: CALLSITE_RECORD_LIMIT + 1,
+                started_ns: Some(1),
+            };
+            assert!(events.0.lock().unwrap().is_empty());
+            assert!(measurement.finish().is_none());
+        });
+        let rows = events.0.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["diagnostic_site"], "test.saturation");
+        assert_eq!(rows[0]["diagnostic_saturated"], "true");
+        assert_eq!(rows[0]["record_limit"], CALLSITE_RECORD_LIMIT.to_string());
     }
 
     #[test]

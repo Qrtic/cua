@@ -354,39 +354,169 @@ unsafe extern "C" fn present_frames(_ctx: *mut c_void) {
     // Each CGImage is released even when its display/generation was retired.
 }
 
+#[derive(Clone, Copy)]
+struct EnqueueDiagnostic {
+    site: &'static str,
+    sequence: u64,
+    started_ns: Option<u64>,
+}
+
+type OrderRequest = (u64, Option<(u64, bool)>, Option<EnqueueDiagnostic>);
+
+fn enqueue_diagnostic(
+    site: &'static str,
+    measurement: Option<&crate::order_diagnostics::CallMeasurement>,
+) -> Option<EnqueueDiagnostic> {
+    let measurement = measurement?;
+    Some(EnqueueDiagnostic {
+        site,
+        sequence: measurement.sequence()?,
+        started_ns: measurement.started_ns(),
+    })
+}
+
 pub(super) fn order_front(generation: u64) {
+    static DIAGNOSTICS: crate::order_diagnostics::LimitedCallsite =
+        crate::order_diagnostics::LimitedCallsite::new("overlay_enqueue_front");
+    let diagnostic = DIAGNOSTICS.begin();
+    let metadata = enqueue_diagnostic("overlay_enqueue_front", diagnostic.as_ref());
     dispatch_main(
-        Box::into_raw(Box::new((generation, None::<(u64, bool)>))).cast(),
+        Box::into_raw(Box::new((generation, None::<(u64, bool)>, metadata))).cast(),
         order_callback,
     );
+    if let Some(timing) = diagnostic.and_then(|measurement| measurement.finish()) {
+        let _ = crate::order_diagnostics::diagnostic_only(|| {
+            tracing::debug!(
+                target: "cua_window_order",
+                diagnostic_site = "overlay_enqueue_front",
+                sequence = timing.sequence,
+                clock = "CLOCK_UPTIME_RAW",
+                started_ns = timing.started_ns,
+                finished_ns = timing.finished_ns,
+                rust_thread_id = ?std::thread::current().id(),
+                requested_generation = generation,
+                "Queued existing unpinned overlay order callback"
+            );
+        });
+    }
 }
 
 pub(super) fn order_above(generation: u64, target_wid: u64, raise_front: bool) {
+    static DIAGNOSTICS: crate::order_diagnostics::LimitedCallsite =
+        crate::order_diagnostics::LimitedCallsite::new("overlay_enqueue_above");
+    let diagnostic = DIAGNOSTICS.begin();
+    let metadata = enqueue_diagnostic("overlay_enqueue_above", diagnostic.as_ref());
     dispatch_main(
-        Box::into_raw(Box::new((generation, Some((target_wid, raise_front))))).cast(),
+        Box::into_raw(Box::new((generation, Some((target_wid, raise_front)), metadata))).cast(),
         order_callback,
     );
+    if let Some(timing) = diagnostic.and_then(|measurement| measurement.finish()) {
+        let _ = crate::order_diagnostics::diagnostic_only(|| {
+            tracing::debug!(
+                target: "cua_window_order",
+                diagnostic_site = "overlay_enqueue_above",
+                sequence = timing.sequence,
+                clock = "CLOCK_UPTIME_RAW",
+                started_ns = timing.started_ns,
+                finished_ns = timing.finished_ns,
+                rust_thread_id = ?std::thread::current().id(),
+                requested_generation = generation,
+                target_window_id = target_wid,
+                captured_raise_front = raise_front,
+                "Queued existing target-relative overlay order callback"
+            );
+        });
+    }
 }
 
 unsafe extern "C" fn order_callback(ctx: *mut c_void) {
-    let (generation, target): (u64, Option<(u64, bool)>) = *Box::from_raw(ctx.cast());
+    static DIAGNOSTICS: crate::order_diagnostics::LimitedCallsite =
+        crate::order_diagnostics::LimitedCallsite::new("overlay_callback");
+    static SURFACE_DIAGNOSTICS: crate::order_diagnostics::LimitedCallsite =
+        crate::order_diagnostics::LimitedCallsite::new("overlay_surface_sequence");
+    let diagnostic = DIAGNOSTICS.begin();
+    let (generation, target, enqueued): OrderRequest = *Box::from_raw(ctx.cast());
+    let mut observed_generation = None;
+    let mut generation_matched = false;
+    let mut receiver_count = 0;
     SURFACES.with(|cell| {
         let state = cell.borrow();
+        observed_generation = Some(state.layout.generation);
         if state.layout.generation != generation {
             return;
         }
-        for surface in state.surfaces.values() {
+        generation_matched = true;
+        receiver_count = state.surfaces.len();
+        for (display_id, surface) in &state.surfaces {
+            let surface_diagnostic = SURFACE_DIAGNOSTICS.begin();
+            let mut relative_finished_ns = None;
+            let mut front_started_ns = None;
             if let Some((target_wid, raise_front)) = target {
                 let _: () =
                     msg_send![&*surface.window, orderWindow: 1i64 relativeTo: target_wid as i64];
+                relative_finished_ns = surface_diagnostic
+                    .as_ref()
+                    .and_then(|measurement| measurement.timestamp());
                 if raise_front {
+                    front_started_ns = surface_diagnostic
+                        .as_ref()
+                        .and_then(|measurement| measurement.timestamp());
                     let _: () = msg_send![&*surface.window, orderFrontRegardless];
                 }
             } else {
+                front_started_ns = surface_diagnostic
+                    .as_ref()
+                    .and_then(|measurement| measurement.started_ns());
                 let _: () = msg_send![&*surface.window, orderFrontRegardless];
+            }
+            if let Some(timing) = surface_diagnostic.and_then(|measurement| measurement.finish()) {
+                let _ = crate::order_diagnostics::diagnostic_only(|| {
+                    tracing::debug!(
+                        target: "cua_window_order",
+                        diagnostic_site = "overlay_surface_sequence",
+                        sequence = timing.sequence,
+                        clock = "CLOCK_UPTIME_RAW",
+                        started_ns = timing.started_ns,
+                        finished_ns = timing.finished_ns,
+                        rust_thread_id = ?std::thread::current().id(),
+                        enqueue_site = enqueued.map(|entry| entry.site),
+                        enqueue_sequence = enqueued.map(|entry| entry.sequence),
+                        receiver_window_id = surface.window_id,
+                        display_id = *display_id,
+                        target_window_id = target.map(|value| value.0),
+                        relative_order_called = target.is_some(),
+                        relative_finished_ns,
+                        front_order_called = target.is_none_or(|value| value.1),
+                        front_started_ns,
+                        "Existing owned overlay ordering sequence returned"
+                    );
+                });
             }
         }
     });
+    if let Some(timing) = diagnostic.and_then(|measurement| measurement.finish()) {
+        let _ = crate::order_diagnostics::diagnostic_only(|| {
+            tracing::debug!(
+                target: "cua_window_order",
+                diagnostic_site = "overlay_callback",
+                sequence = timing.sequence,
+                clock = "CLOCK_UPTIME_RAW",
+                started_ns = timing.started_ns,
+                finished_ns = timing.finished_ns,
+                rust_thread_id = ?std::thread::current().id(),
+                enqueue_site = enqueued.map(|entry| entry.site),
+                enqueue_sequence = enqueued.map(|entry| entry.sequence),
+                enqueue_started_ns = enqueued.and_then(|entry| entry.started_ns),
+                requested_generation = generation,
+                observed_generation,
+                generation_matched,
+                receiver_count,
+                target_window_id = target.map(|value| value.0),
+                captured_raise_front = target.map(|value| value.1),
+                "Existing overlay order callback returned"
+            );
+        });
+    }
 }
 
 fn dispatch_main(context: *mut c_void, callback: unsafe extern "C" fn(*mut c_void)) {

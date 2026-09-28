@@ -387,7 +387,34 @@ pub(super) fn post_to_pid(pid: pid_t, event_ptr: *mut c_void, attach_auth_messag
         }
     }
 
+    // False selects an unauthenticated post, not necessarily a mouse event.
+    // Do not read the event payload or change the transport for diagnostics.
+    static DIAGNOSTICS: crate::order_diagnostics::LimitedCallsite =
+        crate::order_diagnostics::LimitedCallsite::new("pid_post_without_auth");
+    let diagnostic = if !attach_auth_message {
+        DIAGNOSTICS.begin()
+    } else {
+        None
+    };
     unsafe { post_fn(pid, event_ptr) };
+    if let Some(timing) = diagnostic.and_then(|measurement| measurement.finish()) {
+        let _ = crate::order_diagnostics::diagnostic_only(|| {
+            tracing::debug!(
+                target: "cua_window_order",
+                diagnostic_site = "pid_post_without_auth",
+                sequence = timing.sequence,
+                clock = "CLOCK_UPTIME_RAW",
+                started_ns = timing.started_ns,
+                finished_ns = timing.finished_ns,
+                rust_thread_id = ?std::thread::current().id(),
+                target_pid = pid,
+                api = "SLEventPostToPid",
+                attach_auth_message = false,
+                post_attempted = true,
+                "Unauthenticated PID post returned; delivery effect unverified"
+            );
+        });
+    }
     true
 }
 

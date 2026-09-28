@@ -1468,11 +1468,61 @@ fn post_mouse_event_with_mode(
     // Always stamp f40 = target pid (Chromium synthetic-event filter).
     crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
 
+    static DIAGNOSTICS: crate::order_diagnostics::LimitedCallsite =
+        crate::order_diagnostics::LimitedCallsite::new("mouse_transport");
+    let diagnostic = DIAGNOSTICS.begin();
+    let mut private_closure_called = false;
+    let mut private_post_attempted = None;
+    let mut public_closure_called = false;
+    let mut public_started_ns = None;
+    let mut public_finished_ns = None;
     post_mouse_event_transport(
         mode,
-        || crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false),
-        || event.post_to_pid(pid as libc::pid_t),
+        || {
+            private_closure_called = true;
+            let attempted = crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+            private_post_attempted = Some(attempted);
+            attempted
+        },
+        || {
+            public_closure_called = true;
+            public_started_ns = diagnostic
+                .as_ref()
+                .and_then(|measurement| measurement.timestamp());
+            event.post_to_pid(pid as libc::pid_t);
+            public_finished_ns = diagnostic
+                .as_ref()
+                .and_then(|measurement| measurement.timestamp());
+        },
     );
+    if let Some(timing) = diagnostic.and_then(|measurement| measurement.finish()) {
+        let mode = match mode {
+            MousePostMode::Both => "both",
+            MousePostMode::PublicOnly => "public_only",
+            MousePostMode::SkyLightOrPublic => "skylight_or_public",
+        };
+        let _ = crate::order_diagnostics::diagnostic_only(|| {
+            tracing::debug!(
+                target: "cua_window_order",
+                diagnostic_site = "mouse_transport",
+                sequence = timing.sequence,
+                clock = "CLOCK_UPTIME_RAW",
+                started_ns = timing.started_ns,
+                finished_ns = timing.finished_ns,
+                rust_thread_id = ?std::thread::current().id(),
+                target_pid = pid,
+                window_id = wid,
+                event_type = event.get_type() as u32,
+                mode,
+                private_closure_called,
+                private_post_attempted,
+                public_closure_called,
+                public_started_ns,
+                public_finished_ns,
+                "Mouse transport returned; delivery effect unverified"
+            );
+        });
+    }
 }
 
 /// Post a stamped `mouseMoved` to `pid` at `point` before a down/up pair.
