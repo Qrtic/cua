@@ -92,6 +92,73 @@ struct CrossingWitness {
 
 const ORDER_CANDIDATE_ROW_LIMIT: usize = 8;
 
+#[derive(Clone, Copy, Debug)]
+enum QueryCandidateStatus {
+    Unique,
+    MissingInQueryUnknown,
+    DuplicateInQueryUnknown,
+    DuplicateInitialIdentityUnknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Fixed metadata consumed by bounded Debug output.
+struct QueryCandidateRow {
+    pid: i32,
+    window_id: u32,
+    retained_initial_matches: usize,
+    query_matches: usize,
+    status: QueryCandidateStatus,
+    query_index: Option<usize>,
+    row: Option<OrderWindowWitness>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Capture status and rows are diagnostic evidence only.
+enum PostAxQueryRows {
+    NotReachedAxReturn,
+    DiagnosticFailed,
+    Captured {
+        initial_candidate_count: usize,
+        initial_rows_truncated: bool,
+        first: [Option<QueryCandidateRow>; ORDER_CANDIDATE_ROW_LIMIT],
+        final_query: [Option<QueryCandidateRow>; ORDER_CANDIDATE_ROW_LIMIT],
+    },
+}
+
+// Slots follow retained initial identities, not stack order. query_index refers
+// to the original query slice. None means no initial identity was retained in
+// that slot; missing/repeated rows remain unknown, never absence/order proof.
+fn query_candidate_rows(
+    initial: &[Option<OrderWindowWitness>; ORDER_CANDIDATE_ROW_LIMIT],
+    windows: &[WindowInfo],
+) -> [Option<QueryCandidateRow>; ORDER_CANDIDATE_ROW_LIMIT] {
+    std::array::from_fn(|slot| {
+        let identity = initial[slot]?;
+        let retained_initial_matches = initial.iter().flatten()
+            .filter(|w| w.pid == identity.pid && w.window_id == identity.window_id).count();
+        let mut query_matches = 0;
+        let mut first = None;
+        for (index, window) in windows.iter().enumerate()
+            .filter(|(_, w)| w.pid == identity.pid && w.window_id == identity.window_id) {
+            query_matches += 1;
+            if query_matches == 1 { first = Some((index, window)); }
+        }
+        let status = if retained_initial_matches != 1 {
+            QueryCandidateStatus::DuplicateInitialIdentityUnknown
+        } else {
+            match query_matches {
+                0 => QueryCandidateStatus::MissingInQueryUnknown,
+                1 => QueryCandidateStatus::Unique,
+                _ => QueryCandidateStatus::DuplicateInQueryUnknown,
+            }
+        };
+        let unique = matches!(status, QueryCandidateStatus::Unique).then_some(first).flatten();
+        Some(QueryCandidateRow { pid: identity.pid, window_id: identity.window_id,
+            retained_initial_matches, query_matches, status,
+            query_index: unique.map(|(index, _)| index), row: unique.map(|(_, w)| w.into()) })
+    })
+}
+
 struct OrderWitness {
     measurement: Option<CallMeasurement>,
     trace_id: u64,
@@ -107,6 +174,7 @@ struct OrderWitness {
     final_snapshot_succeeded: Option<bool>,
     tab_candidate: Option<u32>,
     ax_status: Option<i32>,
+    post_ax_query_rows: PostAxQueryRows,
 }
 
 impl OrderWitness {
@@ -118,7 +186,8 @@ impl OrderWitness {
             initial_foreground: None, initial_candidates: [None; ORDER_CANDIDATE_ROW_LIMIT],
             initial_candidate_count: guard.candidates.len(), initial_rows_truncated: false,
             source: None, first: None, final_check: None, final_snapshot_succeeded: None,
-            tab_candidate: None, ax_status: None };
+            tab_candidate: None, ax_status: None,
+            post_ax_query_rows: PostAxQueryRows::NotReachedAxReturn };
         if result.enabled() {
             // Preserve supplied snapshot order; never iterate the HashSet as
             // though it represented stack order. This is only a bounded copy.
@@ -155,6 +224,7 @@ impl Drop for OrderWitness {
                 initial_rows_truncated=self.initial_rows_truncated, first_crossed=?self.first,
                 final_crossed=?self.final_check, final_snapshot_succeeded=self.final_snapshot_succeeded,
                 tab_candidate=self.tab_candidate, ax_status=self.ax_status,
+                post_ax_query_rows=?self.post_ax_query_rows,
                 "Background ordering decision witnesses; AX status is not restoration confirmation");
         });
     }
@@ -652,7 +722,21 @@ impl BackgroundOrderGuard {
         let status = self.trace.measure(Phase::OrderingRaise, Some(source), || unsafe {
             ax::perform_action(window.0, "AXRaise")
         });
-        if let Some(record) = &mut witness { record.ax_status = Some(status); }
+        if let Some(record) = &mut witness {
+            record.ax_status = Some(status);
+            if record.enabled() {
+                // Copy the original immutable query rows only after AX returns,
+                // including a nonzero AX status. No new query, Space lookup or
+                // work in the final-admission-to-AX interval. Later diagnostic
+                // copies and output can still perturb subsequent scheduling.
+                record.post_ax_query_rows = diagnostic_only(|| PostAxQueryRows::Captured {
+                    initial_candidate_count: record.initial_candidate_count,
+                    initial_rows_truncated: record.initial_rows_truncated,
+                    first: query_candidate_rows(&record.initial_candidates, windows),
+                    final_query: query_candidate_rows(&record.initial_candidates, &latest.windows),
+                }).unwrap_or(PostAxQueryRows::DiagnosticFailed);
+            }
+        }
         tracing::debug!(target: "cua_window_order", pid=self.pid, window=self.window,
             order_trace_id=self.trace.id(), check_source=source.label(),
             target_pid=self.target_pid, ax_status=status,
@@ -679,6 +763,63 @@ mod tests {
             bounds: WindowBounds { x: 0.0, y: 0.0, width: 600.0, height: 400.0 },
             layer: 0, is_on_screen: true, current_space_id: Some(1),
             on_current_space: Some(true), space_ids: Some(vec![1]) }
+    }
+
+    #[test]
+    fn post_ax_rows_distinguish_main_from_first_match() {
+        let before = [window(1, 10, 30), window(2, 21, 20), window(2, 20, 10)];
+        let ids = eligible_below(&before, 1, 10, 2);
+        let mut initial = [None; ORDER_CANDIDATE_ROW_LIMIT];
+        initial[0] = Some((&before[1]).into());
+        initial[1] = Some((&before[2]).into());
+        for main_z in [10, 40] {
+            let query = [window(2, 21, 50), window(2, 20, main_z), window(1, 10, 30),
+                window(2, 99, 60)];
+            let mut decision = CrossingWitness::default();
+            assert!(crossed_with_witness(&query, 1, 10, 2, &ids, Some(&mut decision)));
+            assert_eq!(decision.matched.unwrap().window_id, 21);
+            let rows = query_candidate_rows(&initial, &query);
+            let main = rows[1].unwrap();
+            assert!(matches!(main.status, QueryCandidateStatus::Unique));
+            assert_eq!(main.row.unwrap().z_index > 30, main_z == 40);
+            assert_eq!(main.query_index, Some(1));
+            // New/non-initial windows do not enter the diagnostic's scope.
+            assert!(rows[2..].iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn post_ax_rows_keep_missing_duplicate_and_space_unknown() {
+        let mut initial = [None; ORDER_CANDIDATE_ROW_LIMIT];
+        for (slot, id) in [20, 21, 22, 23, 23].into_iter().enumerate() {
+            initial[slot] = Some((&window(2, id, 10)).into());
+        }
+        let mut unknown = window(2, 22, 40);
+        unknown.layer = 101;
+        unknown.is_on_screen = false;
+        unknown.current_space_id = None;
+        unknown.on_current_space = None;
+        let query = [window(99, 20, 50), window(2, 21, 40), window(2, 21, 30),
+            unknown, window(2, 23, 50)];
+        let rows = query_candidate_rows(&initial, &query);
+        let missing = rows[0].unwrap();
+        assert!(matches!(missing.status, QueryCandidateStatus::MissingInQueryUnknown));
+        assert_eq!(missing.query_matches, 0);
+        assert!(missing.row.is_none());
+        let duplicate = rows[1].unwrap();
+        assert!(matches!(duplicate.status, QueryCandidateStatus::DuplicateInQueryUnknown));
+        assert_eq!(duplicate.query_matches, 2);
+        assert!(duplicate.row.is_none() && duplicate.query_index.is_none());
+        let raw = rows[2].unwrap().row.unwrap();
+        assert_eq!(raw.layer, 101);
+        assert!(!raw.is_on_screen && raw.current_space_id.is_none() && raw.on_current_space.is_none());
+        for row in rows[3..5].iter().flatten() {
+            assert!(matches!(row.status, QueryCandidateStatus::DuplicateInitialIdentityUnknown));
+            assert_eq!(row.retained_initial_matches, 2);
+            assert_eq!(row.query_matches, 1);
+            assert!(row.row.is_none());
+        }
+        assert!(rows[5..].iter().all(Option::is_none));
     }
 
     #[test]
