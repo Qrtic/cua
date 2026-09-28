@@ -202,8 +202,8 @@ impl Tool for SetValueTool {
                 let role = copy_string_attr(element, "AXRole");
                 let native_date = crate::ax::attached_popover::native_date_role(role.as_deref());
                 let attached = crate::ax::attached_popover::native_value_role(role.as_deref())
-                    && crate::ax::attached_popover::has_displaced_popover_window(
-                        element, window_id,
+                    && crate::ax::attached_popover::has_semantic_popover_candidate(
+                        element, window_id, role.as_deref(),
                     );
                 let native_text = crate::ax::attached_popover::native_text_role(role.as_deref())
                     && (attached || crate::ax::exact_target::native_text_field_in_window(

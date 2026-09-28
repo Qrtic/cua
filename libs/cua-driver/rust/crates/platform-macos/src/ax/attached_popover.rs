@@ -1,8 +1,11 @@
 //! Element-bound semantic proof for native controls in one attached AXPopover.
 //!
 //! A control can name either the AXPopover (Calendar/Pages) or the host (Keynote)
-//! as AXWindow. Its physical window ID must match the actual AXPopover, which
-//! must remain in its reciprocal AXParent chain and name the exact host.
+//! as AXWindow. A mapped control's physical ID must match the actual AXPopover,
+//! which must remain in its reciprocal AXParent chain and name the exact host.
+//! A direct native control with explicit AXWindow NoValue and the narrowly
+//! classified private unmapped result may instead use the strict two-pass
+//! semantic chain. Its physical ID stays unknown and grants no HID authority.
 //! Native popup-button menus may omit AXWindow and report the popover's ID,
 //! while WindowServer displays a separate menu surface. Prove their reciprocal
 //! control ancestry and visible menu geometry; this only authorizes AX actions.
@@ -12,7 +15,7 @@ use super::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorNoValue, kAXErrorSuccess,
     AXUIElementGetTypeID,
     AXUIElementCopyAttributeValue, AXUIElementGetPid, AXUIElementRef,
-    AXUIElementSetMessagingTimeout,
+    AXUIElementSetMessagingTimeout, _AXUIElementGetWindow,
 };
 use core_foundation::{
     array::CFArray,
@@ -92,6 +95,25 @@ fn control_window_kind(error: i32, value_present: bool, is_element: bool) -> Con
     }
 }
 
+// A failed private physical lookup never becomes a window ID. The single
+// observed unmapped result is usable only inside the strict NoValue semantic
+// proof; it cannot authorize pointer or process-keyboard routing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPhysicalWindow { Mapped(u32), IllegalArgumentZero, Unavailable }
+
+fn control_physical_window(error: i32, id: u32) -> ControlPhysicalWindow {
+    match (error, id) {
+        (kAXErrorSuccess, id) if id != 0 => ControlPhysicalWindow::Mapped(id),
+        (-25201, 0) => ControlPhysicalWindow::IllegalArgumentZero,
+        _ => ControlPhysicalWindow::Unavailable,
+    }
+}
+
+fn control_physical_matches(value: ControlPhysicalWindow, popover_id: u32) -> bool {
+    value == ControlPhysicalWindow::Mapped(popover_id)
+        || value == ControlPhysicalWindow::IllegalArgumentZero
+}
+
 trait PopoverTree {
     type Node: Clone;
     fn role(&self, node: &Self::Node) -> Option<String>;
@@ -101,6 +123,10 @@ trait PopoverTree {
         self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present)
     }
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
+    fn control_physical(&self, node: &Self::Node) -> ControlPhysicalWindow {
+        self.window_id(node).filter(|id| *id != 0)
+            .map_or(ControlPhysicalWindow::Unavailable, ControlPhysicalWindow::Mapped)
+    }
     fn parent(&self, node: &Self::Node) -> Option<Self::Node>;
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
     fn contains_unique_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
@@ -192,10 +218,12 @@ fn revalidate_inner_structure<T: PopoverTree>(
 /// Only the explicitly absent action-control AXWindow uses this stronger
 /// second pass. Every retained edge is unique and reciprocal; every other
 /// node has a positive logical window and the phase's exact physical ID.
+/// The direct control may instead retain the exact unmapped SPI result.
 fn revalidate_no_value_path<T: PopoverTree>(
     tree: &T, pid: i32, host_id: u32, popover_id: u32,
     popover: &T::Node, host: &T::Node, host_role: &str,
     nodes: &[T::Node], roles: &[String], windows: &[Option<T::Node>],
+    control_physical: ControlPhysicalWindow,
 ) -> bool {
     if nodes.is_empty() || nodes.len() != roles.len() || nodes.len() != windows.len() {
         return false;
@@ -208,7 +236,12 @@ fn revalidate_no_value_path<T: PopoverTree>(
         if !tree.within_budget()
             || tree.owner(node) != Some(pid)
             || tree.role(node).as_deref() != Some(roles[index].as_str())
-            || tree.window_id(node) != Some(if index <= popup_index { popover_id } else { host_id })
+            || if index == 0 {
+                !control_physical_matches(control_physical, popover_id)
+                    || tree.control_physical(node) != control_physical
+            } else {
+                tree.window_id(node) != Some(if index <= popup_index { popover_id } else { host_id })
+            }
             || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
             || !tree.contains_unique_child(parent, node)
         {
@@ -452,6 +485,7 @@ fn prove_checked<T: PopoverTree>(
     let mut inner_roles = Vec::new();
     let mut structural_windows = Vec::new();
     let mut no_value_windows = Vec::new();
+    let mut no_value_physical = ControlPhysicalWindow::Unavailable;
     for depth in 0..MAX_DEPTH {
         if !tree.within_budget() {
             return Err("ancestry_deadline");
@@ -468,7 +502,7 @@ fn prove_checked<T: PopoverTree>(
                 return (crossed_popover && revalidate_no_value_path(
                     tree, pid, host_id, popover_id, &popover, &host,
                     host_role.as_deref().expect("accepted host role"),
-                    &visited, &roles, &no_value_windows,
+                    &visited, &roles, &no_value_windows, no_value_physical,
                 )).then_some(()).ok_or("no_value_attachment_changed");
             }
             // Re-read the attachment after traversal; an old AXParent alone
@@ -526,12 +560,19 @@ fn prove_checked<T: PopoverTree>(
         }
         let role = tree.role(&current);
         let strict_window = if no_value_control {
+            let is_control = tree.same(&current, control);
             if role.as_deref() == Some("AXUnknown")
-                || (tree.same(&current, control) && role.as_deref() != no_value_role.as_deref())
-                || tree.window_id(&current) != Some(if crossed_popover { host_id } else { popover_id })
+                || (is_control && role.as_deref() != no_value_role.as_deref())
             {
                 return Err("no_value_node_identity_missing");
             }
+            let physical_matches = if is_control {
+                no_value_physical = tree.control_physical(&current);
+                control_physical_matches(no_value_physical, popover_id)
+            } else {
+                tree.window_id(&current) == Some(if crossed_popover { host_id } else { popover_id })
+            };
+            if !physical_matches { return Err("no_value_node_identity_missing"); }
             if tree.same(&current, control) {
                 None
             } else {
@@ -720,6 +761,9 @@ impl PopoverTree for NativeTree {
     fn window_id(&self, node: &AxNode) -> Option<u32> {
         unsafe { ax_get_window_id(node.0) }
     }
+    fn control_physical(&self, node: &AxNode) -> ControlPhysicalWindow {
+        unsafe { native_control_physical(node.0) }
+    }
     fn parent(&self, node: &AxNode) -> Option<AxNode> {
         unsafe { AxNode::owned(copy_element_attr(node.0, "AXParent")?) }
     }
@@ -889,6 +933,41 @@ pub(crate) unsafe fn has_displaced_popover_window(element: AXUIElementRef, host_
         // even for a real popover. Require the nearest AXParent surface.
         || super::element_ancestry::parent_window_id(element),
     )
+}
+
+unsafe fn native_control_physical(element: AXUIElementRef) -> ControlPhysicalWindow {
+    let mut id = 0;
+    control_physical_window(_AXUIElementGetWindow(element, &mut id), id)
+}
+
+// This selects the existing semantic gate, not permission to dispatch. Keep
+// ordinary displaced controls first, with no new query on that path.
+fn semantic_popover_candidate(
+    displaced: bool, role: Option<&str>, host_id: u32,
+    unmapped_no_value: impl FnOnce() -> bool,
+    nearest_surface: impl FnOnce() -> Option<u32>,
+) -> bool {
+    displaced || (native_control_role(role) && unmapped_no_value()
+        && nearest_surface().is_some_and(|id| id != 0 && id != host_id))
+}
+
+/// Semantic element callers only. Coordinate/foreground/middle/key routes
+/// must keep their original physical classifier. The fresh background gate
+/// and immediate pre-write guard still perform the full retained proof.
+pub(crate) unsafe fn has_semantic_popover_candidate(
+    element: AXUIElementRef, host_id: u32, role: Option<&str>,
+) -> bool {
+    semantic_popover_candidate(has_displaced_popover_window(element, host_id), role, host_id, || {
+        if native_control_physical(element) != ControlPhysicalWindow::IllegalArgumentZero {
+            return false;
+        }
+        let attr = CFString::new("AXWindow");
+        let mut value: CFTypeRef = std::ptr::null();
+        let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+        let matches = control_window_kind(error, !value.is_null(), false) == ControlWindowKind::NoValue;
+        if !value.is_null() { CFRelease(value); }
+        matches
+    }, || super::element_ancestry::parent_window_id(element))
 }
 
 /// # Safety
@@ -2629,4 +2708,186 @@ mod tests {
             );
         }
     }
+
+
+    struct UnmappedLeafTree {
+        inner: NoValueTree,
+        physical: (i32, u32),
+        late_physical: Option<(i32, u32)>,
+        physical_reads: Cell<usize>,
+    }
+    impl UnmappedLeafTree {
+        fn new() -> Self {
+            // Actual retained shape: TextField -> Popover -> Toolbar -> host.
+            let mut tree = pages();
+            tree.nodes.retain(|id, _| [0, 2, 4, 6].contains(id));
+            tree.nodes.get_mut(&0).unwrap().parent = Some(2);
+            tree.nodes.get_mut(&0).unwrap().id = None;
+            tree.nodes.get_mut(&2).unwrap().children = vec![0];
+            tree.nodes.get_mut(&2).unwrap().parent = Some(4);
+            tree.nodes.get_mut(&4).unwrap().role = "AXToolbar";
+            tree.nodes.get_mut(&4).unwrap().children = vec![2];
+            tree.nodes.get_mut(&4).unwrap().parent = Some(6);
+            tree.nodes.get_mut(&6).unwrap().children = vec![4];
+            let mut inner = NoValueTree::new(tree); inner.edges = 3;
+            Self { inner, physical: (-25201, 0), late_physical: None,
+                physical_reads: Cell::new(0) }
+        }
+    }
+    impl PopoverTree for UnmappedLeafTree {
+        type Node = u32;
+        fn role(&self, n: &u32) -> Option<String> { self.inner.role(n) }
+        fn owner(&self, n: &u32) -> Option<i32> { self.inner.owner(n) }
+        fn window(&self, n: &u32) -> Option<u32> { self.inner.window(n) }
+        fn control_window(&self, n: &u32) -> ControlWindow<u32> { self.inner.control_window(n) }
+        fn window_id(&self, n: &u32) -> Option<u32> { self.inner.window_id(n) }
+        fn control_physical(&self, n: &u32) -> ControlPhysicalWindow {
+            assert_eq!(*n, 0, "unmapped exception is only the direct control");
+            self.physical_reads.set(self.physical_reads.get() + 1);
+            let raw = if self.inner.unique_reads.get() >= self.inner.edges {
+                self.late_physical.unwrap_or(self.physical)
+            } else { self.physical };
+            control_physical_window(raw.0, raw.1)
+        }
+        fn parent(&self, n: &u32) -> Option<u32> { self.inner.parent(n) }
+        fn contains_child(&self, p: &u32, c: &u32) -> bool { self.inner.contains_child(p, c) }
+        fn contains_unique_child(&self, p: &u32, c: &u32) -> bool { self.inner.contains_unique_child(p, c) }
+        fn virtual_button_child(&self, p: &u32, c: &u32) -> bool { self.inner.virtual_button_child(p, c) }
+        fn same(&self, a: &u32, b: &u32) -> bool { self.inner.same(a, b) }
+        fn within_budget(&self) -> bool { self.inner.within_budget() }
+        fn visible_menu_window(&self, n: &u32, pid: i32) -> Option<u32> { self.inner.visible_menu_window(n, pid) }
+    }
+
+    #[test]
+    fn unmapped_leaf_classification_keeps_errors_zero_and_contradictions_distinct() {
+        assert_eq!(control_physical_window(-25201, 0), ControlPhysicalWindow::IllegalArgumentZero);
+        assert_eq!(control_physical_window(0, 900), ControlPhysicalWindow::Mapped(900));
+        for raw in [(0,0),(-25201,900),(-25212,0),(-25204,0),(-25202,0),(-25205,0)] {
+            assert_eq!(control_physical_window(raw.0,raw.1), ControlPhysicalWindow::Unavailable);
+            let mut tree=UnmappedLeafTree::new(); tree.physical=raw;
+            assert!(!prove(&tree,42,700,&0), "raw {raw:?}");
+        }
+        let mut wrong=UnmappedLeafTree::new(); wrong.physical=(0,701);
+        assert!(!prove(&wrong,42,700,&0), "a nonzero contradictory mapping is never ignored");
+    }
+
+    #[test]
+    fn unmapped_leaf_actual_shape_proves_twice_without_synthetic_window_id() {
+        let tree=UnmappedLeafTree::new();
+        assert_eq!(prove_checked(&tree,42,700,&0),Ok(()));
+        assert_eq!(tree.physical_reads.get(),2);
+        assert_eq!(tree.inner.unique_reads.get(),6);
+        assert_eq!(tree.inner.control_reads.get(),2);
+        assert_eq!(tree.window_id(&0),None,"proof must not fill in a physical ID");
+        assert_eq!(tree.window(&0),None,"proof must not fill in AXWindow");
+    }
+
+    #[test]
+    fn unmapped_leaf_requires_explicit_no_value_and_strict_nonleaf_anchors() {
+        for raw in [(0,false,false),(-25204,false,false),(kAXErrorNoValue,true,true),(0,true,false)] {
+            let mut tree=UnmappedLeafTree::new(); tree.inner.raw=raw;
+            assert!(!prove(&tree,42,700,&0));
+            assert_eq!(tree.inner.unique_reads.get(),0);
+        }
+        for id in [2,4,6] {
+            for field in ["id_none","id_wrong","owner","role","window"] {
+                let mut tree=UnmappedLeafTree::new(); let n=tree.inner.tree.nodes.get_mut(&id).unwrap();
+                match field { "id_none"=>n.id=None,"id_wrong"=>n.id=Some(if id == 2 { 700 } else { 701 }),
+                    "owner"=>n.owner=99,"role"=>n.role="AXUnknown",_=>n.window=None }
+                // The terminal host never required its own AXWindow property.
+                if id == 6 && field == "window" { continue; }
+                assert!(!prove(&tree,42,700,&0), "node {id} field {field}");
+            }
+        }
+        for parent in [2,4,6] {
+            for duplicate in [false,true] {
+                let mut tree=UnmappedLeafTree::new(); let n=tree.inner.tree.nodes.get_mut(&parent).unwrap();
+                if duplicate { n.children.push(n.children[0]); } else { n.children.clear(); }
+                assert!(!prove(&tree,42,700,&0), "parent {parent} duplicate {duplicate}");
+            }
+        }
+    }
+
+    #[test]
+    fn unmapped_leaf_rejects_late_physical_status_and_mapping_changes() {
+        for raw in [(0,900),(0,0),(0,701),(-25201,900),(-25204,0)] {
+            let mut tree=UnmappedLeafTree::new(); tree.late_physical=Some(raw);
+            assert!(!prove(&tree,42,700,&0), "late {raw:?}");
+            assert_eq!(tree.physical_reads.get(),2);
+            assert!(tree.inner.unique_reads.get()>=3);
+        }
+        let mut changed=UnmappedLeafTree::new(); changed.physical=(0,900);
+        changed.late_physical=Some((-25201,0));
+        assert!(!prove(&changed,42,700,&0), "mapped to unmapped is a changed attachment");
+    }
+
+    #[test]
+    fn unmapped_leaf_rejects_late_retained_chain_and_deadline_changes() {
+        for late in [(0,"raw"),(0,"window_present"),(0,"role"),(0,"owner"),(0,"parent"),
+            (2,"window"),(2,"children"),(2,"parent"),(2,"id"),(4,"role"),(4,"id"),
+            (6,"owner"),(6,"role"),(6,"id"),(6,"children"),(0,"deadline")] {
+            let mut tree=UnmappedLeafTree::new(); tree.inner.late=Some(late);
+            assert!(!prove(&tree,42,700,&0), "late {late:?}");
+            assert!(tree.inner.unique_reads.get()>=3);
+            assert!(tree.inner.changed_reads.get()>0);
+        }
+    }
+
+    #[test]
+    fn semantic_candidate_preserves_displaced_fast_path_and_role_boundary() {
+        assert!(semantic_popover_candidate(true,None,700,||panic!("old displaced route must not query"),||panic!("no parent query")));
+        for role in [None,Some("AXUnknown"),Some("AXWebArea"),Some("AXPopover"),Some("AXToolbar")] {
+            assert!(!semantic_popover_candidate(false,role,700,||panic!("not an action control"),||panic!("no parent query")));
+        }
+        let reads=Cell::new(0);
+        assert!(semantic_popover_candidate(false,Some("AXTextField"),700,||{reads.set(reads.get()+1);true},||Some(900)));
+        assert_eq!(reads.get(),1);
+        assert!(!semantic_popover_candidate(false,Some("AXTextField"),700,||false,||panic!("raw failure must not query parent")));
+    }
+
+    #[test]
+    fn semantic_candidate_then_real_gate_never_grants_pointer_or_keyboard() {
+        use cua_driver_core::background_input::{decide_background_input,BackgroundAction,
+            BackgroundTargetFacts,ElementAncestry,ExactWindowTarget,WindowServerOwnership};
+        let tree=UnmappedLeafTree::new();
+        let candidate=semantic_popover_candidate(false,Some("AXTextField"),700,|| {
+            control_physical_window(tree.physical.0,tree.physical.1)==ControlPhysicalWindow::IllegalArgumentZero
+                && control_window_kind(tree.inner.raw.0,tree.inner.raw.1,tree.inner.raw.2)==ControlWindowKind::NoValue
+        },||Some(900));
+        // The same boolean selects the gate in both public element callers.
+        let selected=if candidate {BackgroundAction::AttachedPopoverSemantic} else {BackgroundAction::AxSemantic};
+        let target=ExactWindowTarget{pid:42,window_id:700};
+        let mut facts=BackgroundTargetFacts{window_server:WindowServerOwnership::SamePid,
+            ax_window_present:true,target_minimized:Some(false),target_on_screen:Some(true),
+            app_hidden:Some(false),competing_keyboard_destinations:1,element:ElementAncestry::Unproven};
+        assert!(candidate);
+        assert!(!decide_background_input(target,&facts,selected).is_execute(),"candidate alone is not authority");
+        assert!(prove(&tree,42,700,&0)); facts.element=ElementAncestry::ProvenAttachedPopover;
+        assert!(decide_background_input(target,&facts,selected).is_execute());
+        for action in [BackgroundAction::AxSemantic,BackgroundAction::ApplicationMenuSemantic,
+            BackgroundAction::WindowPointer,BackgroundAction::InsertText,BackgroundAction::GenericKey] {
+            assert!(!decide_background_input(target,&facts,action).is_execute(),"route {action:?}");
+        }
+        let mut broken=UnmappedLeafTree::new(); broken.inner.tree.nodes.get_mut(&2).unwrap().children.clear();
+        facts.element=if prove(&broken,42,700,&0) {ElementAncestry::ProvenAttachedPopover} else {ElementAncestry::Unproven};
+        assert!(!decide_background_input(target,&facts,selected).is_execute(),"raw candidate with broken chain is refused");
+    }
+
+
+    #[test]
+    fn unmapped_ordinary_host_control_keeps_its_original_semantic_gate() {
+        use cua_driver_core::background_input::{decide_background_input,BackgroundAction,
+            BackgroundTargetFacts,ElementAncestry,ExactWindowTarget,WindowServerOwnership};
+        for nearest in [None,Some(0),Some(700)] {
+            assert!(!semantic_popover_candidate(false,Some("AXTextField"),700,||true,||nearest));
+        }
+        let attached=semantic_popover_candidate(false,Some("AXTextField"),700,||true,||Some(700));
+        let action=if attached {BackgroundAction::AttachedPopoverSemantic} else {BackgroundAction::AxSemantic};
+        let facts=BackgroundTargetFacts{window_server:WindowServerOwnership::SamePid,
+            ax_window_present:true,target_minimized:Some(false),target_on_screen:Some(true),
+            app_hidden:Some(false),competing_keyboard_destinations:1,element:ElementAncestry::ProvenDescendant};
+        assert_eq!(action,BackgroundAction::AxSemantic);
+        assert!(decide_background_input(ExactWindowTarget{pid:42,window_id:700},&facts,action).is_execute());
+    }
+
 }

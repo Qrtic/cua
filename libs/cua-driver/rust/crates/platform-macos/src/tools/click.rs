@@ -731,7 +731,9 @@ impl Tool for ClickTool {
                         && crate::ax::exact_target::element_window_id(element).is_none();
                     let popover = inspect_background_surface
                         && !menu
-                        && crate::ax::attached_popover::has_displaced_popover_window(element, wid);
+                        && crate::ax::attached_popover::has_semantic_popover_candidate(
+                            element, wid, Some(role.as_str()),
+                        );
                     let pointer_candidate = primary_press
                         && matches!(
                             role.as_str(),
