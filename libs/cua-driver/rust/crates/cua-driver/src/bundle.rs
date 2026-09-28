@@ -127,6 +127,17 @@ pub fn is_executable_inside_cuadriver_app() -> bool {
         .is_some()
 }
 
+/// Whether the current signed driver app was assembled for a plugin-managed
+/// lifecycle. The marker lives in Info.plist so it is covered by the app's
+/// code signature; ordinary release and local-development bundles omit it.
+#[cfg(target_os = "macos")]
+pub fn is_plugin_managed_app() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| app_bundle_for_executable(&path))
+        .is_some_and(|bundle| bundle.plugin_managed)
+}
+
 /// Returns `true` when the env var is one of `1|true|yes|on`
 /// (case-insensitive). Anything else, including unset, is falsy.
 #[cfg(target_os = "windows")]
@@ -207,6 +218,29 @@ mod tests {
             executable
         }
 
+        fn plugin_managed_fixture(root: &Path, name: &str, marker_value: &str) -> PathBuf {
+            let contents = root.join(name).join("Contents");
+            let macos = contents.join("MacOS");
+            std::fs::create_dir_all(&macos).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>{LOCAL_BUNDLE_ID}</string>
+<key>CFBundleExecutable</key><string>{LOCAL_CLI_NAME}</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>{}</key>{marker_value}
+</dict></plist>"#,
+                    platform_macos::app_identity::PLUGIN_MANAGED_INFO_PLIST_KEY,
+                ),
+            )
+            .unwrap();
+            let executable = macos.join(LOCAL_CLI_NAME);
+            std::fs::write(&executable, b"fixture").unwrap();
+            executable
+        }
+
         #[test]
         fn renamed_apps_keep_their_plist_identity_and_actual_path() {
             let root = tempfile::tempdir().unwrap();
@@ -230,6 +264,30 @@ mod tests {
                 assert_eq!(bundle.is_local, is_local);
                 assert_eq!(path_is_local(&path), is_local);
             }
+        }
+
+        #[test]
+        fn plugin_management_requires_a_signed_plist_marker_and_fails_closed_on_bad_type() {
+            let root = tempfile::tempdir().unwrap();
+            for (name, marker, expected) in [
+                ("managed.app", "<true/>", true),
+                ("unmanaged.app", "<false/>", false),
+                ("invalid-marker.app", "<string>true</string>", true),
+            ] {
+                let executable = plugin_managed_fixture(root.path(), name, marker);
+                let identity = app_bundle_for_executable(&executable).unwrap();
+                assert_eq!(identity.plugin_managed, expected, "fixture {name}");
+            }
+
+            let ordinary = app_fixture(
+                root.path(),
+                "ordinary.app",
+                LOCAL_BUNDLE_ID,
+                LOCAL_CLI_NAME,
+                LOCAL_CLI_NAME,
+                "APPL",
+            );
+            assert!(!app_bundle_for_executable(&ordinary).unwrap().plugin_managed);
         }
 
         #[test]
