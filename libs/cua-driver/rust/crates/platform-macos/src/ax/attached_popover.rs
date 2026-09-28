@@ -118,6 +118,49 @@ fn revalidate_host_collection<T: PopoverTree>(
         && tree.within_budget()
 }
 
+/// Only paths containing an inner AXList pay for this retained-segment check.
+/// Lists are structural, never host anchors or action targets. Their logical
+/// window must remain the same retained popup/host, not a sibling with its ID.
+fn revalidate_inner_list<T: PopoverTree>(
+    tree: &T,
+    pid: i32,
+    popover_id: u32,
+    popover: &T::Node,
+    nodes: &[T::Node],
+    roles: &[String],
+    list_windows: &[(T::Node, T::Node)],
+) -> bool {
+    if nodes.is_empty() || nodes.len() != roles.len() || list_windows.is_empty() {
+        return false;
+    }
+    for (index, (node, role)) in nodes.iter().zip(roles).enumerate() {
+        let parent = nodes.get(index + 1).unwrap_or(popover);
+        if !tree.within_budget()
+            || tree.owner(node) != Some(pid)
+            || tree.role(node).as_deref() != Some(role.as_str())
+            || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
+            || !tree.contains_unique_child(parent, node)
+        {
+            return false;
+        }
+        if role == "AXList" {
+            let Some((_, window)) = list_windows.iter().find(|(list, _)| tree.same(list, node)) else {
+                return false;
+            };
+            if tree.owner(window) != Some(pid)
+                || tree.window_id(node) != Some(popover_id)
+                || !tree.window(node).is_some_and(|live| tree.same(&live, window))
+            {
+                return false;
+            }
+        }
+        if !tree.within_budget() {
+            return false;
+        }
+    }
+    true
+}
+
 struct MenuPath<N> {
     control: N,
     nodes: Vec<N>,
@@ -216,6 +259,9 @@ fn containing_popover<T: PopoverTree>(
         let role = tree.role(&current);
         match role.as_deref() {
             Some("AXPopover") => return Ok(current),
+            // Candidate discovery only. The full walk below must bind each
+            // inner list to this exact popup and revalidate its retained path.
+            Some("AXList") => {}
             Some(role) if native_control_role(Some(role)) || container_role(role) => {}
             _ => {
                 tracing::debug!(target: "cua_popover_proof", stage = "containing_popover",
@@ -317,6 +363,8 @@ fn prove_checked<T: PopoverTree>(
     let mut host_segment_start = 0;
     let mut host_roles = Vec::new();
     let mut uses_host_collection = false;
+    let mut inner_roles = Vec::new();
+    let mut list_windows = Vec::new();
     for depth in 0..MAX_DEPTH {
         if !tree.within_budget() {
             return Err("ancestry_deadline");
@@ -330,7 +378,12 @@ fn prove_checked<T: PopoverTree>(
         if tree.same(&current, &host) {
             // Re-read the attachment after traversal; an old AXParent alone
             // must not authorize a closed or reattached panel.
-            let unchanged = crossed_popover
+            let unchanged = (list_windows.is_empty()
+                || revalidate_inner_list(
+                    tree, pid, popover_id, &popover,
+                    &visited[..host_segment_start], &inner_roles, &list_windows,
+                ))
+                && crossed_popover
                 && tree.window_id(&current) == Some(host_id)
                 && tree.window_id(&popover) == Some(popover_id)
                 && if is_popover_root {
@@ -382,6 +435,17 @@ fn prove_checked<T: PopoverTree>(
                 crossed_popover = true;
                 host_segment_start = visited.len();
             }
+            Some("AXList") if !crossed_popover => {
+                let window = tree.window(&current).ok_or("inner_list_window_missing")?;
+                if tree.owner(&window) != Some(pid)
+                    || tree.window_id(&current) != Some(popover_id)
+                    || !(tree.same(&window, &popover) || tree.same(&window, &host))
+                    || !tree.within_budget()
+                {
+                    return Err("inner_list_identity_mismatch");
+                }
+                list_windows.push((current.clone(), window));
+            }
             Some(role) if crossed_popover && host_collection_role(role) => {
                 if tree.window_id(&current) != Some(host_id)
                     || !tree.window(&current).is_some_and(|window| tree.same(&window, &host))
@@ -405,15 +469,21 @@ fn prove_checked<T: PopoverTree>(
         let Some(parent) = tree.parent(&current) else {
             return Err("ancestor_parent_missing");
         };
-        if !tree.contains_child(&parent, &current)
-            && !(tree.same(&current, element) && tree.virtual_button_child(&parent, &current))
-        {
+        let reciprocal = if role.as_deref() == Some("AXList") && !crossed_popover {
+            tree.contains_unique_child(&parent, &current)
+        } else {
+            tree.contains_child(&parent, &current)
+                || (tree.same(&current, element) && tree.virtual_button_child(&parent, &current))
+        };
+        if !reciprocal {
             tracing::debug!(target: "cua_popover_proof", depth, role = ?role,
                 "popover ancestry lacks reciprocal child relation");
             return Err("ancestor_child_relation_missing");
         }
         if crossed_popover {
             host_roles.push(role.expect("accepted role"));
+        } else {
+            inner_roles.push(role.expect("accepted role"));
         }
         visited.push(current);
         current = parent;
@@ -1548,6 +1618,201 @@ mod tests {
         );
         tree
     }
+    fn inner_list(logical_host: bool) -> Tree {
+        let mut tree = wrapped_toolbar_popover();
+        tree.nodes.get_mut(&0).unwrap().role = "AXCheckBox";
+        tree.nodes.get_mut(&0).unwrap().window = Some(if logical_host { 6 } else { 2 });
+        tree.nodes.get_mut(&1).unwrap().role = "AXCheckBox";
+        tree.nodes.get_mut(&1).unwrap().parent = Some(8);
+        tree.nodes.get_mut(&2).unwrap().children = vec![8];
+        tree.nodes.insert(8, Node {
+            identity: 8, role: "AXList", owner: 42,
+            window: Some(6), id: Some(900), parent: Some(2), children: vec![1],
+        });
+        tree
+    }
+
+    #[test]
+    fn inner_list_proves_both_logical_control_window_paths() {
+        for logical_host in [false, true] {
+            for list_window in [2, 6] {
+                let mut tree = inner_list(logical_host);
+                tree.nodes.get_mut(&8).unwrap().window = Some(list_window);
+                assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
+                assert!(!prove(&tree, 42, 701, &0));
+            }
+        }
+        let mut tree = inner_list(true);
+        tree.nodes.insert(10, tree.nodes[&6].clone());
+        tree.nodes.get_mut(&8).unwrap().window = Some(10);
+        assert!(prove(&tree, 42, 700, &0), "CF-equivalent logical host proxy");
+    }
+
+    #[test]
+    fn inner_list_does_not_admit_outer_lists_or_new_actions() {
+        for logical_host in [false, true] {
+            let mut tree = inner_list(logical_host);
+            assert!(!prove(&tree, 42, 700, &8), "list is not a control");
+            tree.nodes.get_mut(&3).unwrap().role = "AXList";
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("ancestor_role_unexpected"));
+        }
+        for action in ["press", "click", "show_menu", "confirm", "cancel"] {
+            assert_eq!(advertised_action(Some("AXList"), action,
+                &["AXPress".into(), "AXShowMenu".into(), "AXConfirm".into(), "AXCancel".into()]), None);
+        }
+    }
+
+    #[test]
+    fn inner_list_requires_exact_native_identity_not_a_sibling_or_web_path() {
+        for logical_host in [false, true] {
+            for kind in 0..7 {
+                let mut tree = inner_list(logical_host);
+                let list = tree.nodes.get_mut(&8).unwrap();
+                match kind {
+                    0 => list.owner = 99,
+                    1 => list.id = None,
+                    2 => list.id = Some(700),
+                    3 => list.id = Some(901),
+                    4 => list.window = None,
+                    5 => list.window = Some(9), // Same PID/physical ID, different retained window.
+                    _ => list.parent = None,
+                }
+                assert!(!prove(&tree, 42, 700, &0), "logical_host={logical_host} kind={kind}");
+            }
+            for role in ["AXWebArea", "AXTable", "AXIncrementor", "AXApplication", "AXUnknown", "AXPopover"] {
+                let mut tree = inner_list(logical_host);
+                tree.nodes.get_mut(&1).unwrap().role = role;
+                assert!(!prove(&tree, 42, 700, &0), "inner boundary {role}");
+            }
+            let mut tree = inner_list(logical_host);
+            tree.nodes.insert(10, tree.nodes[&2].clone());
+            tree.nodes.get_mut(&10).unwrap().identity = 10;
+            tree.nodes.get_mut(&8).unwrap().window = Some(10);
+            assert!(!prove(&tree, 42, 700, &0), "same-ID sibling popup is not the retained popup");
+        }
+    }
+
+    #[test]
+    fn inner_list_requires_unique_reciprocal_edges_and_existing_bounds() {
+        for logical_host in [false, true] {
+            for parent in [1, 8, 2] {
+                for duplicate in [false, true] {
+                    let mut tree = inner_list(logical_host);
+                    let node = tree.nodes.get_mut(&parent).unwrap();
+                    if duplicate { node.children.push(node.children[0]); } else { node.children.clear(); }
+                    assert!(!prove(&tree, 42, 700, &0), "parent={parent} duplicate={duplicate}");
+                }
+            }
+            let mut tree = inner_list(logical_host);
+            tree.nodes.get_mut(&8).unwrap().children = vec![1; MAX_CHILDREN as usize + 1];
+            assert!(!prove(&tree, 42, 700, &0));
+            let mut tree = inner_list(logical_host);
+            tree.nodes.get_mut(&8).unwrap().parent = Some(1);
+            tree.nodes.get_mut(&1).unwrap().children.push(8);
+            assert!(!prove(&tree, 42, 700, &0), "cycle before popup");
+            let tree = inner_list(logical_host);
+            tree.budget.set(0);
+            assert!(!prove(&tree, 42, 700, &0));
+            let mut tree = inner_list(logical_host);
+            tree.reattach = true;
+            assert!(!prove(&tree, 42, 700, &0), "final popup attachment changed");
+            let mut tree = inner_list(logical_host);
+            tree.budget.set(1000);
+            tree.nodes.get_mut(&1).unwrap().parent = Some(10);
+            let last = 10 + MAX_DEPTH as u32;
+            tree.nodes.get_mut(&8).unwrap().children = vec![last];
+            for node in 10..=last {
+                tree.nodes.insert(node, Node {
+                    identity: node, role: "AXGroup", owner: 42, window: Some(6), id: Some(900),
+                    parent: Some(if node == last { 8 } else { node + 1 }),
+                    children: vec![if node == 10 { 1 } else { node - 1 }],
+                });
+            }
+            assert!(!prove(&tree, 42, 700, &0), "existing depth bound");
+        }
+    }
+
+    // Arm only after the full walk has accepted the inner path and reached
+    // the last outer parent. This exercises the final retained-path check,
+    // not a failed first lookup or initial list qualification.
+    struct LateInnerChange {
+        tree: Tree,
+        field: &'static str,
+        armed: Cell<bool>,
+        late_reads: Cell<usize>,
+        unique_reads: Cell<usize>,
+    }
+    impl LateInnerChange {
+        fn changed(&self, field: &str) -> bool {
+            let changed = self.armed.get() && self.field == field;
+            if changed { self.late_reads.set(self.late_reads.get() + 1); }
+            changed
+        }
+    }
+    impl PopoverTree for LateInnerChange {
+        type Node = u32;
+        fn role(&self, node: &u32) -> Option<String> {
+            if (*node == 8 && self.changed("role")) || (*node == 1 && self.changed("prefix_role")) {
+                Some("AXGroup".into())
+            } else { self.tree.role(node) }
+        }
+        fn owner(&self, node: &u32) -> Option<i32> {
+            if *node == 8 && self.changed("owner") { None } else { self.tree.owner(node) }
+        }
+        fn window(&self, node: &u32) -> Option<u32> {
+            // Popup and host are each ordinarily allowed, but switching the
+            // retained logical window after qualification must still refuse.
+            if *node == 8 && self.changed("window") { Some(2) } else { self.tree.window(node) }
+        }
+        fn window_id(&self, node: &u32) -> Option<u32> {
+            if *node == 8 && self.changed("id") { Some(700) } else { self.tree.window_id(node) }
+        }
+        fn parent(&self, node: &u32) -> Option<u32> {
+            if *node == 5 { self.armed.set(true); }
+            if (*node == 8 && self.changed("parent")) || (*node == 1 && self.changed("prefix_parent")) {
+                None
+            } else { self.tree.parent(node) }
+        }
+        fn contains_child(&self, parent: &u32, child: &u32) -> bool {
+            self.tree.contains_child(parent, child)
+        }
+        fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
+            self.unique_reads.set(self.unique_reads.get() + 1);
+            if *parent == 8 && self.changed("deadline") { self.tree.budget.set(0); }
+            !(*parent == 8 && self.changed("children")) && self.tree.contains_unique_child(parent, child)
+        }
+        fn same(&self, a: &u32, b: &u32) -> bool { self.tree.same(a, b) }
+        fn within_budget(&self) -> bool { self.tree.within_budget() }
+        fn visible_menu_window(&self, node: &u32, pid: i32) -> Option<u32> {
+            self.tree.visible_menu_window(node, pid)
+        }
+    }
+
+    #[test]
+    fn inner_list_revalidates_retained_facts_after_the_successful_walk() {
+        for logical_host in [false, true] {
+            for field in ["role", "owner", "window", "id", "parent", "children", "deadline", "prefix_role", "prefix_parent"] {
+                let tree = LateInnerChange { tree: inner_list(logical_host), field,
+                    armed: Cell::new(false), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+                assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "{field}");
+                assert!(tree.armed.get());
+                assert!(tree.late_reads.get() > 0, "late {field} must actually be read");
+                assert!(tree.unique_reads.get() >= 2, "must enter final inner-path proof");
+            }
+        }
+    }
+
+    #[test]
+    fn inner_list_revalidation_does_not_run_on_legacy_routes() {
+        for legacy in [pages(), wrapped_toolbar_popover()] {
+            let tree = LateInnerChange { tree: legacy, field: "none",
+                armed: Cell::new(false), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+            assert!(prove(&tree, 42, 700, &0));
+            assert_eq!(tree.unique_reads.get(), 0);
+            assert_eq!(tree.late_reads.get(), 0);
+        }
+    }
+
     #[test]
     fn logical_host_window_does_not_hide_a_physical_toolbar_popover() {
         assert!(prove(&wrapped_toolbar_popover(), 42, 700, &0));
