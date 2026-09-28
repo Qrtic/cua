@@ -589,6 +589,12 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if let Some(code) = cli::run_build_attestation_if_requested() {
+        std::process::exit(code);
+    }
+    if let Some(code) = cli::run_permissions_onboarding_contract_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
@@ -597,7 +603,13 @@ fn main() {
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);
     }
+    if let Some(code) = cli::run_plugin_managed_bare_launch_guard_if_requested() {
+        std::process::exit(code);
+    }
     init_logging();
+    if let Some(code) = cli::run_permissions_onboarding_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(code) = cli::run_permissions_host_request_if_requested() {
         std::process::exit(code);
     }
