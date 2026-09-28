@@ -9,7 +9,8 @@
 //! Keep physical window identities intact for pointer and keyboard routing.
 
 use super::bindings::{
-    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorSuccess,
+    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorNoValue, kAXErrorSuccess,
+    AXUIElementGetTypeID,
     AXUIElementCopyAttributeValue, AXUIElementGetPid, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
 };
@@ -74,11 +75,31 @@ fn inner_structural_role(role: &str) -> bool {
     matches!(role, "AXList" | "AXUnknown")
 }
 
+enum ControlWindow<N> {
+    Present(N),
+    NoValue,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlWindowKind { Present, NoValue, Unavailable }
+
+fn control_window_kind(error: i32, value_present: bool, is_element: bool) -> ControlWindowKind {
+    match (error, value_present, is_element) {
+        (kAXErrorSuccess, true, true) => ControlWindowKind::Present,
+        (kAXErrorNoValue, false, _) => ControlWindowKind::NoValue,
+        _ => ControlWindowKind::Unavailable,
+    }
+}
+
 trait PopoverTree {
     type Node: Clone;
     fn role(&self, node: &Self::Node) -> Option<String>;
     fn owner(&self, node: &Self::Node) -> Option<i32>;
     fn window(&self, node: &Self::Node) -> Option<Self::Node>;
+    fn control_window(&self, node: &Self::Node) -> ControlWindow<Self::Node> {
+        self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present)
+    }
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn parent(&self, node: &Self::Node) -> Option<Self::Node>;
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
@@ -166,6 +187,49 @@ fn revalidate_inner_structure<T: PopoverTree>(
         }
     }
     true
+}
+
+/// Only the explicitly absent action-control AXWindow uses this stronger
+/// second pass. Every retained edge is unique and reciprocal; every other
+/// node has a positive logical window and the phase's exact physical ID.
+fn revalidate_no_value_path<T: PopoverTree>(
+    tree: &T, pid: i32, host_id: u32, popover_id: u32,
+    popover: &T::Node, host: &T::Node, host_role: &str,
+    nodes: &[T::Node], roles: &[String], windows: &[Option<T::Node>],
+) -> bool {
+    if nodes.is_empty() || nodes.len() != roles.len() || nodes.len() != windows.len() {
+        return false;
+    }
+    let Some(popup_index) = nodes.iter().position(|node| tree.same(node, popover)) else {
+        return false;
+    };
+    for (index, node) in nodes.iter().enumerate() {
+        let parent = nodes.get(index + 1).unwrap_or(host);
+        if !tree.within_budget()
+            || tree.owner(node) != Some(pid)
+            || tree.role(node).as_deref() != Some(roles[index].as_str())
+            || tree.window_id(node) != Some(if index <= popup_index { popover_id } else { host_id })
+            || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
+            || !tree.contains_unique_child(parent, node)
+        {
+            return false;
+        }
+        let window_unchanged = if index == 0 {
+            windows[index].is_none()
+                && matches!(tree.control_window(node), ControlWindow::NoValue)
+        } else {
+            windows[index].as_ref().is_some_and(|window| {
+                tree.window(node).is_some_and(|live| tree.same(&live, window))
+                    && tree.owner(window) == Some(pid)
+            })
+        };
+        if !window_unchanged || !tree.within_budget() { return false; }
+    }
+    tree.within_budget()
+        && tree.owner(host) == Some(pid)
+        && tree.role(host).as_deref() == Some(host_role)
+        && tree.window_id(host) == Some(host_id)
+        && tree.within_budget()
 }
 
 struct MenuPath<N> {
@@ -309,17 +373,28 @@ fn prove_checked<T: PopoverTree>(
     };
     let control = menu_path.as_ref().map_or(element, |menu| &menu.control);
     let mut control_window = None;
+    let mut no_value_control = false;
+    let mut no_value_role = None;
     let popover = if is_popover_root {
         element.clone()
-    } else if native_control_role(tree.role(control).as_deref()) {
-        let window = tree.window(control).ok_or("element_window_missing")?;
-        let popover = match tree.role(&window).as_deref() {
-            Some("AXPopover") => window.clone(),
-            Some("AXWindow") => containing_popover(tree, pid, control)?,
-            _ => return Err("element_window_not_popover"),
-        };
-        control_window = Some(window);
-        popover
+    } else if let Some(role) = tree.role(control).filter(|role| native_control_role(Some(role.as_str()))) {
+        match tree.control_window(control) {
+            ControlWindow::Present(window) => {
+                let popover = match tree.role(&window).as_deref() {
+                    Some("AXPopover") => window.clone(),
+                    Some("AXWindow") => containing_popover(tree, pid, control)?,
+                    _ => return Err("element_window_not_popover"),
+                };
+                control_window = Some(window);
+                popover
+            }
+            ControlWindow::NoValue if menu_path.is_none() => {
+                no_value_control = true;
+                no_value_role = Some(role);
+                containing_popover(tree, pid, control)?
+            }
+            _ => return Err("element_window_missing"),
+        }
     } else {
         return Err("element_not_native_control_or_popover");
     };
@@ -347,7 +422,8 @@ fn prove_checked<T: PopoverTree>(
             return Err("control_window_does_not_match_popover_or_host");
         }
     }
-    if !matches!(tree.role(&host).as_deref(), Some("AXWindow" | "AXSheet")) {
+    let host_role = tree.role(&host);
+    if !matches!(host_role.as_deref(), Some("AXWindow" | "AXSheet")) {
         return Err("host_role_unexpected");
     }
     if tree.owner(&host) != Some(pid) {
@@ -355,6 +431,9 @@ fn prove_checked<T: PopoverTree>(
     }
     if tree.window_id(&host) != Some(host_id) {
         return Err("host_window_id_mismatch");
+    }
+    if no_value_control && (pid <= 0 || host_id == 0 || popover_id == 0) {
+        return Err("no_value_identity_missing");
     }
     if menu_path.as_ref().is_some_and(|path| {
         path.nodes
@@ -372,6 +451,7 @@ fn prove_checked<T: PopoverTree>(
     let mut uses_host_collection = false;
     let mut inner_roles = Vec::new();
     let mut structural_windows = Vec::new();
+    let mut no_value_windows = Vec::new();
     for depth in 0..MAX_DEPTH {
         if !tree.within_budget() {
             return Err("ancestry_deadline");
@@ -383,6 +463,14 @@ fn prove_checked<T: PopoverTree>(
             return Err("ancestry_cycle");
         }
         if tree.same(&current, &host) {
+            if no_value_control {
+                let roles = [inner_roles, host_roles].concat();
+                return (crossed_popover && revalidate_no_value_path(
+                    tree, pid, host_id, popover_id, &popover, &host,
+                    host_role.as_deref().expect("accepted host role"),
+                    &visited, &roles, &no_value_windows,
+                )).then_some(()).ok_or("no_value_attachment_changed");
+            }
             // Re-read the attachment after traversal; an old AXParent alone
             // must not authorize a closed or reattached panel.
             let unchanged = (structural_windows.is_empty()
@@ -437,13 +525,36 @@ fn prove_checked<T: PopoverTree>(
             return unchanged.then_some(()).ok_or("attachment_changed");
         }
         let role = tree.role(&current);
+        let strict_window = if no_value_control {
+            if role.as_deref() == Some("AXUnknown")
+                || (tree.same(&current, control) && role.as_deref() != no_value_role.as_deref())
+                || tree.window_id(&current) != Some(if crossed_popover { host_id } else { popover_id })
+            {
+                return Err("no_value_node_identity_missing");
+            }
+            if tree.same(&current, control) {
+                None
+            } else {
+                let window = tree.window(&current).ok_or("no_value_ancestor_window_missing")?;
+                let logical_matches = if crossed_popover || tree.same(&current, &popover) {
+                    tree.same(&window, &host)
+                } else {
+                    tree.same(&window, &popover) || tree.same(&window, &host)
+                };
+                if !logical_matches || tree.owner(&window) != Some(pid) || !tree.within_budget() {
+                    return Err("no_value_ancestor_window_mismatch");
+                }
+                Some(window)
+            }
+        } else { None };
         match role.as_deref() {
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
                 host_segment_start = visited.len();
             }
             Some(role) if !crossed_popover && inner_structural_role(role) => {
-                let window = tree.window(&current).ok_or("inner_list_window_missing")?;
+                let window = strict_window.clone().or_else(|| tree.window(&current))
+                    .ok_or("inner_list_window_missing")?;
                 if tree.owner(&window) != Some(pid)
                     || tree.window_id(&current) != Some(popover_id)
                     || !(tree.same(&window, &popover) || tree.same(&window, &host))
@@ -455,7 +566,8 @@ fn prove_checked<T: PopoverTree>(
             }
             Some(role) if crossed_popover && host_collection_role(role) => {
                 if tree.window_id(&current) != Some(host_id)
-                    || !tree.window(&current).is_some_and(|window| tree.same(&window, &host))
+                    || !strict_window.clone().or_else(|| tree.window(&current))
+                        .is_some_and(|window| tree.same(&window, &host))
                     || !tree.within_budget()
                 {
                     return Err("host_collection_identity_mismatch");
@@ -476,7 +588,9 @@ fn prove_checked<T: PopoverTree>(
         let Some(parent) = tree.parent(&current) else {
             return Err("ancestor_parent_missing");
         };
-        let reciprocal = if !crossed_popover && role.as_deref().is_some_and(inner_structural_role) {
+        let reciprocal = if no_value_control
+            || (!crossed_popover && role.as_deref().is_some_and(inner_structural_role))
+        {
             tree.contains_unique_child(&parent, &current)
         } else {
             tree.contains_child(&parent, &current)
@@ -492,6 +606,7 @@ fn prove_checked<T: PopoverTree>(
         } else {
             inner_roles.push(role.expect("accepted role"));
         }
+        if no_value_control { no_value_windows.push(strict_window); }
         visited.push(current);
         current = parent;
     }
@@ -559,6 +674,7 @@ impl Drop for AxNode {
 
 struct NativeTree {
     deadline: Instant,
+    allow_control_no_value: bool,
 }
 impl PopoverTree for NativeTree {
     type Node = AxNode;
@@ -571,6 +687,35 @@ impl PopoverTree for NativeTree {
     }
     fn window(&self, node: &AxNode) -> Option<AxNode> {
         unsafe { AxNode::owned(copy_element_attr(node.0, "AXWindow")?) }
+    }
+    fn control_window(&self, node: &AxNode) -> ControlWindow<AxNode> {
+        if !self.allow_control_no_value {
+            return self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present);
+        }
+        // One AXWindow query, as on the existing successful path. Preserve the
+        // raw status here: the legacy Option intentionally merges missing and
+        // erroneous attributes and cannot grant the new proof.
+        unsafe {
+            let attr = CFString::new("AXWindow");
+            let mut value: CFTypeRef = std::ptr::null();
+            let error = AXUIElementCopyAttributeValue(node.0, attr.as_concrete_TypeRef(), &mut value);
+            let types = (error == kAXErrorSuccess && !value.is_null())
+                .then(|| (CFGetTypeID(value), AXUIElementGetTypeID()));
+            match control_window_kind(error, !value.is_null(), types.is_some_and(|(a, b)| a == b)) {
+                ControlWindowKind::Present => AxNode::owned(value as AXUIElementRef)
+                    .map_or(ControlWindow::Unavailable, ControlWindow::Present),
+                kind => {
+                    tracing::debug!(target: "cua_popover_proof", ax_error = error,
+                        value_present = !value.is_null(), ?kind,
+                        actual_type_id = ?types.map(|(actual, _)| actual),
+                        expected_type_id = ?types.map(|(_, expected)| expected),
+                        "action control AXWindow unavailable");
+                    if !value.is_null() { CFRelease(value); }
+                    if kind == ControlWindowKind::NoValue { ControlWindow::NoValue }
+                    else { ControlWindow::Unavailable }
+                }
+            }
+        }
     }
     fn window_id(&self, node: &AxNode) -> Option<u32> {
         unsafe { ax_get_window_id(node.0) }
@@ -763,6 +908,7 @@ pub(crate) unsafe fn proves_attached_popover(
     prove(
         &NativeTree {
             deadline: Instant::now() + Duration::from_secs(2),
+            allow_control_no_value: true,
         },
         pid,
         host_id,
@@ -791,7 +937,7 @@ pub(crate) unsafe fn proves_attached_popover_before(
         return false;
     };
     Instant::now() < deadline
-        && prove(&NativeTree { deadline }, pid, host_id, &element)
+        && prove(&NativeTree { deadline, allow_control_no_value: false }, pid, host_id, &element)
         && Instant::now() < deadline
 }
 
@@ -1018,6 +1164,206 @@ mod tests {
         fn within_budget(&self) -> bool { self.tree.within_budget() }
         fn visible_menu_window(&self, node: &u32, pid: i32) -> Option<u32> {
             self.tree.visible_menu_window(node, pid)
+        }
+    }
+
+    // This wrapper invokes the production raw-status classifier and proof.
+    // Mutations start only after every first-pass unique edge was accepted.
+    struct NoValueTree {
+        tree: Tree,
+        raw: (i32, bool, bool),
+        late: Option<(u32, &'static str)>,
+        edges: usize,
+        unique_reads: Cell<usize>,
+        control_reads: Cell<usize>,
+        changed_reads: Cell<usize>,
+    }
+    impl NoValueTree {
+        fn new(mut tree: Tree) -> Self {
+            tree.nodes.get_mut(&0).unwrap().role = "AXTextField";
+            tree.nodes.get_mut(&0).unwrap().window = None;
+            tree.budget.set(1000);
+            Self { tree, raw: (kAXErrorNoValue, false, false), late: None,
+                edges: 6, unique_reads: Cell::new(0), control_reads: Cell::new(0),
+                changed_reads: Cell::new(0) }
+        }
+        fn changed(&self, node: u32, field: &str) -> bool {
+            let changed = self.unique_reads.get() >= self.edges
+                && self.late == Some((node, field));
+            if changed { self.changed_reads.set(self.changed_reads.get() + 1); }
+            changed
+        }
+    }
+    impl PopoverTree for NoValueTree {
+        type Node = u32;
+        fn role(&self, node: &u32) -> Option<String> {
+            if self.changed(*node, "role") { Some("AXWebArea".into()) } else { self.tree.role(node) }
+        }
+        fn owner(&self, node: &u32) -> Option<i32> {
+            if self.changed(*node, "owner") { Some(99) } else { self.tree.owner(node) }
+        }
+        fn window(&self, node: &u32) -> Option<u32> {
+            if self.changed(*node, "window") { Some(9) } else { self.tree.window(node) }
+        }
+        fn control_window(&self, node: &u32) -> ControlWindow<u32> {
+            if *node != 0 { return self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present); }
+            self.control_reads.set(self.control_reads.get() + 1);
+            if self.changed(*node, "raw") { return ControlWindow::Unavailable; }
+            if self.changed(*node, "window_present") { return ControlWindow::Present(6); }
+            match control_window_kind(self.raw.0, self.raw.1, self.raw.2) {
+                ControlWindowKind::NoValue => ControlWindow::NoValue,
+                ControlWindowKind::Present => ControlWindow::Present(6),
+                ControlWindowKind::Unavailable => ControlWindow::Unavailable,
+            }
+        }
+        fn window_id(&self, node: &u32) -> Option<u32> {
+            if self.changed(*node, "id") { None } else { self.tree.window_id(node) }
+        }
+        fn parent(&self, node: &u32) -> Option<u32> {
+            if self.changed(*node, "parent") { None } else { self.tree.parent(node) }
+        }
+        fn contains_child(&self, parent: &u32, child: &u32) -> bool {
+            self.tree.contains_child(parent, child)
+        }
+        fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
+            let changed = self.changed(*parent, "children");
+            self.unique_reads.set(self.unique_reads.get() + 1);
+            !changed && self.tree.contains_unique_child(parent, child)
+        }
+        fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
+            self.tree.virtual_button_child(parent, child)
+        }
+        fn same(&self, a: &u32, b: &u32) -> bool { self.tree.same(a, b) }
+        fn within_budget(&self) -> bool {
+            !self.changed(0, "deadline") && self.tree.within_budget()
+        }
+        fn visible_menu_window(&self, node: &u32, pid: i32) -> Option<u32> {
+            self.tree.visible_menu_window(node, pid)
+        }
+    }
+
+    #[test]
+    fn no_value_control_requires_exact_raw_error_and_null() {
+        assert_eq!(control_window_kind(kAXErrorNoValue, false, false), ControlWindowKind::NoValue);
+        assert_eq!(control_window_kind(kAXErrorSuccess, true, true), ControlWindowKind::Present);
+        for raw in [(kAXErrorNoValue, true, true), (kAXErrorSuccess, false, false),
+            (kAXErrorSuccess, true, false), (-25204, false, false), (-25202, false, false),
+            (-25201, true, true)] {
+            assert_eq!(control_window_kind(raw.0, raw.1, raw.2), ControlWindowKind::Unavailable);
+            let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+            tree.raw = raw;
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("element_window_missing"));
+            assert_eq!(tree.unique_reads.get(), 0, "raw failure must not enter alternative proof");
+        }
+    }
+
+    #[test]
+    fn no_value_native_field_proves_complete_retained_toolbar_path_twice() {
+        for sheet in [false, true] {
+            let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+            if sheet { tree.tree.nodes.get_mut(&6).unwrap().role = "AXSheet"; }
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
+            assert_eq!(tree.control_reads.get(), 2);
+            assert_eq!(tree.unique_reads.get(), 12, "six actual edges on each pass");
+        }
+        let mut direct = NoValueTree::new(wrapped_toolbar_popover());
+        for (node, parent, child) in [(0, 2, None), (2, 4, Some(0)), (4, 6, Some(2))] {
+            let entry = direct.tree.nodes.get_mut(&node).unwrap();
+            entry.parent = Some(parent);
+            entry.children = child.into_iter().collect();
+        }
+        direct.tree.nodes.get_mut(&6).unwrap().children = vec![4];
+        direct.edges = 3;
+        assert_eq!(prove_checked(&direct, 42, 700, &0), Ok(()));
+        assert_eq!(direct.unique_reads.get(), 6, "direct field/popover/toolbar/host path");
+        let mut legacy = wrapped_toolbar_popover();
+        legacy.nodes.get_mut(&0).unwrap().window = None;
+        assert_eq!(prove_checked(&legacy, 42, 700, &0), Err("element_window_missing"),
+            "a collapsed Option is not NoValue evidence");
+    }
+
+    #[test]
+    fn no_value_route_requires_every_physical_owner_and_positive_ancestor_window() {
+        for node in 0..=6 {
+            for field in ["owner", "id_missing", "id_other"] {
+                let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+                let entry = tree.tree.nodes.get_mut(&node).unwrap();
+                match field { "owner" => entry.owner = 99, "id_missing" => entry.id = None,
+                    _ => entry.id = Some(701) }
+                assert!(!prove(&tree, 42, 700, &0), "node {node} field {field}");
+            }
+        }
+        for node in 1..6 {
+            for window in [None, Some(9)] {
+                let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+                tree.tree.nodes.get_mut(&node).unwrap().window = window;
+                assert!(!prove(&tree, 42, 700, &0), "node {node} window {window:?}");
+            }
+        }
+        for id in [0, 701] { assert!(!prove(&NoValueTree::new(pages()), 42, id, &0)); }
+        let mut tree = NoValueTree::new(pages());
+        for node in 0..=2 { tree.tree.nodes.get_mut(&node).unwrap().id = Some(0); }
+        assert!(!prove(&tree, 42, 700, &0));
+    }
+
+    #[test]
+    fn no_value_route_never_accepts_opaque_boundaries_or_virtual_edges() {
+        for node in [1, 3, 4] {
+            for role in ["AXUnknown", "AXWebArea", "AXApplication", "AXTable", "AXPopover", "AXWindow"] {
+                let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+                tree.tree.nodes.get_mut(&node).unwrap().role = role;
+                assert!(!prove(&tree, 42, 700, &0), "node {node} role {role}");
+            }
+        }
+        assert!(!prove(&NoValueTree::new(virtual_preview()), 42, 700, &0));
+        let mut menu = NoValueTree::new(calendar_menu());
+        menu.tree.nodes.get_mut(&0).unwrap().role = "AXPopUpButton";
+        assert_eq!(prove_checked(&menu, 42, 700, &8), Err("element_window_missing"));
+    }
+
+    #[test]
+    fn no_value_route_requires_unique_edges_and_rejects_cycles_and_bounds() {
+        for parent in 1..=6 {
+            for duplicate in [false, true] {
+                let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+                let children = &mut tree.tree.nodes.get_mut(&parent).unwrap().children;
+                if duplicate { children.push(parent - 1); } else { children.clear(); }
+                assert!(!prove(&tree, 42, 700, &0), "parent {parent} duplicate {duplicate}");
+            }
+        }
+        let mut tree = NoValueTree::new(pages());
+        tree.tree.nodes.get_mut(&1).unwrap().parent = Some(0);
+        tree.tree.nodes.get_mut(&0).unwrap().children.push(1);
+        assert!(!prove(&tree, 42, 700, &0));
+        let mut tree = NoValueTree::new(pages());
+        tree.tree.nodes.get_mut(&2).unwrap().children = vec![1; MAX_CHILDREN as usize + 1];
+        assert!(!prove(&tree, 42, 700, &0));
+        let tree = NoValueTree::new(pages());tree.tree.budget.set(0);
+        assert!(!prove(&tree, 42, 700, &0));
+        let mut deep = NoValueTree::new(pages());
+        deep.tree.nodes.get_mut(&0).unwrap().parent = Some(100);
+        for id in 100..=132 {
+            deep.tree.nodes.insert(id, Node { identity: id, role: "AXGroup", owner: 42,
+                window: Some(6), id: Some(900),
+                parent: Some(if id == 132 { 2 } else { id + 1 }),
+                children: vec![if id == 100 { 0 } else { id - 1 }] });
+        }
+        deep.tree.nodes.get_mut(&2).unwrap().children = vec![132];
+        assert_eq!(prove_checked(&deep, 42, 700, &0), Err("popover_lookup_depth_limit"));
+    }
+
+    #[test]
+    fn no_value_route_rechecks_retained_facts_after_the_whole_first_walk() {
+        for (node, field) in [(0, "owner"), (0, "role"), (0, "id"), (0, "parent"),
+            (0, "raw"), (0, "window_present"), (1, "window"), (2, "window"),
+            (3, "parent"), (4, "role"), (5, "id"), (6, "children"),
+            (6, "owner"), (6, "role"), (6, "id"), (0, "deadline")] {
+            let mut tree = NoValueTree::new(wrapped_toolbar_popover());
+            tree.late = Some((node, field));
+            assert!(prove_checked(&tree, 42, 700, &0).is_err(),
+                "late node {node} field {field}");
+            assert!(tree.unique_reads.get() >= 6, "must finish first walk");
+            assert!(tree.changed_reads.get() > 0, "must exercise actual late {field} read");
         }
     }
 
