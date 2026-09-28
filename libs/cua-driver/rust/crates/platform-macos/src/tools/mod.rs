@@ -1737,7 +1737,7 @@ pub(crate) async fn resolve_foreground_keyboard_target(
     match resolution {
         Ok(crate::transient_ui::RouteResolution::None) => {
             let detection = crate::foreground_activity::spawn_blocking(move || {
-                crate::transient_ui::detect_visible_transient_helper(source)
+                crate::transient_ui::detect_transient_helper_for_input_guard(source)
             })
             .await;
             match detection {
@@ -2035,7 +2035,7 @@ pub(crate) async fn guard_transient_pointer_target(
     match resolution {
         crate::transient_ui::RouteResolution::None => {
             let detection = crate::foreground_activity::spawn_blocking(move || {
-                crate::transient_ui::detect_visible_transient_helper(source)
+                crate::transient_ui::detect_transient_helper_for_input_guard(source)
             })
             .await
             .map_err(|error| {
@@ -2645,6 +2645,7 @@ mod transient_keyboard_routing_tests {
             crate::transient_ui::RouteResolution::Live(crate::transient_ui::TransientRoute {
                 source,
                 target: helper,
+                app_context: None,
             }),
             None,
             false,
@@ -2673,6 +2674,7 @@ mod transient_keyboard_routing_tests {
             crate::transient_ui::RouteResolution::Stale(crate::transient_ui::TransientRoute {
                 source,
                 target: helper,
+                app_context: None,
             }),
             None,
             false,
@@ -2718,6 +2720,7 @@ mod transient_keyboard_routing_tests {
             crate::transient_ui::RouteResolution::Live(crate::transient_ui::TransientRoute {
                 source,
                 target,
+                app_context: None,
             }),
             None,
         )
@@ -2744,6 +2747,30 @@ mod transient_keyboard_routing_tests {
             direct.structured_content.unwrap()["code"],
             "transient_ui_direct_target_unsupported"
         );
+    }
+
+    #[test]
+    fn app_context_helper_stale_then_unobserved_never_authorizes_host_or_pointer() {
+        use crate::transient_ui::{AppContextHelperProof, RouteResolution, TransientHelperDetection, TransientRoute, WindowTarget};
+        let source = WindowTarget { pid: 10, window_id: 100 };
+        let target = WindowTarget { pid: 20, window_id: 200 };
+        let route = TransientRoute { source, target, app_context: Some(AppContextHelperProof {
+            host_birth: (1, 2), helper_birth: (3, 4),
+        }) };
+        let first = foreground_keyboard_target_from_evidence(10, 100, RouteResolution::Stale(route), None, false, true).unwrap_err();
+        assert_eq!(error_code(first), "transient_ui_stale");
+        let visible = TransientHelperDetection::Unique(target);
+        let second = foreground_keyboard_target_from_evidence(10, 100, RouteResolution::None, Some(visible), false, true).unwrap_err();
+        assert_eq!(error_code(second), "transient_ui_unobserved");
+        assert_eq!(error_code(transient_ui_unobserved_refusal(10, 0, visible)), "transient_ui_unobserved");
+        assert!(transient_pointer_target_from_evidence(10, None, RouteResolution::None, Some(visible)).is_err());
+        assert!(transient_pointer_target_from_evidence(10, Some(100), RouteResolution::Live(route), None).is_err());
+        for (addressed, rewrite_allowed) in [(true, true), (false, false)] {
+            assert!(foreground_keyboard_target_from_evidence(10, 100, RouteResolution::Live(route), None, addressed, rewrite_allowed).is_err());
+        }
+        let keyboard = foreground_keyboard_target_from_evidence(10, 100, RouteResolution::Live(route), None, false, true).unwrap();
+        assert_eq!((keyboard.pid, keyboard.window_id), (20, Some(200)));
+        assert_eq!(keyboard.transient_route, Some(route));
     }
 
     #[test]

@@ -291,6 +291,7 @@ fn apply_transient_observation_contract(
     structured: &mut serde_json::Value,
     source: crate::transient_ui::WindowTarget,
     target: crate::transient_ui::WindowTarget,
+    app_context: bool,
 ) {
     // The stable public target remains the caller-authorized host. The helper
     // is deliberately nested as a non-actionable visual surface so clients do
@@ -314,7 +315,11 @@ fn apply_transient_observation_contract(
             "ax_actions_supported": false
         },
         "input_policy": "foreground_keyboard_only",
-        "reason": "visible out-of-process modal helper associated with the requested host window",
+        "reason": if app_context {
+            "visible trusted app-owned helper selected by the host application context; no editor-parent association is asserted"
+        } else {
+            "visible out-of-process modal helper associated with the requested host window"
+        },
         "action_guidance": "Keep using the host pid/window_id. Only an unaddressed type_text, press_key, or hotkey with delivery_mode:\"foreground\" may be routed after revalidation; do not use screenshot coordinates, element_index, element_token, or the helper target directly."
     });
     structured["screenshot_target"] = serde_json::json!("transient_ui.visual_target");
@@ -329,9 +334,12 @@ fn commit_transient_observation(
     source: crate::transient_ui::WindowTarget,
     target: crate::transient_ui::WindowTarget,
     observation_only: bool,
+    app_context: Option<crate::transient_ui::AppContextHelperProof>,
 ) {
     if !observation_only {
-        registry.record(session, source, Some(target));
+        registry.record_route(session, source, Some(crate::transient_ui::TransientRoute {
+            source, target, app_context,
+        }));
     }
 }
 
@@ -1058,33 +1066,32 @@ impl Tool for GetWindowStateTool {
             }
         }
 
-        // A modal UI can be rendered by an AppKit/XPC helper while the
-        // public app identity and cached host window remain stable. Resolve
-        // only the explicitly trusted Shortcuts → system WorkflowKit service
-        // pair, then additionally require matching WindowServer name/title,
-        // modal layer, and containment. This does not add the helper to
-        // list_apps.
-        let transient_target = if delegated_panel {
+        // Explicit window observations retain the old window-bound proof.
+        // Only unbound app context can recover a unique app-owned helper;
+        // the source remains an observation anchor, not an asserted AX parent.
+        let transient_route = if delegated_panel {
             None
         } else {
+            let app_context = selection_mode == WindowSelectionMode::AppContext;
             let transient_detection = crate::foreground_activity::spawn_blocking(move || {
-                crate::transient_ui::detect_visible_transient_helper(source_target)
+                crate::transient_ui::detect_transient_for_observation(source_target, app_context)
             })
             .await;
             match transient_detection {
-                Ok(detection) => match transient_target_from_detection(
+                Ok(Ok((detection, app_context))) => match transient_target_from_detection(
                     detection,
                     source_target,
-                    cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(
-                    ),
+                    cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(),
                 ) {
-                    Ok(target) => target,
+                    Ok(target) => target.map(|target| crate::transient_ui::TransientRoute {
+                        source: source_target, target, app_context,
+                    }),
                     Err(refusal) => return refusal,
                 },
-                Err(error) => {
-                    return ToolResult::error(format!(
-                        "Could not resolve transient UI for the requested host window: {error}"
-                    ))
+                _ => {
+                    return ToolResult::error(
+                        "Could not prove the current transient UI for the requested host context."
+                    )
                     .with_structured(serde_json::json!({
                         "code": "transient_ui_resolution_failed",
                         "effect": "refused",
@@ -1093,6 +1100,7 @@ impl Tool for GetWindowStateTool {
                 }
             }
         };
+        let transient_target = transient_route.map(|route| route.target);
         let (pid, window_id) = transient_target
             .map(|target| (target.pid, target.window_id))
             .unwrap_or((base_target.pid, base_target.window_id));
@@ -1319,20 +1327,16 @@ impl Tool for GetWindowStateTool {
             }
         }
 
-        if let Some(target) = transient_target {
-            // Re-prove the association before any file, cache, token, resize,
+        if let Some(route) = transient_route {
+            // Re-prove the same observation scope before any file, cache, token, resize,
             // route, or response state is committed. The capture itself is
             // side-effect free; everything after this point can safely use the
             // same validated physical surface.
             let final_detection = crate::foreground_activity::spawn_blocking(move || {
-                crate::transient_ui::detect_visible_transient_helper(source_target)
+                route.is_live()
             })
             .await;
-            if !matches!(
-                final_detection,
-                Ok(crate::transient_ui::TransientHelperDetection::Unique(current))
-                    if current == target
-            ) {
+            if !matches!(final_detection, Ok(true)) {
                 return ToolResult::error(
                     "The transient helper changed or closed while it was being observed. Re-observe the host app; no foreground input route was retained.",
                 )
@@ -1766,7 +1770,8 @@ impl Tool for GetWindowStateTool {
             }
         }
         if let Some(target) = transient_target {
-            apply_transient_observation_contract(&mut structured, source_target, target);
+            apply_transient_observation_contract(&mut structured, source_target, target,
+                transient_route.is_some_and(|route| route.app_context.is_some()));
         }
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
@@ -1946,20 +1951,16 @@ impl Tool for GetWindowStateTool {
                 cua_driver_core::window_inspection::BrowserChromeCaptureCoverage::MayBeIncomplete,
             ),
         );
-        if let Some(target) = transient_target {
+        if let Some(route) = transient_route {
             // Keep the authorization hand-off adjacent to the route commit as
             // well as before state publication above. If the modal disappears
             // during response construction, never leave a route that the
             // caller could consume on its next foreground keyboard action.
             let commit_detection = crate::foreground_activity::spawn_blocking(move || {
-                crate::transient_ui::detect_visible_transient_helper(source_target)
+                route.is_live()
             })
             .await;
-            if !matches!(
-                commit_detection,
-                Ok(crate::transient_ui::TransientHelperDetection::Unique(current))
-                    if current == target
-            ) {
+            if !matches!(commit_detection, Ok(true)) {
                 return ToolResult::error(
                     "The transient helper changed or closed before its observation could be committed. Re-observe the host app; no foreground input route was retained.",
                 )
@@ -1976,8 +1977,9 @@ impl Tool for GetWindowStateTool {
                 &self.state.transient_ui_registry,
                 &transient_session,
                 source_target,
-                target,
+                route.target,
                 observation_only,
+                route.app_context,
             );
         }
         if let Some(mut guard) = committed_delegation.take() {
@@ -2408,7 +2410,7 @@ mod window_scope_contract_tests {
         registry.record(&session, source, Some(old_target));
 
         let _ = begin_transient_observation(&registry, &session, source, true);
-        commit_transient_observation(&registry, &session, source, new_target, true);
+        commit_transient_observation(&registry, &session, source, new_target, true, None);
         assert_eq!(
             registry.recorded_target(&session, source),
             Some(old_target),
@@ -2416,7 +2418,7 @@ mod window_scope_contract_tests {
         );
 
         let _ = begin_transient_observation(&registry, &session, source, false);
-        commit_transient_observation(&registry, &session, source, new_target, false);
+        commit_transient_observation(&registry, &session, source, new_target, false, None);
         assert_eq!(registry.recorded_target(&session, source), Some(new_target));
     }
 
@@ -2435,7 +2437,7 @@ mod window_scope_contract_tests {
             "window_id": target.window_id,
             "elements": [],
         });
-        apply_transient_observation_contract(&mut structured, source, target);
+        apply_transient_observation_contract(&mut structured, source, target, false);
 
         assert_eq!(structured["pid"], source.pid);
         assert_eq!(structured["window_id"], source.window_id);
@@ -2453,6 +2455,31 @@ mod window_scope_contract_tests {
         );
         assert!(structured["transient_ui"].get("pid").is_none());
         assert!(structured["transient_ui"].get("window_id").is_none());
+    }
+
+    #[test]
+    fn app_context_helper_contract_has_no_parent_or_action_binding_and_no_observation_only_commit() {
+        use crate::transient_ui::{AppContextHelperProof, TransientSessionKey, TransientUiRegistry, WindowTarget};
+        let source = WindowTarget { pid: 10, window_id: 100 };
+        let target = WindowTarget { pid: 20, window_id: 200 };
+        let proof = Some(AppContextHelperProof { host_birth: (1, 2), helper_birth: (3, 4) });
+        let registry = TransientUiRegistry::new();
+        let session = TransientSessionKey::Anonymous;
+        commit_transient_observation(&registry, &session, source, target, true, proof);
+        assert_eq!(registry.recorded_target(&session, source), None);
+        commit_transient_observation(&registry, &session, source, target, false, proof);
+        assert_eq!(registry.recorded_target(&session, source), Some(target));
+        assert_eq!(begin_transient_observation(&registry, &session, source, false), Some(target));
+        assert_eq!(registry.recorded_target(&session, source), None, "exact refresh revokes app route first");
+        let mut output = serde_json::json!({"elements": []});
+        apply_transient_observation_contract(&mut output, source, target, true);
+        assert_eq!(output["pid"], 10);
+        assert_eq!(output["window_id"], 100);
+        assert_eq!(output["transient_ui"]["visual_target"]["ax_actions_supported"], false);
+        assert_eq!(output["transient_ui"]["visual_target"]["pixel_actions_supported"], false);
+        assert_eq!(output["transient_ui"]["input_policy"], "foreground_keyboard_only");
+        assert!(output["transient_ui"]["reason"].as_str().unwrap().contains("no editor-parent association"));
+        assert_eq!(output["elements"], serde_json::json!([]));
     }
 
     #[test]

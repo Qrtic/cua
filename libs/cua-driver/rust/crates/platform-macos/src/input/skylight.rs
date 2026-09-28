@@ -6104,6 +6104,7 @@ mod tests {
                     pid: 30,
                     window_id: 300,
                 },
+                app_context: None,
             }),
             helper,
         ));
@@ -6111,6 +6112,7 @@ mod tests {
             Some(crate::transient_ui::TransientRoute {
                 source,
                 target: helper,
+                app_context: None,
             }),
             helper,
         ));

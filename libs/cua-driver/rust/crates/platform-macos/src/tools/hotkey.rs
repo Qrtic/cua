@@ -730,6 +730,7 @@ mod tests {
                 pid: 20,
                 window_id: 200,
             },
+            app_context: None,
         };
         let refusal = background_transient_hotkey_refusal(false, 10, Some(100), Some(route))
             .expect("background hotkey must fail closed");
