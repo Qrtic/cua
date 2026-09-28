@@ -1,6 +1,7 @@
 //! Native activity evidence. No permission requests, input contents or retry timer.
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, RecvTimeoutError, SyncSender},
     Arc, Mutex, Once, OnceLock,
 };
 use std::time::{Duration, Instant};
@@ -1758,6 +1759,129 @@ impl Drop for RegisteredTap {
     }
 }
 
+// This bounds only the added first-health wait, not native API calls or idle.
+const FIRST_HEALTH_WAIT: Duration = Duration::from_millis(250);
+
+fn wait_for_first_health(
+    timeout: Duration,
+    start: impl FnOnce(SyncSender<()>),
+) -> Result<(), RecvTimeoutError> {
+    let (completed, first_health) = mpsc::sync_channel(1);
+    start(completed);
+    first_health.recv_timeout(timeout)
+}
+
+fn complete_first_health(completed: &mut Option<SyncSender<()>>) {
+    if let Some(completed) = completed.take() {
+        // The receiver may already have timed out. Never block or retry.
+        let _ = completed.send(());
+    }
+}
+
+#[cfg(test)]
+mod startup_health_tests {
+    use super::{complete_first_health, wait_for_first_health};
+    use cua_driver_core::foreground_activity::{Activity, EpisodeLease, State};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc, Barrier, Once,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn first_health_attempt_completes_without_granting_idle() {
+        for reliable in [false, true] {
+            let mut activity = Activity::default();
+            let result = wait_for_first_health(Duration::ZERO, |completed| {
+                activity.health(100, reliable);
+                let mut completed = Some(completed);
+                complete_first_health(&mut completed);
+                assert!(completed.is_none());
+                complete_first_health(&mut completed);
+            });
+            assert_eq!(result, Ok(()));
+            let current = activity.snapshot(100);
+            assert_eq!(current.reliable, reliable);
+            assert_eq!(current.state, State::Unknown);
+            assert_eq!(current.idle_ms, 0);
+            assert!(EpisodeLease::begin(100, current).is_none());
+        }
+    }
+
+    #[test]
+    fn startup_failure_disconnects_without_restarting() {
+        let mut attempts = 0;
+        let result = wait_for_first_health(Duration::ZERO, |completed| {
+            attempts += 1;
+            drop(completed);
+        });
+        assert_eq!(result, Err(RecvTimeoutError::Disconnected));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn startup_timeout_does_not_prevent_later_health() {
+        let mut pending = None;
+        let mut activity = Activity::default();
+        let result = wait_for_first_health(Duration::ZERO, |completed| {
+            pending = Some(completed);
+        });
+        assert_eq!(result, Err(RecvTimeoutError::Timeout));
+        assert!(!activity.snapshot(100).reliable);
+        activity.health(101, true);
+        complete_first_health(&mut pending);
+        assert!(pending.is_none());
+        let fresh = activity.snapshot(101);
+        assert!(fresh.reliable);
+        assert_eq!(fresh.state, State::Unknown);
+        assert!(EpisodeLease::begin(101, fresh).is_none());
+    }
+
+    #[test]
+    fn concurrent_first_calls_share_one_health_wait() {
+        let once = Arc::new(Once::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Barrier::new(5));
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let once = Arc::clone(&once);
+            let attempts = Arc::clone(&attempts);
+            let gate = Arc::clone(&gate);
+            let completion_tx = completion_tx.clone();
+            let returned_tx = returned_tx.clone();
+            callers.push(std::thread::spawn(move || {
+                gate.wait();
+                once.call_once(|| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let result = wait_for_first_health(Duration::from_secs(5), |completed| {
+                        completion_tx.send(completed).unwrap();
+                    });
+                    assert_eq!(result, Ok(()));
+                });
+                returned_tx.send(()).unwrap();
+            }));
+        }
+        gate.wait();
+        let mut completed = Some(completion_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(
+            returned_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        complete_first_health(&mut completed);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        for _ in 0..4 {
+            returned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        once.call_once(|| panic!("completed startup must not spawn or wait again"));
+    }
+}
+
 fn start_monitor() {
     static START: Once = Once::new();
     START.call_once(|| {
@@ -1766,86 +1890,92 @@ fn start_monitor() {
         if !crate::session::has_graphic_access() || !unsafe { CGPreflightListenEventAccess() } {
             return;
         }
-        let _ = std::thread::Builder::new()
-            .name("foreground-activity".into())
-            .spawn(|| {
-                // Secure Input at first use is a temporary coverage gap, not a
-                // consumed one-shot initialization attempt. No input is retried.
-                while !environment_is_reliable() {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                use CGEventType::*;
-                let events = vec![
-                    LeftMouseDown,
-                    LeftMouseUp,
-                    RightMouseDown,
-                    RightMouseUp,
-                    MouseMoved,
-                    LeftMouseDragged,
-                    RightMouseDragged,
-                    KeyDown,
-                    KeyUp,
-                    FlagsChanged,
-                    ScrollWheel,
-                    TabletPointer,
-                    TabletProximity,
-                    OtherMouseDown,
-                    OtherMouseUp,
-                    OtherMouseDragged,
-                ];
-                let mask = events
-                    .iter()
-                    .fold(0_u64, |mask, event| mask | (1_u64 << *event as u32));
-                let port =
-                    unsafe { CGEventTapCreate(1, 0, 1, mask, observe_event, std::ptr::null_mut()) };
-                if port.is_null() {
-                    return;
-                }
-                let tap =
-                    unsafe { core_foundation::mach_port::CFMachPort::wrap_under_create_rule(port) };
-                let Ok(source) = tap.create_runloop_source(0) else {
-                    unsafe {
-                        core_foundation::mach_port::CFMachPortInvalidate(port);
+        let _ = wait_for_first_health(FIRST_HEALTH_WAIT, |completed| {
+            let _ = std::thread::Builder::new()
+                .name("foreground-activity".into())
+                .spawn(move || {
+                    let mut completed = Some(completed);
+                    // Secure Input at first use is a temporary coverage gap, not a
+                    // consumed one-shot initialization attempt. No input is retried.
+                    while !environment_is_reliable() {
+                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    return;
-                };
-                let run_loop = CFRunLoop::get_current();
-                unsafe {
-                    run_loop.add_source(&source, kCFRunLoopDefaultMode);
-                    CGEventTapEnable(port, true);
-                }
-                let _registration = RegisteredTap {
-                    port: tap,
-                    source,
-                    run_loop,
-                };
-                loop {
-                    let environment_ready = environment_is_reliable();
-                    if environment_ready && !unsafe { CGEventTapIsEnabled(port) } {
+                    use CGEventType::*;
+                    let events = vec![
+                        LeftMouseDown,
+                        LeftMouseUp,
+                        RightMouseDown,
+                        RightMouseUp,
+                        MouseMoved,
+                        LeftMouseDragged,
+                        RightMouseDragged,
+                        KeyDown,
+                        KeyUp,
+                        FlagsChanged,
+                        ScrollWheel,
+                        TabletPointer,
+                        TabletProximity,
+                        OtherMouseDown,
+                        OtherMouseUp,
+                        OtherMouseDragged,
+                    ];
+                    let mask = events
+                        .iter()
+                        .fold(0_u64, |mask, event| mask | (1_u64 << *event as u32));
+                    let port =
+                        unsafe { CGEventTapCreate(1, 0, 1, mask, observe_event, std::ptr::null_mut()) };
+                    if port.is_null() {
+                        return;
+                    }
+                    let tap =
+                        unsafe { core_foundation::mach_port::CFMachPort::wrap_under_create_rule(port) };
+                    let Ok(source) = tap.create_runloop_source(0) else {
+                        unsafe {
+                            core_foundation::mach_port::CFMachPortInvalidate(port);
+                        }
+                        return;
+                    };
+                    let run_loop = CFRunLoop::get_current();
+                    unsafe {
+                        run_loop.add_source(&source, kCFRunLoopDefaultMode);
+                        CGEventTapEnable(port, true);
+                    }
+                    let _registration = RegisteredTap {
+                        port: tap,
+                        source,
+                        run_loop,
+                    };
+                    loop {
+                        let environment_ready = environment_is_reliable();
+                        if environment_ready && !unsafe { CGEventTapIsEnabled(port) } {
+                            activity()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .invalidate();
+                            unsafe {
+                                CGEventTapEnable(port, true);
+                            }
+                        }
+                        let reliable = environment_ready
+                            && unsafe { CGEventTapIsEnabled(port) }
+                            && effective_mask_is_complete(mask);
                         activity()
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .invalidate();
+                            .health(clock_ms(), reliable);
+                        // Signal the first attempt, even when unreliable, only
+                        // after the Activity lock is released. This is not admission.
+                        complete_first_health(&mut completed);
                         unsafe {
-                            CGEventTapEnable(port, true);
+                            CFRunLoop::run_in_mode(
+                                kCFRunLoopDefaultMode,
+                                Duration::from_millis(100),
+                                false,
+                            );
                         }
                     }
-                    let reliable = environment_ready
-                        && unsafe { CGEventTapIsEnabled(port) }
-                        && effective_mask_is_complete(mask);
-                    activity()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .health(clock_ms(), reliable);
-                    unsafe {
-                        CFRunLoop::run_in_mode(
-                            kCFRunLoopDefaultMode,
-                            Duration::from_millis(100),
-                            false,
-                        );
-                    }
-                }
-            });
+                });
+        });
     });
 }
 
