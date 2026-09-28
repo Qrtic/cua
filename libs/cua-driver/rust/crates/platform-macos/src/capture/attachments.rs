@@ -72,6 +72,13 @@ fn budget<T: Tree>(tree: &T) -> Result<(), DiscoveryStop> {
         .ok_or(DiscoveryStop::Deadline)
 }
 
+// Diagnostics use only the existing counter and a constant phase; no AX read.
+fn depth_limit(stage: &'static str, attempted_depth: usize) -> DiscoveryStop {
+    tracing::debug!(target: "cua_capture_geometry", stage, attempted_depth,
+        max_depth = MAX_DEPTH, "Capture attachment depth boundary");
+    DiscoveryStop::DepthLimit
+}
+
 fn exact_window(windows: &[WindowInfo], pid: i32, id: u32) -> Option<&WindowInfo> {
     let mut matches = windows.iter().filter(|window| window.window_id == id);
     let window = matches.next()?;
@@ -517,8 +524,16 @@ fn collect_focused_collection_popover<T: Tree>(
         let mut popover_index = None;
         loop {
             budget(tree)?;
-            if upward.len() >= MAX_DEPTH {
-                return Err(DiscoveryStop::DepthLimit);
+            // The focused descendant only locates a candidate. Bound that
+            // segment and the independently proved popover-to-host segment
+            // separately, each including the popover. The full retained walk
+            // still shares one cycle set, node allowance and deadline.
+            let phase_depth = popover_index.map_or(upward.len(), |index| upward.len() - index);
+            if phase_depth >= MAX_DEPTH {
+                return Err(depth_limit(
+                    if popover_index.is_some() { "popover_host_attachment" } else { "focused_popover_locator" },
+                    phase_depth + 1,
+                ));
             }
             if upward.iter().any(|prior| tree.same(prior, &node)) {
                 return Err(DiscoveryStop::Cycle);
@@ -713,7 +728,7 @@ fn collect_outline_menus<T: Tree>(
     let mut admitted: Vec<(Vec<T::Node>, OutlineMenuProof)> = Vec::new();
     while let Some(path) = queue.pop_front() {
         budget(tree)?;
-        if path.len() > MAX_DEPTH { return Err(DiscoveryStop::DepthLimit) }
+        if path.len() > MAX_DEPTH { return Err(depth_limit("outline_search", path.len())) }
         let node = path.last().ok_or(DiscoveryStop::Changed)?;
         charge_outline_node(tree, visited, node)?;
         if entered.iter().any(|prior| tree.same(prior, node)) { return Err(DiscoveryStop::Cycle) }
@@ -731,7 +746,7 @@ fn collect_outline_menus<T: Tree>(
             if role.is_empty() || role == "AXUnknown" { return Err(DiscoveryStop::AxUnavailable) }
             if is_outline {
                 if role != "AXMenu" { continue } // Never read rows/cells or submenu contents.
-                if path.len() == MAX_DEPTH { return Err(DiscoveryStop::DepthLimit) }
+                if path.len() == MAX_DEPTH { return Err(depth_limit("outline_menu_leaf", path.len() + 1)) }
                 let mut candidate = path.clone(); candidate.push(child);
                 if let Some(proof) = prove_outline_menu(tree, pid, host, &candidate, windows)? {
                     if admitted.len() >= MAX_ATTACHMENTS { return Err(DiscoveryStop::AttachmentLimit) }
@@ -741,7 +756,7 @@ fn collect_outline_menus<T: Tree>(
                     admitted.push((candidate, proof));
                 }
             } else if outline_structure(&role) || role == "AXOutline" {
-                if path.len() == MAX_DEPTH { return Err(DiscoveryStop::DepthLimit) }
+                if path.len() == MAX_DEPTH { return Err(depth_limit("outline_child", path.len() + 1)) }
                 if !reciprocal_edge(tree, node, &child)? { return Err(DiscoveryStop::Changed) }
                 let mut next = path.clone(); next.push(child); queue.push_back(next);
             }
@@ -811,7 +826,7 @@ fn collect<T: Tree>(
         while let Some((path, resumed_seed)) = queue.pop_front() {
             budget(tree)?;
             if path.len() > MAX_DEPTH {
-                return Err(DiscoveryStop::DepthLimit);
+                return Err(depth_limit("legacy_path", path.len()));
             }
             let node = path.last().expect("nonempty path");
             if path[..path.len() - 1].iter().any(|prior| tree.same(prior, node)) {
@@ -2263,8 +2278,101 @@ mod tests {
         t.focused = Some(30);
         assert_eq!(
             collect(&t, 42, 10, &t.windows),
-            Err(DiscoveryStop::DepthLimit)
+            Ok(vec![20])
         );
+    }
+
+    // Extend only the already proven fixture. Both depths include the popup;
+    // IDs 30+ are descendants and IDs 100+ are host-side native groups.
+    fn collection_depth_fixture(locator_depth: usize, attachment_depth: usize) -> Fake {
+        assert!(locator_depth >= 1 && attachment_depth >= 9);
+        let mut t = collection_popover();
+        let mut parent = 3;
+        for id in 100..100 + (attachment_depth - 9) as u32 {
+            t.nodes.get_mut(&parent).unwrap().children = vec![id];
+            t.nodes.insert(id, Fact {
+                role: "AXGroup", owner: 42, id: 10, parent: Some(parent),
+                window: Some(1), children: vec![4],
+            });
+            t.nodes.get_mut(&4).unwrap().parent = Some(id);
+            parent = id;
+        }
+        parent = 4;
+        for id in 30..30 + (locator_depth - 1) as u32 {
+            t.nodes.get_mut(&parent).unwrap().children = vec![id];
+            t.nodes.insert(id, Fact {
+                role: "AXGroup", owner: 42, id: 20, parent: Some(parent),
+                window: Some(1), children: vec![],
+            });
+            parent = id;
+        }
+        t.focused = Some(parent);
+        t
+    }
+
+    #[test]
+    fn collection_popover_bounds_locator_and_attachment_independently() {
+        for (locator, attachment, accepted) in [
+            (1, 9, true), (6, 9, true), (12, 9, true), (13, 9, false),
+            (1, 12, true), (1, 13, false), (12, 12, true),
+            (12, 13, false), (13, 12, false),
+        ] {
+            let t = collection_depth_fixture(locator, attachment);
+            let expected = if accepted { Ok(vec![20]) } else { Err(DiscoveryStop::DepthLimit) };
+            assert_eq!(collect(&t, 42, 10, &t.windows), expected,
+                "locator {locator}, attachment {attachment}");
+            assert_eq!(t.proof_calls.get(), if accepted { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn collection_popover_deep_segments_share_the_original_node_allowance() {
+        // 12+12 shares one popup: exactly23 unique path nodes, not24.
+        for (extra, accepted) in [(MAX_NODES - 23, true), (MAX_NODES - 22, false)] {
+            let mut t = collection_depth_fixture(12, 12);
+            for id in 500..500 + extra as u32 {
+                t.nodes.insert(id, Fact {
+                    role: "AXStaticText", owner: 42, id: 10, parent: Some(1),
+                    window: Some(1), children: vec![],
+                });
+                t.nodes.get_mut(&1).unwrap().children.push(id);
+            }
+            let expected = if accepted { Ok(vec![20]) } else { Err(DiscoveryStop::NodeLimit) };
+            assert_eq!(collect(&t, 42, 10, &t.windows), expected, "extra {extra}");
+        }
+    }
+
+    #[test]
+    fn collection_popover_deep_segments_keep_identity_edges_and_expiry_guards() {
+        for case in 0..10 {
+            let mut t = collection_depth_fixture(12, 12);
+            let focused = t.focused.unwrap();
+            let expected = match case {
+                0 => { t.nodes.get_mut(&focused).unwrap().role = "AXIncrementor"; Ok(vec![]) }
+                1 => { t.nodes.get_mut(&focused).unwrap().parent = None; Ok(vec![]) }
+                2 => { t.nodes.get_mut(&5).unwrap().parent = Some(9); Err(DiscoveryStop::Cycle) }
+                3 => { t.children_errors.insert(9); Err(DiscoveryStop::AxUnavailable) }
+                4 => { t.nodes.get_mut(&9).unwrap().owner = 77; Ok(vec![]) }
+                5 => { t.current.remove(&20); Ok(vec![]) }
+                6 => { t.expire_on_proof = true; Err(DiscoveryStop::Deadline) }
+                7 => {
+                    t.change_on_refresh = 2;
+                    let mut changed = t.nodes[&102].clone(); changed.parent = None;
+                    t.changed_node = Some((102, changed)); Err(DiscoveryStop::Changed)
+                }
+                8 => {
+                    t.change_on_refresh = 2;
+                    let mut changed = t.windows.clone(); changed[1].bounds.x += 1.0;
+                    t.changed_windows = Some(changed); Err(DiscoveryStop::Changed)
+                }
+                _ => {
+                    t.nodes.insert(9000, t.nodes[&1].clone());
+                    t.change_on_refresh = 2; t.changed_roots = Some(vec![9000]);
+                    Err(DiscoveryStop::Changed)
+                }
+            };
+            assert_eq!(collect(&t, 42, 10, &t.windows), expected, "case {case}");
+        }
     }
 
     #[test]

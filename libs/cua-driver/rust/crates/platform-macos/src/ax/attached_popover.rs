@@ -213,10 +213,17 @@ fn containing_popover<T: PopoverTree>(
         if visited.iter().any(|node| tree.same(node, &current)) {
             return Err("popover_lookup_cycle");
         }
-        match tree.role(&current).as_deref() {
+        let role = tree.role(&current);
+        match role.as_deref() {
             Some("AXPopover") => return Ok(current),
             Some(role) if native_control_role(Some(role)) || container_role(role) => {}
-            _ => return Err("popover_lookup_boundary"),
+            _ => {
+                tracing::debug!(target: "cua_popover_proof", stage = "containing_popover",
+                    lookup_depth = visited.len() + 1,
+                    role = role.as_deref().filter(|role| role.len() <= 64).unwrap_or("<missing-or-oversize>"),
+                    "attached popover lookup stopped at role boundary");
+                return Err("popover_lookup_boundary");
+            }
         }
         let parent = tree
             .parent(&current)
@@ -941,6 +948,17 @@ mod tests {
             assert!(prove(&tree, 42, 700, &0));
             assert!(prove(&tree, 42, 700, &2));
             assert!(!prove(&tree, 42, 701, &0));
+        }
+    }
+
+    #[test]
+    fn popover_lookup_keeps_stepper_and_foreign_container_boundaries() {
+        for role in ["AXIncrementor", "AXWebArea", "AXTable", "AXApplication"] {
+            let mut tree = host_collection();
+            tree.nodes.get_mut(&0).unwrap().role = "AXButton";
+            tree.nodes.get_mut(&0).unwrap().window = Some(10);
+            tree.nodes.get_mut(&1).unwrap().role = role;
+            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("popover_lookup_boundary"), "{role}");
         }
     }
 
