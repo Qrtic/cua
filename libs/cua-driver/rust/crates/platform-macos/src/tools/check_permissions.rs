@@ -7,7 +7,12 @@ use serde_json::Value;
 use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use super::ToolState;
-use crate::permission_observation::{DirectCaptureEvidenceStore, DirectCaptureVerification};
+#[cfg(test)]
+use crate::permission_observation::direct_capture_evidence_store_for_bundle as evidence_store_for_bundle;
+use crate::permission_observation::{
+    direct_capture_evidence_store_for_driver_executable as evidence_store_for_driver_executable,
+    DirectCaptureEvidenceStore, DirectCaptureVerification,
+};
 use crate::permissions::status::{
     accessibility_granted, request_accessibility, request_screen_recording,
     screen_recording_granted,
@@ -58,10 +63,13 @@ fn direct_capture_evidence_store_for_identity(
     home: &Path,
     attribution: Option<&str>,
 ) -> Option<DirectCaptureEvidenceStore> {
-    let bundle_id = driver_bundle_id_for_executable(executable)?;
-    direct_capture_evidence_store_for_bundle(bundle_id, home, attribution)
+    if attribution != Some("driver-daemon") {
+        return None;
+    }
+    evidence_store_for_driver_executable(Path::new(executable), home)
 }
 
+#[cfg(test)]
 fn direct_capture_evidence_store_for_bundle(
     bundle_id: &str,
     home: &Path,
@@ -70,16 +78,7 @@ fn direct_capture_evidence_store_for_bundle(
     if attribution != Some("driver-daemon") {
         return None;
     }
-    let state_directory = match bundle_id {
-        "com.trycua.driver.local" => ".cua-driver-local",
-        "com.trycua.driver" => ".cua-driver",
-        _ => return None,
-    };
-    Some(DirectCaptureEvidenceStore::new(
-        home.join(state_directory)
-            .join("direct-capture-verification.json"),
-        bundle_id,
-    ))
+    evidence_store_for_bundle(bundle_id, home)
 }
 
 fn current_direct_capture_evidence_store(source: &Value) -> Option<DirectCaptureEvidenceStore> {
@@ -187,13 +186,7 @@ fn resolve_direct_capture_verification(
                     "message": "the installed product identity or user home directory is unavailable",
                 }));
             };
-            store.record_now().map(Some).map_err(|error| {
-                let message = match store.clear() {
-                    Ok(()) => error,
-                    Err(clear_error) => {
-                        format!("{error}; clear prior direct-capture verification: {clear_error}")
-                    }
-                };
+            store.refresh_now().map(Some).map_err(|message| {
                 serde_json::json!({
                     "code": "direct_capture_verification_store_failed",
                     "message": message,

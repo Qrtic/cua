@@ -103,10 +103,12 @@ impl Tool for LaunchAppTool {
         let webkit_inspector_port = args.opt_u64("webkit_inspector_port").map(|v| v as u16);
         let creates_new_instance = args.bool_or("creates_new_application_instance", false);
         let additional_arguments: Vec<String> = args.str_array("additional_arguments");
-        if additional_arguments
-            .iter()
-            .any(|argument| argument == super::check_permissions::PERMISSIONS_HOST_REQUEST_ARG)
-        {
+        if additional_arguments.iter().any(|argument| {
+            argument == super::check_permissions::PERMISSIONS_HOST_REQUEST_ARG
+                || argument == crate::permissions::onboarding::ONBOARDING_CONTRACT_ARG
+                || argument == crate::permissions::onboarding::ONBOARDING_LAUNCH_ARG
+                || argument == crate::permissions::onboarding::ONBOARDING_HOST_ARG
+        }) {
             return protected_host_launch_refusal();
         }
         if additional_arguments
@@ -740,21 +742,28 @@ mod tests {
 
     #[tokio::test]
     async fn launch_app_cannot_reach_private_permission_host_entrypoint() {
-        let result = LaunchAppTool
-            .invoke(json!({
-                "bundle_id": "com.example.not-installed",
-                "additional_arguments": [
-                    "__permissions-host-request",
-                    "--result-file",
-                    "/tmp/cua-driver-permissions-forged.json"
-                ]
-            }))
-            .await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content.unwrap()["error"],
-            "PROTECTED_HOST_ENTRYPOINT"
-        );
+        for private_argument in [
+            "__permissions-host-request",
+            crate::permissions::onboarding::ONBOARDING_CONTRACT_ARG,
+            crate::permissions::onboarding::ONBOARDING_LAUNCH_ARG,
+            crate::permissions::onboarding::ONBOARDING_HOST_ARG,
+        ] {
+            let result = LaunchAppTool
+                .invoke(json!({
+                    "bundle_id": "com.example.not-installed",
+                    "additional_arguments": [
+                        private_argument,
+                        "--result-file",
+                        "/tmp/cua-driver-permissions-forged.json"
+                    ]
+                }))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content.unwrap()["error"],
+                "PROTECTED_HOST_ENTRYPOINT"
+            );
+        }
 
         let result = LaunchAppTool
             .invoke(json!({ "bundle_id": "com.trycua.driver" }))
