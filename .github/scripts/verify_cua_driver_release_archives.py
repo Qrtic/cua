@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+import plistlib
 import tarfile
 import zipfile
 
@@ -129,7 +130,7 @@ def _find_archive(root: Path, filename: str) -> Path:
     return matches[0]
 
 
-def _verify_tar(path: Path, contract: ArchiveContract) -> None:
+def _verify_tar(path: Path, contract: ArchiveContract, version: str) -> None:
     with tarfile.open(path, "r:gz") as archive:
         members = {
             _normalize_member(member.name): member
@@ -148,6 +149,37 @@ def _verify_tar(path: Path, contract: ArchiveContract) -> None:
             member = members.get(expected)
             if member is None or member.mode & 0o111 == 0:
                 raise ContractError(f"{path.name} contains non-executable member {expected}")
+
+        info_members = [
+            member
+            for name, member in members.items()
+            if name.endswith("/CuaDriver.app/Contents/Info.plist")
+        ]
+        if info_members:
+            if len(info_members) != 1:
+                raise ContractError(f"{path.name} contains ambiguous CuaDriver Info.plists")
+            reader = archive.extractfile(info_members[0])
+            if reader is None:
+                raise ContractError(f"{path.name} cannot read CuaDriver Info.plist")
+            payload = reader.read(256 * 1024 + 1)
+            if len(payload) > 256 * 1024:
+                raise ContractError(f"{path.name} contains an oversized CuaDriver Info.plist")
+            try:
+                info = plistlib.loads(payload)
+            except (plistlib.InvalidFileException, ValueError) as error:
+                raise ContractError(f"{path.name} contains an invalid CuaDriver Info.plist") from error
+            expected_identity = {
+                "CFBundleIdentifier": "com.meta.musecode.cua.driver",
+                "CFBundleExecutable": "cua-driver",
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": version,
+            }
+            for key, expected in expected_identity.items():
+                if info.get(key) != expected:
+                    raise ContractError(
+                        f"{path.name} CuaDriver Info.plist has invalid {key}: "
+                        f"expected {expected!r}, got {info.get(key)!r}"
+                    )
 
 
 def _verify_zip(path: Path, contract: ArchiveContract) -> None:
@@ -173,7 +205,7 @@ def verify_release_archives(root: Path, version: str) -> tuple[Path, ...]:
     for contract in release_contracts(version):
         path = _find_archive(root, contract.filename)
         if path.name.endswith(".tar.gz"):
-            _verify_tar(path, contract)
+            _verify_tar(path, contract, version)
         elif path.suffix == ".zip":
             _verify_zip(path, contract)
         else:  # pragma: no cover - contracts above define supported formats.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import plistlib
 import tarfile
 import zipfile
 
@@ -18,10 +19,20 @@ from verify_cua_driver_release_archives import (
 VERSION = "9.8.7"
 
 
-def _write_tar(path: Path, contract: ArchiveContract) -> None:
+def _write_tar(path: Path, contract: ArchiveContract, overrides=None) -> None:
+    overrides = overrides or {}
     with tarfile.open(path, "w:gz") as archive:
         for name in contract.members:
-            payload = f"payload for {name}".encode()
+            if name.endswith("/CuaDriver.app/Contents/Info.plist"):
+                payload = plistlib.dumps({
+                    "CFBundleIdentifier": "com.meta.musecode.cua.driver",
+                    "CFBundleExecutable": "cua-driver",
+                    "CFBundlePackageType": "APPL",
+                    "CFBundleShortVersionString": VERSION,
+                })
+            else:
+                payload = f"payload for {name}".encode()
+            payload = overrides.get(name, payload)
             info = tarfile.TarInfo(name)
             info.size = len(payload)
             info.mode = 0o755 if name in contract.executable_members else 0o644
@@ -97,4 +108,26 @@ def test_non_executable_unix_binary_fails_closed(tmp_path: Path) -> None:
         ContractError,
         match=rf"{target.filename} contains non-executable member cua-driver",
     ):
+        verify_release_archives(tmp_path, VERSION)
+
+
+def test_macos_bundle_identity_must_match_production_contract(tmp_path: Path) -> None:
+    contracts = _write_valid_release(tmp_path)
+    target = next(
+        contract
+        for contract in contracts
+        if contract.filename.endswith("darwin-universal.tar.gz")
+    )
+    info_name = next(
+        name for name in target.members if name.endswith("CuaDriver.app/Contents/Info.plist")
+    )
+    wrong_info = plistlib.dumps({
+        "CFBundleIdentifier": "com.trycua.driver",
+        "CFBundleExecutable": "cua-driver",
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": VERSION,
+    })
+    _write_tar(tmp_path / target.filename, target, {info_name: wrong_info})
+
+    with pytest.raises(ContractError, match="invalid CFBundleIdentifier"):
         verify_release_archives(tmp_path, VERSION)

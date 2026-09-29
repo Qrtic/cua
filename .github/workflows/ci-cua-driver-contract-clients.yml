@@ -18,9 +18,13 @@ on:
       - "libs/cua-driver/rust/crates/cua-driver-core/**"
       - "libs/cua-driver/rust/crates/cua-driver-sdk/**"
       - "libs/cua-driver/rust/crates/cua-driver-testkit/**"
+      - "libs/cua-driver/rust/crates/computer-use-mcp-bootstrap/**"
       - "libs/cua-driver/rust/crates/platform-linux/**"
       - "libs/cua-driver/rust/crates/platform-macos/**"
       - "libs/cua-driver/rust/crates/platform-windows/**"
+      - "libs/cua-driver/scripts/**"
+      - ".github/scripts/verify_cua_driver_release_archives.py"
+      - ".github/scripts/tests/test_verify_cua_driver_release_archives.py"
       - "libs/cua-driver/scripts/generate-uniffi-bindings.mjs"
       - "libs/cua-driver/scripts/stage-uniffi-library.mjs"
       - "libs/cua-driver/scripts/build-npm-packages.mjs"
@@ -45,9 +49,13 @@ on:
       - "libs/cua-driver/rust/crates/cua-driver-core/**"
       - "libs/cua-driver/rust/crates/cua-driver-sdk/**"
       - "libs/cua-driver/rust/crates/cua-driver-testkit/**"
+      - "libs/cua-driver/rust/crates/computer-use-mcp-bootstrap/**"
       - "libs/cua-driver/rust/crates/platform-linux/**"
       - "libs/cua-driver/rust/crates/platform-macos/**"
       - "libs/cua-driver/rust/crates/platform-windows/**"
+      - "libs/cua-driver/scripts/**"
+      - ".github/scripts/verify_cua_driver_release_archives.py"
+      - ".github/scripts/tests/test_verify_cua_driver_release_archives.py"
       - "libs/cua-driver/scripts/generate-uniffi-bindings.mjs"
       - "libs/cua-driver/scripts/stage-uniffi-library.mjs"
       - "libs/cua-driver/scripts/build-npm-packages.mjs"
@@ -105,7 +113,7 @@ jobs:
   runtime-parity:
     name: Portable contract parity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -138,6 +146,35 @@ jobs:
         if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
         working-directory: libs/cua-driver/rust
         run: cargo test --locked -p cua-driver --test schema_consistency_test portable_desktop_contracts_are_accepted_by_active_backend
+
+      - name: Test macOS onboarding runtime
+        if: runner.os == 'macOS'
+        working-directory: libs/cua-driver/rust
+        env:
+          CUA_DRIVER_PRODUCTION_TEAM_ID: TEAM123456
+        run: |
+          cargo test --locked -p computer-use-mcp-bootstrap --all-targets
+          cargo test --locked -p platform-macos --lib app_identity::
+          cargo test --locked -p platform-macos --lib permission_observation::
+          cargo test --locked -p platform-macos --lib permissions::
+          cargo test --locked -p platform-macos --lib tools::check_permissions::tests::
+          cargo test --locked -p platform-macos --lib tools::health_report::tests::
+          cargo test --locked -p platform-macos --lib tools::launch_app::tests::
+          cargo test --locked -p cua-driver --bin cua-driver onboarding
+          cargo test --locked -p cua-driver --bin cua-driver serve::socket_tests::
+          cargo test --locked -p cua-driver --bin cua-driver history_runtime::tests::
+          cargo test --locked -p cua-driver --bin cua-driver bundle::tests::
+
+      - name: Test macOS installer and identity contracts
+        if: runner.os == 'macOS'
+        run: |
+          python3 -m pip install pytest
+          python3 -m pytest -q \
+            libs/cua-driver/python/tests/test_install_local_signing.py \
+            libs/cua-driver/scripts/tests/test_bundle_presentation.py \
+            libs/cua-driver/scripts/tests/test_install_macos_tcc.py \
+            libs/cua-driver/scripts/tests/test_macos_lume_runner.py \
+            libs/cua-driver/scripts/tests/test_uninstall_local.py
 
       - name: Verify released CLI and MCP compatibility
         if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
@@ -242,6 +279,10 @@ jobs:
             tests/test_build_wheel.py \
             tests/test_compatibility_contract.py \
             -q
+
+      - name: Test release archive contracts
+        run: |
+          python -m pytest .github/scripts/tests/test_verify_cua_driver_release_archives.py -q
 
       - name: Build and stage host-native UniFFI library
         working-directory: libs/cua-driver
