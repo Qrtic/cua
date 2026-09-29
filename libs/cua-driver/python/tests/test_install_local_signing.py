@@ -7,9 +7,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 SIGNING_HELPER = SCRIPTS_DIR / "_local-signing.sh"
 
 
-def run_signing_policy(
-    shell_body: str, extra_env: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
+def run_signing_policy(shell_body: str, extra_env=None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["SIGNING_HELPER"] = str(SIGNING_HELPER)
     env.update(extra_env or {})
