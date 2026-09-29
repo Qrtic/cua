@@ -456,7 +456,10 @@ fn contains_remote_debugging_flag(value: &str) -> bool {
 fn is_cua_driver_bundle_id(bundle_id: &str) -> bool {
     matches!(
         bundle_id,
-        "com.meta.musecode.cua.driver" | "com.meta.musecode.cua.driver.local"
+        "com.meta.musecode.cua.driver"
+            | "com.meta.musecode.cua.driver.local"
+            | "com.trycua.driver"
+            | "com.trycua.driver.local"
     )
 }
 
@@ -839,6 +842,8 @@ mod tests {
         assert!(is_cua_driver_bundle_id(
             "com.meta.musecode.cua.driver.local"
         ));
+        assert!(is_cua_driver_bundle_id("com.trycua.driver"));
+        assert!(is_cua_driver_bundle_id("com.trycua.driver.local"));
         assert!(!is_cua_driver_bundle_id("com.trycua.harness.tauri"));
     }
 
