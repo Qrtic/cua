@@ -225,7 +225,9 @@ fn select_context_menu_projection<T: MenuVisualTree>(
         visited.push(node.clone());
         let role = tree.role(&node)?;
         if role == "AXMenu" {
-            let Some(frame) = tree.frame(&node).filter(valid_frame) else { continue };
+            let Some(frame) = tree.frame(&node).filter(valid_frame) else {
+                continue;
+            };
             let mut peers = windows.iter().filter(|window| {
                 window.pid == pid
                     && window.window_id != host_window_id
@@ -261,10 +263,14 @@ fn select_context_menu_projection<T: MenuVisualTree>(
         !tree.same(node, selected) && !path.iter().any(|ancestor| tree.same(ancestor, node))
     }) || !tree.within_budget()
         || tree.focused_window() != Some(host_window_id)
-        || !tree.context_host(host_window_id).is_some_and(|current| tree.same(&current, &host))
+        || !tree
+            .context_host(host_window_id)
+            .is_some_and(|current| tree.same(&current, &host))
         || tree.owner(&host) != Some(pid)
         || tree.window_id(&host) != Some(host_window_id)
-        || !tree.frame(&host).is_some_and(|current| frames_match(&current, &host_frame))
+        || !tree
+            .frame(&host)
+            .is_some_and(|current| frames_match(&current, &host_frame))
     {
         return None;
     }
@@ -301,7 +307,10 @@ fn context_menu_path<T: MenuVisualTree>(
         if tree.same(&current, host) {
             return Some(path);
         }
-        if matches!(tree.role(&current).as_deref(), Some("AXWindow" | "AXSheet" | "AXMenuBar" | "AXApplication")) {
+        if matches!(
+            tree.role(&current).as_deref(),
+            Some("AXWindow" | "AXSheet" | "AXMenuBar" | "AXApplication")
+        ) {
             return None;
         }
         let parent = tree.parent(&current)?;
@@ -469,14 +478,21 @@ pub(crate) unsafe fn menu_context_preparation_is_owned(
     let role = tree.role(&element).unwrap_or_default();
     is_actionable_menu_role(&role)
         && !action.eq_ignore_ascii_case("cancel")
-        && advertised_menu_element_action(&role, action, &super::bindings::copy_action_names(element.0)).is_some()
+        && advertised_menu_element_action(
+            &role,
+            action,
+            &super::bindings::copy_action_names(element.0),
+        )
+        .is_some()
         && proves_menu_ancestry(&tree, pid, &element)
 }
 
 /// Lifecycle classification only, not permission to dispatch. Leaf commands
 /// and cancellation end the retained menu context even if AX updates lag.
 pub(crate) unsafe fn menu_element_opens_submenu(pid: i32, element: AXUIElementRef) -> bool {
-    if element.is_null() { return false; }
+    if element.is_null() {
+        return false;
+    }
     let role = super::bindings::copy_string_attr(element, "AXRole").unwrap_or_default();
     if role == "AXMenuBarItem" {
         return true;
@@ -492,9 +508,14 @@ pub(crate) unsafe fn menu_element_opens_submenu(pid: i32, element: AXUIElementRe
         deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(200)),
     };
     CFRetain(element as CFTypeRef);
-    let Some(node) = AxNode::owned(element) else { return false };
-    tree.children(&node).is_some_and(|children|
-        children.iter().any(|child| tree.role(child).as_deref() == Some("AXMenu")))
+    let Some(node) = AxNode::owned(element) else {
+        return false;
+    };
+    tree.children(&node).is_some_and(|children| {
+        children
+            .iter()
+            .any(|child| tree.role(child).as_deref() == Some("AXMenu"))
+    })
 }
 
 struct AxNode(AXUIElementRef);
@@ -629,25 +650,38 @@ impl MenuVisualTree for NativeMenuTree {
         unsafe {
             let attribute = CFString::new("AXChildren");
             let mut value: CFTypeRef = std::ptr::null();
-            let error = AXUIElementCopyAttributeValue(node.0, attribute.as_concrete_TypeRef(), &mut value);
+            let error =
+                AXUIElementCopyAttributeValue(node.0, attribute.as_concrete_TypeRef(), &mut value);
             if error != kAXErrorSuccess {
-                if !value.is_null() { CFRelease(value); }
+                if !value.is_null() {
+                    CFRelease(value);
+                }
                 // Native text and image leaves can omit AXChildren. A timeout
                 // or other read failure cannot masquerade as an empty subtree.
-                return matches!(error, super::bindings::kAXErrorAttributeUnsupported | super::bindings::kAXErrorNoValue)
-                    .then(Vec::new);
+                return matches!(
+                    error,
+                    super::bindings::kAXErrorAttributeUnsupported
+                        | super::bindings::kAXErrorNoValue
+                )
+                .then(Vec::new);
             }
-            if value.is_null() { return None; }
+            if value.is_null() {
+                return None;
+            }
             if CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
                 CFRelease(value);
                 return None;
             }
             let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
-            if children.len() > MAX_MENU_CHILDREN as isize { return None; }
+            if children.len() > MAX_MENU_CHILDREN as isize {
+                return None;
+            }
             let mut result = Vec::new();
             for index in 0..children.len() {
                 let child = *children.get(index)?;
-                if CFGetTypeID(child) != AXUIElementGetTypeID() { return None; }
+                if CFGetTypeID(child) != AXUIElementGetTypeID() {
+                    return None;
+                }
                 CFRetain(child);
                 result.push(AxNode::owned(child as AXUIElementRef)?);
             }
@@ -675,7 +709,11 @@ pub(crate) fn active_application_menu_projection(
     pid: i32,
     document_window_id: u32,
 ) -> Option<ApplicationMenuProjection> {
-    active_menu_projection_with_policy(pid, document_window_id, MenuProjectionPolicy::ApplicationOnly)
+    active_menu_projection_with_policy(
+        pid,
+        document_window_id,
+        MenuProjectionPolicy::ApplicationOnly,
+    )
 }
 
 pub(crate) fn active_open_menu_projection(
@@ -683,8 +721,15 @@ pub(crate) fn active_open_menu_projection(
     host_window_id: u32,
     allow_application_menu: bool,
 ) -> Option<ApplicationMenuProjection> {
-    active_menu_projection_with_policy(pid, host_window_id,
-        if allow_application_menu { MenuProjectionPolicy::ApplicationOrContext } else { MenuProjectionPolicy::ContextOnly })
+    active_menu_projection_with_policy(
+        pid,
+        host_window_id,
+        if allow_application_menu {
+            MenuProjectionPolicy::ApplicationOrContext
+        } else {
+            MenuProjectionPolicy::ContextOnly
+        },
+    )
 }
 
 enum MenuProjectionPolicy {
@@ -730,9 +775,15 @@ fn active_menu_projection_with_policy(
         deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
     };
     let selected = match policy {
-        MenuProjectionPolicy::ApplicationOnly => select_application_menu_projection(&tree, pid, document_window_id, &enumeration.windows),
-        MenuProjectionPolicy::ContextOnly => select_context_menu_projection(&tree, pid, document_window_id, &enumeration.windows),
-        MenuProjectionPolicy::ApplicationOrContext => select_menu_projection(&tree, pid, document_window_id, &enumeration.windows),
+        MenuProjectionPolicy::ApplicationOnly => {
+            select_application_menu_projection(&tree, pid, document_window_id, &enumeration.windows)
+        }
+        MenuProjectionPolicy::ContextOnly => {
+            select_context_menu_projection(&tree, pid, document_window_id, &enumeration.windows)
+        }
+        MenuProjectionPolicy::ApplicationOrContext => {
+            select_menu_projection(&tree, pid, document_window_id, &enumeration.windows)
+        }
     }?;
     Some(ApplicationMenuProjection {
         root: selected.root,
@@ -752,7 +803,10 @@ pub(crate) fn same_menu_scope(left: &ApplicationMenuImage, right: &ApplicationMe
         && left.pid == right.pid
         && left.document_window_id == right.document_window_id
         && left.menu_window_id == right.menu_window_id
-        && frames_match(&bounds_frame(&left.menu_bounds), &bounds_frame(&right.menu_bounds))
+        && frames_match(
+            &bounds_frame(&left.menu_bounds),
+            &bounds_frame(&right.menu_bounds),
+        )
         && frames_match(
             &bounds_frame(&left.document_bounds),
             &bounds_frame(&right.document_bounds),
@@ -761,10 +815,15 @@ pub(crate) fn same_menu_scope(left: &ApplicationMenuImage, right: &ApplicationMe
 
 pub(crate) fn revalidate_menu_image(image: &ApplicationMenuImage) -> bool {
     let projection = match image.kind {
-        MenuKind::Application => active_application_menu_projection(image.pid, image.document_window_id),
-        MenuKind::Context => active_open_menu_projection(image.pid, image.document_window_id, false),
+        MenuKind::Application => {
+            active_application_menu_projection(image.pid, image.document_window_id)
+        }
+        MenuKind::Context => {
+            active_open_menu_projection(image.pid, image.document_window_id, false)
+        }
     };
-    projection.map(|menu| menu.image)
+    projection
+        .map(|menu| menu.image)
         .is_some_and(|current| same_menu_scope(&current, image))
 }
 
@@ -1075,19 +1134,35 @@ mod tests {
     struct ContextVisualTree(VisualTree);
     impl MenuTree for ContextVisualTree {
         type Node = u32;
-        fn focused_window(&self) -> Option<u32> { self.0.focused_window() }
-        fn menu_bar(&self) -> Option<u32> { None }
-        fn owner(&self, node: &u32) -> Option<i32> { self.0.owner(node) }
-        fn role(&self, node: &u32) -> Option<String> { self.0.role(node) }
-        fn parent(&self, node: &u32) -> Option<u32> { self.0.parent(node) }
+        fn focused_window(&self) -> Option<u32> {
+            self.0.focused_window()
+        }
+        fn menu_bar(&self) -> Option<u32> {
+            None
+        }
+        fn owner(&self, node: &u32) -> Option<i32> {
+            self.0.owner(node)
+        }
+        fn role(&self, node: &u32) -> Option<String> {
+            self.0.role(node)
+        }
+        fn parent(&self, node: &u32) -> Option<u32> {
+            self.0.parent(node)
+        }
         fn contains_child(&self, parent: &u32, child: &u32) -> bool {
             self.0.contains_child(parent, child)
         }
-        fn same(&self, left: &u32, right: &u32) -> bool { self.0.same(left, right) }
+        fn same(&self, left: &u32, right: &u32) -> bool {
+            self.0.same(left, right)
+        }
     }
     impl MenuVisualTree for ContextVisualTree {
-        fn children(&self, node: &u32) -> Option<Vec<u32>> { self.0.children(node) }
-        fn frame(&self, node: &u32) -> Option<[f64; 4]> { self.0.frame(node) }
+        fn children(&self, node: &u32) -> Option<Vec<u32>> {
+            self.0.children(node)
+        }
+        fn frame(&self, node: &u32) -> Option<[f64; 4]> {
+            self.0.frame(node)
+        }
         fn context_host(&self, window_id: u32) -> Option<u32> {
             (window_id == 7).then_some(100)
         }
@@ -1103,10 +1178,24 @@ mod tests {
             (101, "AXScrollArea", Some(100), vec![102]),
             (102, "AXTable", Some(101), vec![103, 104]),
             (103, "AXRow", Some(102), vec![105]),
-            (104, "AXColumn", Some(102), if duplicate_header { vec![105] } else { vec![] }),
+            (
+                104,
+                "AXColumn",
+                Some(102),
+                if duplicate_header { vec![105] } else { vec![] },
+            ),
             (105, "AXCell", Some(103), vec![2]),
         ] {
-            tree.tree.nodes.insert(id, Node { identity: id, role, owner: 42, parent, children });
+            tree.tree.nodes.insert(
+                id,
+                Node {
+                    identity: id,
+                    role,
+                    owner: 42,
+                    parent,
+                    children,
+                },
+            );
         }
         tree.tree.nodes.get_mut(&2).unwrap().parent = Some(105);
         tree.frames.insert(100, [0.0, 787.0, 480.0, 270.0]);
@@ -1116,7 +1205,10 @@ mod tests {
     fn context_visual_windows() -> Vec<crate::windows::WindowInfo> {
         let mut host = visual_window(7, 42, 3, [0.0, 787.0, 480.0, 270.0]);
         host.is_on_screen = false;
-        vec![host, visual_window(9, 42, 101, [401.0, 816.0, 183.0, 235.0])]
+        vec![
+            host,
+            visual_window(9, 42, 101, [401.0, 816.0, 183.0, 235.0]),
+        ]
     }
     #[test]
     fn focused_panel_context_menu_is_the_visible_projection() {
@@ -1126,7 +1218,10 @@ mod tests {
         assert_eq!(projection.root, 2);
         assert_eq!(projection.image.document_window_id, 7);
         assert_eq!(projection.image.menu_window_id, 9);
-        assert!(!proves_menu_member(&tree, 42, 7, &3), "context menus do not gain menu-bar ancestry");
+        assert!(
+            !proves_menu_member(&tree, 42, 7, &3),
+            "context menus do not gain menu-bar ancestry"
+        );
     }
     #[test]
     fn repeated_row_column_header_identity_does_not_hide_the_context_menu() {
@@ -1142,7 +1237,9 @@ mod tests {
             let mut tree = context_visual_tree(false);
             let mut windows = context_visual_windows();
             match mutation {
-                0 => { windows.remove(0); }
+                0 => {
+                    windows.remove(0);
+                }
                 1 => windows[0].pid = 99,
                 2 => windows[0].layer = 101,
                 3 => windows[0].bounds.x += 1.0,
@@ -1158,17 +1255,30 @@ mod tests {
                 13 => tree.0.tree.nodes.get_mut(&105).unwrap().children.push(100),
                 14 => windows.push(visual_window(10, 42, 101, [401.0, 816.0, 183.0, 235.0])),
                 15 => windows[0].on_current_space = Some(false),
-                _ => { tree.0.frames.insert(100, [f64::NAN, 787.0, 480.0, 270.0]); }
+                _ => {
+                    tree.0.frames.insert(100, [f64::NAN, 787.0, 480.0, 270.0]);
+                }
             }
-            assert!(select_menu_projection(&tree, 42, 7, &windows).is_none(), "mutation {mutation}");
+            assert!(
+                select_menu_projection(&tree, 42, 7, &windows).is_none(),
+                "mutation {mutation}"
+            );
         }
     }
     #[test]
     fn context_projection_rejects_peer_menus_but_accepts_a_proven_submenu_chain() {
         let mut tree = context_visual_tree(false);
         let mut windows = context_visual_windows();
-        tree.0.tree.nodes.insert(106, Node { identity: 106, role: "AXMenu", owner: 42,
-            parent: Some(3), children: vec![] });
+        tree.0.tree.nodes.insert(
+            106,
+            Node {
+                identity: 106,
+                role: "AXMenu",
+                owner: 42,
+                parent: Some(3),
+                children: vec![],
+            },
+        );
         tree.0.tree.nodes.get_mut(&3).unwrap().children.push(106);
         tree.0.frames.insert(106, [584.0, 816.0, 150.0, 100.0]);
         windows.push(visual_window(10, 42, 101, [584.0, 816.0, 150.0, 100.0]));
@@ -1184,12 +1294,24 @@ mod tests {
     }
     #[test]
     fn menu_container_only_accepts_explicit_advertised_cancel() {
-        assert_eq!(advertised_menu_element_action("AXMenu", "cancel", &["AXCancel".into()]), Some("AXCancel"));
-        assert_eq!(advertised_menu_element_action("AXMenu", "cancel", &[]), None);
+        assert_eq!(
+            advertised_menu_element_action("AXMenu", "cancel", &["AXCancel".into()]),
+            Some("AXCancel")
+        );
+        assert_eq!(
+            advertised_menu_element_action("AXMenu", "cancel", &[]),
+            None
+        );
         for action in ["press", "click", "pick", "show_menu", "confirm", "open"] {
             assert!(!supports_menu_action_role("AXMenu", action));
-            assert_eq!(advertised_menu_element_action("AXMenu", action,
-                &["AXPress".into(), "AXCancel".into(), "AXPick".into()]), None);
+            assert_eq!(
+                advertised_menu_element_action(
+                    "AXMenu",
+                    action,
+                    &["AXPress".into(), "AXCancel".into(), "AXPick".into()]
+                ),
+                None
+            );
         }
         assert!(!supports_menu_action_role("AXMenuBar", "cancel"));
         assert!(!supports_menu_action_role("AXWindow", "cancel"));
@@ -1197,9 +1319,21 @@ mod tests {
 
     #[test]
     fn menu_container_cancel_requires_current_visible_exact_projection() {
-        assert!(proves_visible_menu_container(&visual_tree(), 42, 7, &2, &visual_windows()));
+        assert!(proves_visible_menu_container(
+            &visual_tree(),
+            42,
+            7,
+            &2,
+            &visual_windows()
+        ));
         for element in [0, 1, 3] {
-            assert!(!proves_visible_menu_container(&visual_tree(), 42, 7, &element, &visual_windows()));
+            assert!(!proves_visible_menu_container(
+                &visual_tree(),
+                42,
+                7,
+                &element,
+                &visual_windows()
+            ));
         }
         for mutation in 0..5 {
             let mut tree = visual_tree();
@@ -1218,7 +1352,10 @@ mod tests {
     fn menu_image_keeps_document_anchor_and_selects_only_proven_popup() {
         let projection = select_menu_projection(&visual_tree(), 42, 7, &visual_windows())
             .expect("the current AX menu has an exact same-owner CG frame");
-        assert_eq!(projection.root, 2, "walk the proven visible menu rather than the document or other menu branches");
+        assert_eq!(
+            projection.root, 2,
+            "walk the proven visible menu rather than the document or other menu branches"
+        );
         let image = projection.image;
         assert_eq!(
             (image.pid, image.document_window_id, image.menu_window_id),

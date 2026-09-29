@@ -57,12 +57,16 @@ impl SheetTree for Tree {
         Some(self.nodes.get(n)?.role.into())
     }
     fn identifier(&self, n: &u32) -> Option<String> {
-        if self.unreadable_identifier == Some(*n) { return None; }
+        if self.unreadable_identifier == Some(*n) {
+            return None;
+        }
         if *n == 900 {
             let reads = self.identifier_reads.get();
             self.identifier_reads.set(reads + 1);
             if reads > 0 {
-                if self.identifier_unreadable_after_first { return None; }
+                if self.identifier_unreadable_after_first {
+                    return None;
+                }
                 if let Some(identifier) = self.identifier_after_first {
                     return Some(identifier.into());
                 }
@@ -97,11 +101,15 @@ impl SheetTree for Tree {
         }
     }
     fn child_sheets(&self, n: &u32) -> Option<Vec<u32>> {
-        if !self.children_complete { return None; }
+        if !self.children_complete {
+            return None;
+        }
         if *n == 900 {
             let reads = self.leaf_child_reads.get();
             self.leaf_child_reads.set(reads + 1);
-            if self.new_child_after_leaf_check && reads > 0 { return Some(vec![950]); }
+            if self.new_child_after_leaf_check && reads > 0 {
+                return Some(vec![950]);
+            }
         }
         if *n == 700 {
             let reads = self.host_child_reads.get();
@@ -112,7 +120,9 @@ impl SheetTree for Tree {
         }
         let mut sheets = Vec::new();
         for child in &self.nodes.get(n)?.children {
-            if self.nodes.get(child)?.role == "AXSheet" { sheets.push(*child); }
+            if self.nodes.get(child)?.role == "AXSheet" {
+                sheets.push(*child);
+            }
         }
         Some(sheets)
     }
@@ -200,11 +210,20 @@ fn standard_dialog_attachment_retains_exact_panel_and_host() {
     for identifier in ["save-panel", "open-panel"] {
         let mut tree = xcode();
         tree.nodes.get_mut(&900).unwrap().id = identifier;
-        assert_eq!(dialog_attachment(&tree, 42, 950), Some(DialogAttachment {
-            window_id: 950, panel_id: 900, host_id: 700, path: vec![950, 900, 700],
-        }));
-        assert_eq!(tree.identifier_reads.get(), 2,
-            "the final standard-panel identifier must be read after the double chain proof");
+        assert_eq!(
+            dialog_attachment(&tree, 42, 950),
+            Some(DialogAttachment {
+                window_id: 950,
+                panel_id: 900,
+                host_id: 700,
+                path: vec![950, 900, 700],
+            })
+        );
+        assert_eq!(
+            tree.identifier_reads.get(),
+            2,
+            "the final standard-panel identifier must be read after the double chain proof"
+        );
     }
 }
 
@@ -212,8 +231,11 @@ fn standard_dialog_attachment_retains_exact_panel_and_host() {
 fn standard_dialog_attachment_refuses_identifier_changed_after_chain_proof() {
     let mut weaker = xcode();
     weaker.identifier_after_first = Some("ordinary-confirmation");
-    assert_eq!(dialog_host(&weaker, 42, 950), Some(700),
-        "a structural host proof alone does not include the required final identifier read");
+    assert_eq!(
+        dialog_host(&weaker, 42, 950),
+        Some(700),
+        "a structural host proof alone does not include the required final identifier read"
+    );
     let mut tree = xcode();
     tree.identifier_after_first = Some("ordinary-confirmation");
     assert!(dialog_attachment(&tree, 42, 950).is_none());
@@ -240,7 +262,11 @@ fn standard_dialog_probe_declines_direct_ordinary_before_full_proof() {
     assert_eq!(probe.host_id, None);
     assert_eq!(tree.identifier_reads.get(), 1);
     assert_eq!(tree.windows_reads.get(), 0);
-    assert_eq!(tree.relation_reads.get(), 1, "only the existing direct-parent discovery");
+    assert_eq!(
+        tree.relation_reads.get(),
+        1,
+        "only the existing direct-parent discovery"
+    );
 
     let mut original = chess_with_host_focus();
     original.focused = 900;
@@ -282,7 +308,11 @@ fn standard_dialog_probe_keeps_nested_standard_ancestor_and_original_read_counts
     let tree = xcode();
     let probe = probe_standard_dialog(&tree, 42, 950);
     assert!(probe.observed_requested_sheet);
-    assert_eq!(probe.host_id, Some(700), "GoToWindow is not the standard ancestor");
+    assert_eq!(
+        probe.host_id,
+        Some(700),
+        "GoToWindow is not the standard ancestor"
+    );
     let original = xcode();
     assert_eq!(dialog_attachment(&original, 42, 950).unwrap().panel_id, 900);
     assert_eq!(tree.windows_reads.get(), original.windows_reads.get());
@@ -301,20 +331,34 @@ fn standard_dialog_probe_unknown_direct_identifier_keeps_original_full_proof() {
         let probe = probe_standard_dialog(&tree, 42, 900);
         assert!(probe.observed_requested_sheet);
         assert_eq!(probe.host_id, None);
-        assert_eq!(tree.windows_reads.get(), 1, "unknown cannot take the early decline");
+        assert_eq!(
+            tree.windows_reads.get(),
+            1,
+            "unknown cannot take the early decline"
+        );
         assert_eq!(tree.relation_reads.get(), 3);
         if !unreadable {
-            assert_eq!(tree.identifier_reads.get(), 2, "unknown is reread at the original point");
+            assert_eq!(
+                tree.identifier_reads.get(),
+                2,
+                "unknown is reread at the original point"
+            );
         }
     }
     let mut later_standard = chess_with_host_focus();
     later_standard.focused = 900;
     later_standard.nodes.get_mut(&900).unwrap().id = "";
     later_standard.identifier_after_first = Some("save-panel");
-    assert_eq!(probe_standard_dialog(&later_standard, 42, 900).host_id, Some(700));
+    assert_eq!(
+        probe_standard_dialog(&later_standard, 42, 900).host_id,
+        Some(700)
+    );
     assert_eq!(later_standard.windows_reads.get(), 2);
-    assert_eq!(later_standard.identifier_reads.get(), 3,
-        "an early unknown must not replace the original later standard-panel decision");
+    assert_eq!(
+        later_standard.identifier_reads.get(),
+        3,
+        "an early unknown must not replace the original later standard-panel decision"
+    );
 }
 
 #[test]
@@ -329,13 +373,21 @@ fn standard_dialog_probe_rechecks_identifier_after_retained_standard_proof() {
         assert!(probe.observed_requested_sheet);
         assert_eq!(probe.host_id, None);
         assert_eq!(tree.windows_reads.get(), 2);
-        assert_eq!(tree.identifier_reads.get(), 2, "early standard ID is never final authority");
+        assert_eq!(
+            tree.identifier_reads.get(),
+            2,
+            "early standard ID is never final authority"
+        );
     }
 }
 
 #[test]
 fn standard_dialog_probe_retained_relation_selection_and_budget_failures_stay_negative() {
-    for fault in [RelationFault::Reparented, RelationFault::WrongWindow, RelationFault::Unreadable] {
+    for fault in [
+        RelationFault::Reparented,
+        RelationFault::WrongWindow,
+        RelationFault::Unreadable,
+    ] {
         let mut tree = chess_with_host_focus();
         tree.focused = 900;
         tree.nodes.get_mut(&900).unwrap().id = "save-panel";
@@ -377,13 +429,20 @@ fn ordinary_sheet_keyboard_activation_requires_its_own_proven_visible_leaf() {
         assert!(keyboard_activation_matches(&tree, 42, 900, &proof));
         assert!(keyboard_activation_chain(&tree, 42, 700).is_none());
         assert!(keyboard_activation_chain(&tree, 42, 901).is_none());
-        assert!(dialog_host(&tree, 42, 900).is_none(),
-            "keyboard activation must not grant file-dialog segment authority");
+        assert!(
+            dialog_host(&tree, 42, 900).is_none(),
+            "keyboard activation must not grant file-dialog segment authority"
+        );
     }
     let mut tree = xcode();
     tree.nodes.get_mut(&900).unwrap().id = "ordinary-settings";
     tree.nodes.get_mut(&950).unwrap().id = "ordinary-confirmation";
-    assert_eq!(keyboard_activation_chain(&tree, 42, 950).unwrap().window_ids, [950, 900, 700]);
+    assert_eq!(
+        keyboard_activation_chain(&tree, 42, 950)
+            .unwrap()
+            .window_ids,
+        [950, 900, 700]
+    );
     assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
     assert!(dialog_host(&tree, 42, 950).is_none());
 }
@@ -397,8 +456,10 @@ fn ordinary_sheet_keyboard_activation_does_not_reclassify_file_panels() {
         assert_eq!(dialog_host(&tree, 42, 950), Some(700));
         tree.unreadable_identifier = Some(900);
         assert!(dialog_host(&tree, 42, 950).is_none());
-        assert!(keyboard_activation_chain(&tree, 42, 950).is_none(),
-            "an unreadable file panel cannot cross into ordinary-sheet admission");
+        assert!(
+            keyboard_activation_chain(&tree, 42, 950).is_none(),
+            "an unreadable file panel cannot cross into ordinary-sheet admission"
+        );
     }
     let mut tree = chess_with_host_focus();
     tree.unreadable_identifier = Some(900);
@@ -414,14 +475,19 @@ fn focused_sheet_keyboard_activation_refuses_new_children_before_focus_updates()
     let mut tree = xcode();
     tree.nodes.get_mut(&900).unwrap().id = "ordinary-settings";
     tree.focused = 900;
-    assert!(prove(&tree, 42, 900).is_some(), "legacy discovery is unchanged");
+    assert!(
+        prove(&tree, 42, 900).is_some(),
+        "legacy discovery is unchanged"
+    );
     assert!(keyboard_activation_chain(&tree, 42, 900).is_none());
 
     let mut tree = chess_with_host_focus();
     tree.focused = 900;
     tree.new_child_after_leaf_check = true;
-    assert!(keyboard_activation_chain(&tree, 42, 900).is_none(),
-        "a child appearing during proof cannot inherit the stale focused-sheet authority");
+    assert!(
+        keyboard_activation_chain(&tree, 42, 900).is_none(),
+        "a child appearing during proof cannot inherit the stale focused-sheet authority"
+    );
 }
 
 #[test]
@@ -437,7 +503,10 @@ fn ordinary_sheet_keyboard_activation_refuses_foreign_stale_or_unreadable_chains
         |t: &mut Tree| t.nodes.get_mut(&900).unwrap().visible = false,
         |t: &mut Tree| t.nodes.get_mut(&700).unwrap().visible = false,
         |t: &mut Tree| t.nodes.get_mut(&700).unwrap().minimized = Ok(true),
-        |t: &mut Tree| t.nodes.get_mut(&900).unwrap().minimized = Err(crate::ax::bindings::kAXErrorCannotComplete),
+        |t: &mut Tree| {
+            t.nodes.get_mut(&900).unwrap().minimized =
+                Err(crate::ax::bindings::kAXErrorCannotComplete)
+        },
         |t: &mut Tree| t.windows = vec![700, 700],
         |t: &mut Tree| t.windows = vec![],
         |t: &mut Tree| t.children_complete = false,
@@ -485,8 +554,10 @@ fn ordinary_sheet_keyboard_activation_revalidates_before_each_use_without_renewi
     tree.budget.set(1000);
     tree.relation_reads.set(0);
     tree.expire_on_parent_read = true;
-    assert!(!keyboard_activation_matches(&tree, 42, 900, &proof),
-        "a current proof must not continue by renewing an exhausted budget");
+    assert!(
+        !keyboard_activation_matches(&tree, 42, 900, &proof),
+        "a current proof must not continue by renewing an exhausted budget"
+    );
     assert_eq!(tree.relation_reads.get(), 1);
     assert_eq!(tree.budget.get(), 0);
 }
@@ -497,17 +568,31 @@ fn retained_keyboard_revalidation_discovers_once_and_reads_again_at_each_use() {
         let mut tree = chess_with_host_focus();
         tree.focused = focus;
         let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
-        assert_eq!(tree.windows_reads.get(), 2, "initial discovery remains double-proven");
+        assert_eq!(
+            tree.windows_reads.get(),
+            2,
+            "initial discovery remains double-proven"
+        );
         for _ in 0..2 {
             tree.windows_reads.set(0);
             tree.reads.set(0);
             assert!(keyboard_activation_matches(&tree, 42, 900, &proof));
-            assert_eq!(tree.windows_reads.get(), 1, "one complete fresh chain per use");
-            assert_eq!(tree.reads.get(), 2, "fresh selection is still checked twice");
+            assert_eq!(
+                tree.windows_reads.get(),
+                1,
+                "one complete fresh chain per use"
+            );
+            assert_eq!(
+                tree.reads.get(),
+                2,
+                "fresh selection is still checked twice"
+            );
         }
         tree.nodes.get_mut(&700).unwrap().children.clear();
-        assert!(!keyboard_activation_matches(&tree, 42, 900, &proof),
-            "a previous successful use cannot cache a detached relation");
+        assert!(
+            !keyboard_activation_matches(&tree, 42, 900, &proof),
+            "a previous successful use cannot cache a detached relation"
+        );
     }
 }
 
@@ -521,21 +606,29 @@ fn retained_keyboard_revalidation_rejects_a_different_valid_host() {
     tree.nodes.get_mut(&900).unwrap().parent = Some(701);
     tree.nodes.get_mut(&900).unwrap().window = Some(701);
     tree.windows = vec![700, 701];
-    assert!(keyboard_activation_chain(&tree, 42, 900).is_some(),
-        "the replacement host is independently valid, but is not retained authority");
+    assert!(
+        keyboard_activation_chain(&tree, 42, 900).is_some(),
+        "the replacement host is independently valid, but is not retained authority"
+    );
     assert!(!keyboard_activation_matches(&tree, 42, 900, &proof));
 }
 
 #[test]
 fn retained_keyboard_revalidation_rejects_edges_changed_during_the_fresh_walk() {
-    for fault in [RelationFault::Reparented, RelationFault::WrongWindow, RelationFault::Unreadable] {
+    for fault in [
+        RelationFault::Reparented,
+        RelationFault::WrongWindow,
+        RelationFault::Unreadable,
+    ] {
         let mut tree = chess_with_host_focus();
         let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
         tree.relation_reads.set(0);
         tree.relation_fault = Some(fault);
         assert!(!keyboard_activation_matches(&tree, 42, 900, &proof));
-        assert!(tree.relation_reads.get() > 1,
-            "the first parent read succeeds; a later reciprocal read must reject the change");
+        assert!(
+            tree.relation_reads.get() > 1,
+            "the first parent read succeeds; a later reciprocal read must reject the change"
+        );
     }
 }
 
@@ -548,17 +641,26 @@ fn retained_keyboard_revalidation_rejects_new_children_and_sibling_selection() {
     tree.windows_reads.set(0);
     tree.new_child_after_leaf_check = true;
     assert!(!keyboard_activation_matches(&tree, 42, 900, &proof));
-    assert_eq!(tree.windows_reads.get(), 1,
-        "fresh-chain discovery completes before the final ordinary-leaf check rejects the child");
-    assert_eq!(tree.focused, 900, "unchanged focused ID cannot hide a new child");
+    assert_eq!(
+        tree.windows_reads.get(),
+        1,
+        "fresh-chain discovery completes before the final ordinary-leaf check rejects the child"
+    );
+    assert_eq!(
+        tree.focused, 900,
+        "unchanged focused ID cannot hide a new child"
+    );
 
     let mut tree = chess_with_host_focus();
     let proof = keyboard_activation_chain(&tree, 42, 900).unwrap();
     tree.host_child_reads.set(0);
     tree.new_sibling_after_selection = true;
     assert!(!keyboard_activation_matches(&tree, 42, 900, &proof));
-    assert_eq!(tree.host_child_reads.get(), 2,
-        "the fresh chain's final selection rejects the new competing sheet");
+    assert_eq!(
+        tree.host_child_reads.get(),
+        2,
+        "the fresh chain's final selection rejects the new competing sheet"
+    );
 }
 
 #[test]
@@ -571,8 +673,11 @@ fn retained_keyboard_revalidation_rechecks_identifiers_after_fresh_discovery() {
         tree.identifier_after_first = Some(identifier);
         assert!(!keyboard_activation_matches(&tree, 42, 900, &proof));
         assert_eq!(tree.windows_reads.get(), 1);
-        assert_eq!(tree.identifier_reads.get(), 2,
-            "a current file-panel identifier cannot reuse the old ordinary-leaf result");
+        assert_eq!(
+            tree.identifier_reads.get(),
+            2,
+            "a current file-panel identifier cannot reuse the old ordinary-leaf result"
+        );
     }
 }
 
@@ -584,9 +689,14 @@ fn host_focused_chess_sheet_is_discovered_as_its_own_window() {
     let tree = chess_with_host_focus();
     assert_eq!(prove(&tree, 42, 900), Some(900));
     assert_eq!(prove_with_visibility(&tree, 42, 900, true), Some(900));
-    assert_eq!(prove_successor(&tree, 42, 700), Some(AttachedSheetSuccessor {
-        window_id: 900, host_id: 700, path: vec![900, 700],
-    }));
+    assert_eq!(
+        prove_successor(&tree, 42, 700),
+        Some(AttachedSheetSuccessor {
+            window_id: 900,
+            host_id: 700,
+            path: vec![900, 700],
+        })
+    );
     assert!(prove(&tree, 42, 700).is_none());
     // Discovery must not grant this arbitrary sheet a standard file-dialog
     // foreground lease or substitute its host for the requested target.
@@ -600,7 +710,10 @@ fn host_focused_nested_sheet_selects_only_the_unique_leaf() {
     assert_eq!(prove(&tree, 42, 950), Some(950));
     assert_eq!(dialog_host(&tree, 42, 950), Some(700));
     assert!(prove(&tree, 42, 900).is_none());
-    assert_eq!(prove_successor(&tree, 42, 700).unwrap().path, [950, 900, 700]);
+    assert_eq!(
+        prove_successor(&tree, 42, 700).unwrap().path,
+        [950, 900, 700]
+    );
 }
 
 #[test]
@@ -750,7 +863,10 @@ fn keyboard_revalidation_diagnostics_distinguish_budget_from_unproven_evidence()
     );
     assert_eq!(
         super::keyboard_revalidation_diagnostic_status(
-            start, deadline - std::time::Duration::from_micros(1), deadline, false,
+            start,
+            deadline - std::time::Duration::from_micros(1),
+            deadline,
+            false,
         ),
         "proof_unproven"
     );
@@ -772,9 +888,14 @@ fn keyboard_revalidation_diagnostics_do_not_revoke_an_accepted_proof() {
 fn exact_focused_nested_leaf_proves_ancestors_missing_from_axwindows() {
     let tree = xcode();
     assert_eq!(tree.windows, [700]);
-    assert_eq!(prove_focused_sheet_context(&tree, 42, 950, true),
-        Some(FocusedSheetContext::ExactLeafAncestors(vec![900, 700])));
-    assert!(tree.windows_reads.get() >= 2, "both complete chain proofs must run");
+    assert_eq!(
+        prove_focused_sheet_context(&tree, 42, 950, true),
+        Some(FocusedSheetContext::ExactLeafAncestors(vec![900, 700]))
+    );
+    assert!(
+        tree.windows_reads.get() >= 2,
+        "both complete chain proofs must run"
+    );
 }
 
 #[test]
@@ -782,8 +903,10 @@ fn focused_sheet_context_keeps_successor_priority_and_no_candidate_read_cost() {
     let old = xcode();
     let expected = prove_successor(&old, 42, 700).unwrap();
     let current = xcode();
-    assert_eq!(prove_focused_sheet_context(&current, 42, 700, true),
-        Some(FocusedSheetContext::Successor(expected)));
+    assert_eq!(
+        prove_focused_sheet_context(&current, 42, 700, true),
+        Some(FocusedSheetContext::Successor(expected))
+    );
     assert_eq!(current.budget.get(), old.budget.get());
     assert_eq!(current.relation_reads.get(), old.relation_reads.get());
     assert_eq!(current.windows_reads.get(), old.windows_reads.get());
@@ -799,16 +922,21 @@ fn focused_sheet_context_keeps_successor_priority_and_no_candidate_read_cost() {
 #[test]
 fn focused_leaf_ancestor_proof_rejects_wrong_focus_children_and_incomplete_reads() {
     for focused in [700, 900] {
-        let mut tree = xcode(); tree.focused = focused;
-        assert!(prove_focused_leaf_ancestors(&tree, 42, focused).is_none(),
-            "a host or parent with a nested child is not the exact focused leaf");
+        let mut tree = xcode();
+        tree.focused = focused;
+        assert!(
+            prove_focused_leaf_ancestors(&tree, 42, focused).is_none(),
+            "a host or parent with a nested child is not the exact focused leaf"
+        );
     }
     let tree = xcode();
     assert!(prove_focused_leaf_ancestors(&tree, 42, 900).is_none());
-    let mut tree = xcode(); tree.children_complete = false;
+    let mut tree = xcode();
+    tree.children_complete = false;
     assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
     for id in [950, 900] {
-        let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().window = Some(701);
+        let mut tree = xcode();
+        tree.nodes.get_mut(&id).unwrap().window = Some(701);
         assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
         let mut tree = xcode();
         let parent = tree.nodes[&id].parent.unwrap();
@@ -820,36 +948,53 @@ fn focused_leaf_ancestor_proof_rejects_wrong_focus_children_and_incomplete_reads
 #[test]
 fn focused_leaf_ancestor_proof_keeps_owner_visibility_and_live_host_guards() {
     for id in [950, 900, 700] {
-        let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().owner = 99;
+        let mut tree = xcode();
+        tree.nodes.get_mut(&id).unwrap().owner = 99;
         assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
-        let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().visible = false;
+        let mut tree = xcode();
+        tree.nodes.get_mut(&id).unwrap().visible = false;
         assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
         for state in [Ok(true), Err(crate::ax::bindings::kAXErrorCannotComplete)] {
-            let mut tree = xcode(); tree.nodes.get_mut(&id).unwrap().minimized = state;
+            let mut tree = xcode();
+            tree.nodes.get_mut(&id).unwrap().minimized = state;
             assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
         }
     }
     for windows in [vec![], vec![700, 700], vec![900]] {
-        let mut tree = xcode(); tree.windows = windows;
+        let mut tree = xcode();
+        tree.windows = windows;
         assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
     }
 }
 
 #[test]
 fn focused_leaf_ancestor_proof_revalidates_and_never_renews_exhausted_budget() {
-    let mut tree = chess_with_host_focus(); tree.focused = 900;
+    let mut tree = chess_with_host_focus();
+    tree.focused = 900;
     tree.new_child_after_leaf_check = true;
     assert!(prove_focused_leaf_ancestors(&tree, 42, 900).is_none());
-    assert_eq!(tree.leaf_child_reads.get(), 2, "reject child added after first proof");
-    let mut tree = xcode(); tree.change_focus = true;
+    assert_eq!(
+        tree.leaf_child_reads.get(),
+        2,
+        "reject child added after first proof"
+    );
+    let mut tree = xcode();
+    tree.change_focus = true;
     assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
-    for fault in [RelationFault::Reparented, RelationFault::WrongWindow, RelationFault::Unreadable] {
-        let mut tree = xcode(); tree.relation_fault = Some(fault);
+    for fault in [
+        RelationFault::Reparented,
+        RelationFault::WrongWindow,
+        RelationFault::Unreadable,
+    ] {
+        let mut tree = xcode();
+        tree.relation_fault = Some(fault);
         assert!(prove_focused_leaf_ancestors(&tree, 42, 950).is_none());
     }
-    let mut tree = xcode(); tree.expire_on_parent_read = true;
+    let mut tree = xcode();
+    tree.expire_on_parent_read = true;
     assert!(prove_focused_sheet_context(&tree, 42, 950, true).is_none());
     assert_eq!(tree.budget.get(), 0);
-    let tree = xcode(); tree.budget.set(0);
+    let tree = xcode();
+    tree.budget.set(0);
     assert!(prove_focused_sheet_context(&tree, 42, 950, true).is_none());
 }

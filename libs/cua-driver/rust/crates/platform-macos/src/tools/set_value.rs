@@ -203,12 +203,15 @@ impl Tool for SetValueTool {
                 let native_date = crate::ax::attached_popover::native_date_role(role.as_deref());
                 let attached = crate::ax::attached_popover::native_value_role(role.as_deref())
                     && crate::ax::attached_popover::has_semantic_popover_candidate(
-                        element, window_id, role.as_deref(),
+                        element,
+                        window_id,
+                        role.as_deref(),
                     );
                 let native_text = crate::ax::attached_popover::native_text_role(role.as_deref())
-                    && (attached || crate::ax::exact_target::native_text_field_in_window(
-                        element, pid, window_id,
-                    ));
+                    && (attached
+                        || crate::ax::exact_target::native_text_field_in_window(
+                            element, pid, window_id,
+                        ));
                 (native_date, native_text, attached)
             })
             .await
@@ -486,9 +489,14 @@ impl NativeValueField for LiveNativeTextField {
         }
         let role = unsafe { copy_string_attr(element, "AXRole") };
         if !crate::ax::attached_popover::native_text_role(role.as_deref())
-            || (!self.attached && !unsafe {
-                crate::ax::exact_target::native_text_field_in_window(element, self.pid, self.window_id)
-            })
+            || (!self.attached
+                && !unsafe {
+                    crate::ax::exact_target::native_text_field_in_window(
+                        element,
+                        self.pid,
+                        self.window_id,
+                    )
+                })
             || unsafe { crate::ax::bindings::copy_bool_attr(element, "AXEnabled") } == Some(false)
             || !unsafe { crate::ax::bindings::is_attribute_settable(element, "AXValue") }
         {
@@ -618,7 +626,10 @@ fn set_native_date_value(
             base: LiveNativeTextField {
                 editor: unsafe {
                     crate::ax::native_text_editor::NativeTextEditor::new(
-                        element_ptr, pid, window_id, false,
+                        element_ptr,
+                        pid,
+                        window_id,
+                        false,
                     )
                 },
                 pid,
@@ -665,7 +676,10 @@ fn set_native_text_value(
         &LiveNativeTextField {
             editor: unsafe {
                 crate::ax::native_text_editor::NativeTextEditor::new(
-                    element_ptr, pid, window_id, !attached,
+                    element_ptr,
+                    pid,
+                    window_id,
+                    !attached,
                 )
             },
             pid,
@@ -1272,7 +1286,12 @@ mod tests {
         fn check_request(&self) -> anyhow::Result<()> {
             self.calls.borrow_mut().push("poll");
             if self.cancel_on_focus_poll.is_some_and(|limit| {
-                self.calls.borrow().iter().filter(|call| **call == "poll").count() >= limit
+                self.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| **call == "poll")
+                    .count()
+                    >= limit
             }) {
                 anyhow::bail!("request cancelled during editor preparation");
             }
@@ -1281,11 +1300,19 @@ mod tests {
 
         fn validate(&self) -> anyhow::Result<()> {
             self.calls.borrow_mut().push("validate");
-            if self.windowless_until_focus_ready && self.focused.get() && self.delayed_focus_reads.get() > 0 {
+            if self.windowless_until_focus_ready
+                && self.focused.get()
+                && self.delayed_focus_reads.get() > 0
+            {
                 anyhow::bail!("native window ancestry is unavailable during editor transition");
             }
             if self.revoke_on_validation.is_some_and(|limit| {
-                self.calls.borrow().iter().filter(|call| **call == "validate").count() >= limit
+                self.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| **call == "validate")
+                    .count()
+                    >= limit
             }) {
                 anyhow::bail!("target revoked while waiting for its editor");
             }
@@ -1299,7 +1326,8 @@ mod tests {
         }
         fn focused(&self) -> Option<bool> {
             if self.focused.get() && self.delayed_focus_reads.get() > 0 {
-                self.delayed_focus_reads.set(self.delayed_focus_reads.get() - 1);
+                self.delayed_focus_reads
+                    .set(self.delayed_focus_reads.get() - 1);
                 return Some(false);
             }
             Some(self.focused.get())
@@ -1405,7 +1433,15 @@ mod tests {
         assert_eq!(response.phase, "editor_focus");
         assert!(!response.value_write_attempted);
         assert!(!field.calls.borrow().contains(&"write"));
-        assert_eq!(field.calls.borrow().iter().filter(|call| **call == "focus").count(), 1);
+        assert_eq!(
+            field
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "focus")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1467,7 +1503,10 @@ mod tests {
         let error = write_native_value(&field, 81, "new").err().unwrap();
         let response = error.downcast_ref::<NativeValueResponse>().unwrap();
         assert_eq!(response.phase, "editor_focus");
-        assert_eq!(response.native_error, Some(crate::ax::bindings::kAXErrorCannotComplete));
+        assert_eq!(
+            response.native_error,
+            Some(crate::ax::bindings::kAXErrorCannotComplete)
+        );
         assert!(!response.value_write_attempted);
         let calls = field.calls.borrow();
         assert_eq!(calls.iter().filter(|call| **call == "focus").count(), 1);

@@ -261,7 +261,13 @@ pub(crate) fn walk_tree_bounded_strict_window_with_visible_menu(
     max_depth: usize,
 ) -> TreeWalkResult {
     walk_tree_bounded_with_projection(
-        pid, Some(window_id), query, max_elements, max_depth, true, true,
+        pid,
+        Some(window_id),
+        query,
+        max_elements,
+        max_depth,
+        true,
+        true,
     )
 }
 
@@ -349,7 +355,11 @@ fn walk_tree_bounded_with_projection(
         }
 
         if let Some(panel) = window_id
-            .filter(|wid| !top_level.iter().any(|&node| ax_get_window_id(node) == Some(*wid)))
+            .filter(|wid| {
+                !top_level
+                    .iter()
+                    .any(|&node| ax_get_window_id(node) == Some(*wid))
+            })
             .and_then(|wid| super::focused_panel::copy_focused_panel(pid, Some(wid)))
         {
             top_level.push(panel);
@@ -416,11 +426,18 @@ fn walk_tree_bounded_with_projection(
                     && walk_these.iter().any(|&child| {
                         copy_string_attr(child, "AXRole").as_deref() == Some("AXMenuBar")
                     });
-                super::application_menu::active_open_menu_projection(pid, wid, allow_application_menu)
+                super::application_menu::active_open_menu_projection(
+                    pid,
+                    wid,
+                    allow_application_menu,
+                )
             });
         embedded_menu = window_id
-            .filter(|_| prioritize_visible_menu && visible_menu.is_none()
-                && window_scope.as_ref().is_some_and(WindowScope::is_matched))
+            .filter(|_| {
+                prioritize_visible_menu
+                    && visible_menu.is_none()
+                    && window_scope.as_ref().is_some_and(WindowScope::is_matched)
+            })
             .and_then(|wid| super::embedded_menu::active_menu(pid, wid));
         let roots = if let Some(menu) = visible_menu.as_ref() {
             application_menu = Some(menu.image.clone());
@@ -608,13 +625,23 @@ unsafe fn walk_element(
     // returns its real AXPress button. Use that actual retained element only
     // after bounded virtual-child and complete host-attachment proofs. Never
     // manufacture actions/bounds on the wrapper or inspect web button grids.
-    if role == "AXButton" && !in_web_content && actions.is_empty()
+    if role == "AXButton"
+        && !in_web_content
+        && actions.is_empty()
         && limits.virtual_button_probes < 32
     {
         limits.virtual_button_probes += 1;
         if let Some(button) = super::attached_popover::copy_virtual_popover_button(element) {
-            walk_element(button, depth, parent_index, in_web_content,
-                         nodes, lines, counter, limits);
+            walk_element(
+                button,
+                depth,
+                parent_index,
+                in_web_content,
+                nodes,
+                lines,
+                counter,
+                limits,
+            );
             CFRelease(button as CFTypeRef);
             return;
         }
@@ -1117,8 +1144,10 @@ mod tests {
         }
         node.element_index = Some(5);
         node.selectable_menu_item = true;
-        assert_eq!(format_node_line(&node),
-            "- [5] AXMenuItem \"Open…\" [selection=parent_selected_children]");
+        assert_eq!(
+            format_node_line(&node),
+            "- [5] AXMenuItem \"Open…\" [selection=parent_selected_children]"
+        );
         assert!(node.actions.is_empty(), "selection does not invent AXPress");
     }
 }

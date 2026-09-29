@@ -91,14 +91,20 @@ pub struct Snapshot {
 /// shared order guard. No second snapshot, lease, poller or input actuator.
 pub(crate) struct NativeTabHandoff(Arc<Mutex<crate::background_order::BackgroundOrderGuard>>);
 impl NativeTabHandoff {
-    pub(crate) fn capture(&self, element: crate::ax::bindings::AXUIElementRef, pid: i32, source: u32)
-        -> Option<crate::ax::window_tabs::retained::Pending> {
+    pub(crate) fn capture(
+        &self,
+        element: crate::ax::bindings::AXUIElementRef,
+        pid: i32,
+        source: u32,
+    ) -> Option<crate::ax::window_tabs::retained::Pending> {
         let scope = self.0.lock().ok()?.native_tab_scope(pid, source)?;
         // Release the guard lock before any retained proof or AXPress.
         crate::ax::window_tabs::retained::Pending::capture(element, scope)
     }
     pub(crate) fn confirm(&self, proof: crate::ax::window_tabs::retained::Destination) {
-        if let Ok(mut guard) = self.0.lock() { guard.confirm_native_tab(proof); }
+        if let Ok(mut guard) = self.0.lock() {
+            guard.confirm_native_tab(proof);
+        }
     }
 }
 
@@ -295,12 +301,15 @@ impl WindowChangeDetector {
             _ => None,
         };
         let order_query = crate::background_order::OrderQueryTiming::begin(
-            matches!(suppression_scope, SuppressionScope::Target(_))
-                && lease.is_some());
+            matches!(suppression_scope, SuppressionScope::Target(_)) && lease.is_some(),
+        );
         let visible = windows::visible_windows_with_space_snapshot();
         let order_query = order_query.finish();
         let mut ordering_trace = None;
-        let ordering = match (suppression_scope, lease.as_ref().and_then(SuppressionLease::targeted_deadline)) {
+        let ordering = match (
+            suppression_scope,
+            lease.as_ref().and_then(SuppressionLease::targeted_deadline),
+        ) {
             (SuppressionScope::Target(pid), Some(deadline)) => {
                 // Input can create a document just as an explicit file-open
                 // can. Capture complete membership before dispatch so a new
@@ -308,13 +317,19 @@ impl WindowChangeDetector {
                 // Raw membership needs no Space queries or stack ordering;
                 // only the visible snapshot supplies relative order evidence.
                 let complete = windows::all_windows_including_accessory_layers_with_snapshot();
-                crate::background_order::BackgroundOrderGuard::capture_before_input(pid, target_start, &complete, &visible).map(|mut guard| {
+                crate::background_order::BackgroundOrderGuard::capture_before_input(
+                    pid,
+                    target_start,
+                    &complete,
+                    &visible,
+                )
+                .map(|mut guard| {
                     guard.limit_deadline(deadline);
                     guard.record_initial_query_timing(order_query);
                     ordering_trace = Some(guard.diagnostic_trace());
                     Arc::new(Mutex::new(guard))
                 })
-            },
+            }
             _ => None,
         };
         // An AX call may raise the host before returning. Cover that interval
@@ -323,10 +338,14 @@ impl WindowChangeDetector {
         if let (Some(lease), Some(ordering)) = (lease.as_mut(), ordering.as_ref()) {
             let ordering = Arc::clone(ordering);
             lease.start_polling(move |deadline, diagnostics| {
-                ordering.lock().map(|mut guard| guard.poll(deadline, diagnostics)).unwrap_or(false)
+                ordering
+                    .lock()
+                    .map(|mut guard| guard.poll(deadline, diagnostics))
+                    .unwrap_or(false)
             });
         }
-        let window_ids: HashSet<u32> = visible.windows
+        let window_ids: HashSet<u32> = visible
+            .windows
             .into_iter()
             .filter(|w| w.layer == 0)
             .map(|w| w.window_id)
@@ -410,9 +429,15 @@ impl Snapshot {
             let ordering = snapshot.ordering.take();
             if let Some(lease) = lease {
                 if let Some(ordering) = ordering {
-                    lease.defer_release_with_poll(protection_deadline, move |deadline, diagnostics| {
-                        ordering.lock().map(|mut guard| guard.poll(deadline, diagnostics)).unwrap_or(false)
-                    });
+                    lease.defer_release_with_poll(
+                        protection_deadline,
+                        move |deadline, diagnostics| {
+                            ordering
+                                .lock()
+                                .map(|mut guard| guard.poll(deadline, diagnostics))
+                                .unwrap_or(false)
+                        },
+                    );
                 } else {
                     lease.defer_release(protection_deadline);
                 }
@@ -446,7 +471,8 @@ impl Snapshot {
             // The action has completed before entering this loop. Inspect and
             // restore an already-raised background window immediately; wait
             // only between later samples for an asynchronous AppKit change.
-            let order_query = crate::background_order::OrderQueryTiming::begin(self.ordering.is_some());
+            let order_query =
+                crate::background_order::OrderQueryTiming::begin(self.ordering.is_some());
             let current: Vec<WindowInfo> = windows::visible_windows()
                 .into_iter()
                 .filter(|w| w.layer == 0)
@@ -561,10 +587,18 @@ mod tests {
     #[test]
     fn native_tab_handoff_cannot_outlive_or_invent_a_targeted_lease() {
         let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let guard = Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(checks)));
-        let snapshot = Snapshot { window_ids: HashSet::new(), front_pid: None, _lease: None,
-            hold_targeted_lease_until_deadline: false, suppression_scope: SuppressionScope::Target(-2),
-            ordering_trace: None, ordering: Some(Arc::clone(&guard)) };
+        let guard = Arc::new(Mutex::new(
+            crate::background_order::BackgroundOrderGuard::observing_checks(checks),
+        ));
+        let snapshot = Snapshot {
+            window_ids: HashSet::new(),
+            front_pid: None,
+            _lease: None,
+            hold_targeted_lease_until_deadline: false,
+            suppression_scope: SuppressionScope::Target(-2),
+            ordering_trace: None,
+            ordering: Some(Arc::clone(&guard)),
+        };
         assert!(snapshot.native_tab_handoff().is_none());
         // An unqualified guard stops before attempting any AX pointer read.
         let handoff = NativeTabHandoff(guard);
@@ -598,7 +632,10 @@ mod tests {
 
     #[tokio::test]
     async fn fast_input_checks_window_order_before_returning_its_report() {
-        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
         let checks = Arc::new(AtomicUsize::new(0));
         let snapshot = Snapshot {
@@ -608,18 +645,25 @@ mod tests {
             hold_targeted_lease_until_deadline: false,
             suppression_scope: SuppressionScope::Target(-2),
             ordering_trace: None,
-            ordering: Some(Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(
-                Arc::clone(&checks),
-            )))),
+            ordering: Some(Arc::new(Mutex::new(
+                crate::background_order::BackgroundOrderGuard::observing_checks(Arc::clone(
+                    &checks,
+                )),
+            ))),
         };
         snapshot.detect_input_async().await;
-        assert!(checks.load(Ordering::Relaxed) > 0,
-            "the response poll must retain ordering protection until its deferred handoff");
+        assert!(
+            checks.load(Ordering::Relaxed) > 0,
+            "the response poll must retain ordering protection until its deferred handoff"
+        );
     }
 
     #[test]
     fn completed_action_checks_order_before_its_first_wait() {
-        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
 
         let checks = Arc::new(AtomicUsize::new(0));
         let mut snapshot = Snapshot {
@@ -629,9 +673,11 @@ mod tests {
             hold_targeted_lease_until_deadline: false,
             suppression_scope: SuppressionScope::Target(-2),
             ordering_trace: None,
-            ordering: Some(Arc::new(Mutex::new(crate::background_order::BackgroundOrderGuard::observing_checks(
-                Arc::clone(&checks),
-            )))),
+            ordering: Some(Arc::new(Mutex::new(
+                crate::background_order::BackgroundOrderGuard::observing_checks(Arc::clone(
+                    &checks,
+                )),
+            ))),
         };
         // The action has already completed. Even a zero-length reporting
         // window must inspect its effects once before any polling delay. The

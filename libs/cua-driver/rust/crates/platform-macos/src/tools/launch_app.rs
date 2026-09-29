@@ -213,11 +213,14 @@ impl Tool for LaunchAppTool {
                     let proof = reuse::observe(pid, &bid);
                     crate::foreground_activity::check_request()?;
                     Ok::<_, anyhow::Error>(proof)
-                }).await;
+                })
+                .await;
                 match reused {
                     Ok(Ok(Some((app, windows)))) => {
-                        let windows: Vec<Value> = windows.iter()
-                            .map(super::list_windows::window_record_json).collect();
+                        let windows: Vec<Value> = windows
+                            .iter()
+                            .map(super::list_windows::window_record_json)
+                            .collect();
                         return ToolResult::text(format!(
                             "Reused existing {} (pid {}) without a launch request. Call get_window_state to inspect.",
                             app.name, app.pid,
@@ -250,7 +253,10 @@ impl Tool for LaunchAppTool {
         // the original foreground before reopening; a post-launch capture
         // would wrongly treat the already-raised window as the baseline.
         let reopen_ordering = capture_reopen_ordering(
-            &previously_running_pids, response_bundle_id.as_deref(), creates_new_instance, !urls.is_empty(),
+            &previously_running_pids,
+            response_bundle_id.as_deref(),
+            creates_new_instance,
+            !urls.is_empty(),
         );
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
@@ -347,7 +353,9 @@ impl Tool for LaunchAppTool {
                         // Never transfer a prior process's window evidence to
                         // a replacement instance returned by LaunchServices.
                         if expected_pid == *pid {
-                            targeted_lease.start_polling(move |deadline, diagnostics| ordering.poll(deadline, diagnostics));
+                            targeted_lease.start_polling(move |deadline, diagnostics| {
+                                ordering.poll(deadline, diagnostics)
+                            });
                         }
                     }
                     // Cold launches and file/argument delivery get a bounded
@@ -468,10 +476,12 @@ fn existing_reopen_pid(pids: &[i32], creates_new_instance: bool) -> Option<i32> 
 /// Cold launches remain outside this existing-process guard. An explicit file
 /// request can separately enroll newly created AX standard document windows,
 /// bound to this process lifetime and the unchanged original foreground.
-fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
-                          creates_new_instance: bool, opens_file: bool)
-    -> Option<(i32, crate::background_order::BackgroundOrderGuard)>
-{
+fn capture_reopen_ordering(
+    pids: &[i32],
+    expected_bundle_id: Option<&str>,
+    creates_new_instance: bool,
+    opens_file: bool,
+) -> Option<(i32, crate::background_order::BackgroundOrderGuard)> {
     use objc2_app_kit::NSRunningApplication;
     tracing::debug!(target: "cua_window_order", ?pids, creates_new_instance,
         bundle_identity_available=expected_bundle_id.is_some(),
@@ -482,7 +492,9 @@ fn capture_reopen_ordering(pids: &[i32], expected_bundle_id: Option<&str>,
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
         if app.isTerminated()
             || app.bundleIdentifier().map(|id| id.to_string()).as_deref() != Some(expected)
-        { return None; }
+        {
+            return None;
+        }
         app.isHidden()
     };
     let before = crate::windows::all_windows_with_space_snapshot();
@@ -509,7 +521,8 @@ fn unhide_requested_application(pid: i32, expected_bundle_id: Option<&str>) -> V
             return serde_json::json!({"requested": false, "reason": "process_unavailable"});
         };
         if app.isTerminated()
-            || app.bundleIdentifier().map(|bid| bid.to_string()).as_deref() != Some(expected_bundle_id)
+            || app.bundleIdentifier().map(|bid| bid.to_string()).as_deref()
+                != Some(expected_bundle_id)
         {
             return serde_json::json!({"requested": false, "reason": "process_identity_changed"});
         }
@@ -730,9 +743,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_remote_debugging_flag, existing_reopen_pid, is_cua_driver_bundle_id, local_file_target,
-        normalize_launch_url, preflight_file_urls, response_identity, structured_launch_failure,
-        LaunchAppTool,
+        contains_remote_debugging_flag, existing_reopen_pid, is_cua_driver_bundle_id,
+        local_file_target, normalize_launch_url, preflight_file_urls, response_identity,
+        structured_launch_failure, LaunchAppTool,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::json;

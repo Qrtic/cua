@@ -24,7 +24,8 @@ use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 
 use crate::ax::bindings::{
     ax_get_window_id, copy_bool_attr, copy_string_attr, try_copy_ax_windows, try_copy_element_attr,
-    AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    AXUIElementCreateApplication, AXUIElementGetPid, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
 use crate::windows::{WindowBounds, WindowInfo};
 
@@ -100,8 +101,12 @@ impl TransientRoute {
     fn revalidate_with(
         self,
         window_bound: impl FnOnce(WindowTarget) -> Option<WindowTarget>,
-        app_context: impl FnOnce(WindowTarget)
-            -> Result<(TransientHelperDetection, Option<AppContextHelperProof>), ()>,
+        app_context: impl FnOnce(
+            WindowTarget,
+        ) -> Result<
+            (TransientHelperDetection, Option<AppContextHelperProof>),
+            (),
+        >,
     ) -> bool {
         match self.app_context {
             None => window_bound(self.source) == Some(self.target),
@@ -221,9 +226,15 @@ impl TransientUiRegistry {
         source: WindowTarget,
         target: Option<WindowTarget>,
     ) {
-        self.record_route(session, source, target.map(|target| TransientRoute {
-            source, target, app_context: None,
-        }));
+        self.record_route(
+            session,
+            source,
+            target.map(|target| TransientRoute {
+                source,
+                target,
+                app_context: None,
+            }),
+        );
     }
 
     pub(crate) fn record_route(
@@ -259,10 +270,12 @@ impl TransientUiRegistry {
         session: &TransientSessionKey,
         source: WindowTarget,
     ) -> Option<WindowTarget> {
-        self.lock_routes().remove(&RouteKey {
-            session: session.clone(),
-            source,
-        }).map(|route| route.target)
+        self.lock_routes()
+            .remove(&RouteKey {
+                session: session.clone(),
+                source,
+            })
+            .map(|route| route.target)
     }
 
     pub(crate) fn clear_session(&self, session: &str) {
@@ -303,7 +316,9 @@ impl TransientUiRegistry {
         source: WindowTarget,
         resolve: impl FnOnce(WindowTarget) -> Option<WindowTarget>,
     ) -> RouteResolution {
-        self.resolve_route_with(session, source, |route| resolve(route.source) == Some(route.target))
+        self.resolve_route_with(session, source, |route| {
+            resolve(route.source) == Some(route.target)
+        })
     }
 
     fn resolve_route_with(
@@ -397,14 +412,19 @@ pub(crate) fn detect_same_pid_transient_in_front(
     // AppKit can omit an attached AXSheet from AXWindows and leave the document
     // as AXMainWindow. Geometry only gates this read; reciprocal AX attachment,
     // exact focus, ownership and visible-chain revalidation authorize the hop.
-    if windows.iter().any(|window| window.pid == source.pid
-        && window.window_id != source.window_id && window.is_on_screen
-        && window.on_current_space != Some(false))
-    {
+    if windows.iter().any(|window| {
+        window.pid == source.pid
+            && window.window_id != source.window_id
+            && window.is_on_screen
+            && window.on_current_space != Some(false)
+    }) {
         use crate::ax::attached_sheet::FocusedSheetContext;
         let sheet_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         match crate::ax::attached_sheet::focused_attached_sheet_context(
-            source.pid, source.window_id, has_geometry_candidate, sheet_deadline,
+            source.pid,
+            source.window_id,
+            has_geometry_candidate,
+            sheet_deadline,
         ) {
             Some(FocusedSheetContext::Successor(proof)) => {
                 return SamePidTransientDetection::AttachedSheet(proof);
@@ -414,10 +434,13 @@ pub(crate) fn detect_same_pid_transient_in_front(
             {
                 // The AX proof may take time. A new unrelated window or a
                 // changed physical surface must not inherit the old snapshot.
-                if !recheck_ancestor_geometry(&windows, source, &ancestors,
+                if !recheck_ancestor_geometry(
+                    &windows,
+                    source,
+                    &ancestors,
                     || std::time::Instant::now() < sheet_deadline,
-                    crate::windows::all_automation_windows_with_space_snapshot)
-                {
+                    crate::windows::all_automation_windows_with_space_snapshot,
+                ) {
                     return SamePidTransientDetection::Indeterminate;
                 }
                 tracing::debug!(target: "cua_observation_timing", pid=source.pid,
@@ -460,45 +483,78 @@ fn has_same_pid_transient_geometry_candidate(windows: &[WindowInfo], source: Win
 // Do not waive the generic guard for a proved sheet when another geometric
 // candidate remains. Only the exact retained chain's ancestors are excluded.
 fn geometry_candidates_are_proven_ancestors(
-    windows: &[WindowInfo], source: WindowTarget, ancestors: &[u32],
+    windows: &[WindowInfo],
+    source: WindowTarget,
+    ancestors: &[u32],
 ) -> bool {
     let Some(source_window) = eligible_same_pid_source(windows, source) else {
         return false;
     };
-    if ancestors.is_empty() || ancestors.contains(&source.window_id) { return false; }
+    if ancestors.is_empty() || ancestors.contains(&source.window_id) {
+        return false;
+    }
     let mut found = false;
-    for candidate in windows.iter()
+    for candidate in windows
+        .iter()
         .filter(|candidate| is_same_pid_transient_geometry_candidate(candidate, source_window))
     {
         found = true;
-        if !ancestors.contains(&candidate.window_id) { return false; }
+        if !ancestors.contains(&candidate.window_id) {
+            return false;
+        }
     }
     found
 }
 
 fn recheck_ancestor_geometry(
-    before: &[WindowInfo], source: WindowTarget, ancestors: &[u32],
+    before: &[WindowInfo],
+    source: WindowTarget,
+    ancestors: &[u32],
     mut within_budget: impl FnMut() -> bool,
     enumerate: impl FnOnce() -> crate::windows::WindowEnumeration,
 ) -> bool {
-    if !within_budget() { return false; }
+    if !within_budget() {
+        return false;
+    }
     let current = enumerate();
-    if !within_budget() || !current.succeeded { return false; }
+    if !within_budget() || !current.succeeded {
+        return false;
+    }
     for id in std::iter::once(&source.window_id).chain(ancestors.iter()) {
         let old: Vec<_> = before.iter().filter(|w| w.window_id == *id).collect();
-        let fresh: Vec<_> = current.windows.iter().filter(|w| w.window_id == *id).collect();
-        let ([old], [fresh]) = (old.as_slice(), fresh.as_slice()) else { return false; };
-        if old.pid != source.pid || fresh.pid != source.pid
-            || old.layer != fresh.layer || !fresh.is_on_screen || !old.is_on_screen
+        let fresh: Vec<_> = current
+            .windows
+            .iter()
+            .filter(|w| w.window_id == *id)
+            .collect();
+        let ([old], [fresh]) = (old.as_slice(), fresh.as_slice()) else {
+            return false;
+        };
+        if old.pid != source.pid
+            || fresh.pid != source.pid
+            || old.layer != fresh.layer
+            || !fresh.is_on_screen
+            || !old.is_on_screen
             || fresh.on_current_space != Some(true)
             || old.on_current_space != fresh.on_current_space
-            || old.current_space_id != fresh.current_space_id || old.space_ids != fresh.space_ids
-            || [old.bounds.x, old.bounds.y, old.bounds.width, old.bounds.height]
-                != [fresh.bounds.x, fresh.bounds.y, fresh.bounds.width, fresh.bounds.height]
-        { return false; }
+            || old.current_space_id != fresh.current_space_id
+            || old.space_ids != fresh.space_ids
+            || [
+                old.bounds.x,
+                old.bounds.y,
+                old.bounds.width,
+                old.bounds.height,
+            ] != [
+                fresh.bounds.x,
+                fresh.bounds.y,
+                fresh.bounds.width,
+                fresh.bounds.height,
+            ]
+        {
+            return false;
+        }
     }
-    geometry_candidates_are_proven_ancestors(&current.windows, source, ancestors)
-        && within_budget()
+    geometry_candidates_are_proven_ancestors(&current.windows, source, ancestors) && within_budget()
 }
 
 fn same_pid_ax_window_facts(pid: i32) -> Result<Vec<SamePidAxWindowFacts>, ()> {
@@ -692,8 +748,9 @@ pub(crate) fn detect_transient_for_observation(
     source: WindowTarget,
     app_context: bool,
 ) -> Result<(TransientHelperDetection, Option<AppContextHelperProof>), ()> {
-    observation_detection_with(app_context, detect_visible_transient_helper(source),
-        || detect_app_context_helper(source))
+    observation_detection_with(app_context, detect_visible_transient_helper(source), || {
+        detect_app_context_helper(source)
+    })
 }
 
 fn observation_detection_with(
@@ -701,8 +758,11 @@ fn observation_detection_with(
     old: TransientHelperDetection,
     recover: impl FnOnce() -> Result<(TransientHelperDetection, Option<AppContextHelperProof>), ()>,
 ) -> Result<(TransientHelperDetection, Option<AppContextHelperProof>), ()> {
-    if app_context && old == TransientHelperDetection::None { recover() }
-    else { Ok((old, None)) }
+    if app_context && old == TransientHelperDetection::None {
+        recover()
+    } else {
+        Ok((old, None))
+    }
 }
 
 fn app_context_candidate(
@@ -710,25 +770,54 @@ fn app_context_candidate(
     source: WindowTarget,
     trusted: impl FnMut(i32) -> bool,
 ) -> TransientHelperDetection {
-    let hosts: Vec<_> = windows.iter().filter(|w| w.pid == source.pid
-        && w.window_id == source.window_id && w.window_id != 0
-        && w.is_on_screen && w.layer == 0).collect();
-    if hosts.len() != 1 { return TransientHelperDetection::None; }
+    let hosts: Vec<_> = windows
+        .iter()
+        .filter(|w| {
+            w.pid == source.pid
+                && w.window_id == source.window_id
+                && w.window_id != 0
+                && w.is_on_screen
+                && w.layer == 0
+        })
+        .collect();
+    if hosts.len() != 1 {
+        return TransientHelperDetection::None;
+    }
     visible_app_owned_helper(windows, source.pid, trusted)
 }
 
 // Refusal evidence only until the complete AX proof succeeds. This predicate
 // never creates a route and does not require a particular editor to be visible.
 fn visible_app_owned_helper(
-    windows: &[WindowInfo], host_pid: i32, mut trusted: impl FnMut(i32) -> bool,
+    windows: &[WindowInfo],
+    host_pid: i32,
+    mut trusted: impl FnMut(i32) -> bool,
 ) -> TransientHelperDetection {
-    let candidates: Vec<_> = windows.iter().filter(|w| w.pid > 0 && w.pid != host_pid
-        && w.window_id != 0 && w.is_on_screen && w.layer == MODAL_PANEL_WINDOW_LAYER
-        && trusted(w.pid)).collect();
+    let candidates: Vec<_> = windows
+        .iter()
+        .filter(|w| {
+            w.pid > 0
+                && w.pid != host_pid
+                && w.window_id != 0
+                && w.is_on_screen
+                && w.layer == MODAL_PANEL_WINDOW_LAYER
+                && trusted(w.pid)
+        })
+        .collect();
     match candidates.as_slice() {
         [] => TransientHelperDetection::None,
-        [target] if windows.iter().filter(|w| w.pid == target.pid && w.is_on_screen).count() == 1 =>
-            TransientHelperDetection::Unique(WindowTarget { pid: target.pid, window_id: target.window_id }),
+        [target]
+            if windows
+                .iter()
+                .filter(|w| w.pid == target.pid && w.is_on_screen)
+                .count()
+                == 1 =>
+        {
+            TransientHelperDetection::Unique(WindowTarget {
+                pid: target.pid,
+                window_id: target.window_id,
+            })
+        }
         _ => TransientHelperDetection::Ambiguous,
     }
 }
@@ -737,7 +826,11 @@ fn visible_app_owned_helper(
 struct ContextAxNodes(Vec<AXUIElementRef>);
 impl Drop for ContextAxNodes {
     fn drop(&mut self) {
-        for node in &self.0 { unsafe { CFRelease(*node as CFTypeRef); } }
+        for node in &self.0 {
+            unsafe {
+                CFRelease(*node as CFTypeRef);
+            }
+        }
     }
 }
 
@@ -747,34 +840,49 @@ unsafe fn context_ax_read<T>(
     read: impl FnOnce() -> T,
 ) -> Result<T, ()> {
     let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
-    if node.is_null() || remaining.is_zero()
+    if node.is_null()
+        || remaining.is_zero()
         || AXUIElementSetMessagingTimeout(node, remaining.as_secs_f32().min(0.2)) != 0
-    { return Err(()); }
+    {
+        return Err(());
+    }
     // The caller first takes ownership of any returned CF references, then
     // checks the shared deadline. Never discard a late raw retained result.
     Ok(read())
 }
 
 fn app_context_ax_identity(
-    target: WindowTarget, owner: Option<i32>, physical: Option<u32>,
-    role: Option<&str>, subrole: Option<&str>,
+    target: WindowTarget,
+    owner: Option<i32>,
+    physical: Option<u32>,
+    role: Option<&str>,
+    subrole: Option<&str>,
 ) -> bool {
-    owner == Some(target.pid) && physical == Some(target.window_id) && target.window_id != 0
-        && role == Some("AXWindow") && subrole == Some("AXStandardWindow")
+    owner == Some(target.pid)
+        && physical == Some(target.window_id)
+        && target.window_id != 0
+        && role == Some("AXWindow")
+        && subrole == Some("AXStandardWindow")
 }
 
 /// Complete AXWindows membership plus the app's own focused/main references.
 /// The helper may report AXModal=false; this is not a modal/parent proof.
 unsafe fn context_ax_window(
-    target: WindowTarget, helper: bool, deadline: Instant,
+    target: WindowTarget,
+    helper: bool,
+    deadline: Instant,
 ) -> Result<ContextAxNodes, ()> {
     let app = AXUIElementCreateApplication(target.pid);
-    if app.is_null() { return Err(()); }
+    if app.is_null() {
+        return Err(());
+    }
     let mut owned = ContextAxNodes(vec![app]);
     let snapshot = context_ax_read(app, deadline, || try_copy_ax_windows(app))?.map_err(|_| ())?;
     let count = snapshot.windows.len();
     owned.0.extend(snapshot.windows);
-    if !snapshot.complete || count == 0 || count > 16 || (helper && count != 1) { return Err(()); }
+    if !snapshot.complete || count == 0 || count > 16 || (helper && count != 1) {
+        return Err(());
+    }
     let mut selected = None;
     for &window in &owned.0[1..] {
         let owner = context_ax_read(window, deadline, || {
@@ -783,12 +891,23 @@ unsafe fn context_ax_window(
         })?;
         let physical = context_ax_read(window, deadline, || ax_get_window_id(window))?;
         // Unknown members must not conceal another candidate or a foreign window.
-        if owner != Some(target.pid) || physical.is_none() { return Err(()); }
+        if owner != Some(target.pid) || physical.is_none() {
+            return Err(());
+        }
         if physical == Some(target.window_id) {
-            if selected.replace(window).is_some() { return Err(()); }
+            if selected.replace(window).is_some() {
+                return Err(());
+            }
             let role = context_ax_read(window, deadline, || copy_string_attr(window, "AXRole"))?;
-            let subrole = context_ax_read(window, deadline, || copy_string_attr(window, "AXSubrole"))?;
-            if !app_context_ax_identity(target, owner, physical, role.as_deref(), subrole.as_deref()) {
+            let subrole =
+                context_ax_read(window, deadline, || copy_string_attr(window, "AXSubrole"))?;
+            if !app_context_ax_identity(
+                target,
+                owner,
+                physical,
+                role.as_deref(),
+                subrole.as_deref(),
+            ) {
                 return Err(());
             }
         }
@@ -796,11 +915,16 @@ unsafe fn context_ax_window(
     let selected = selected.ok_or(())?;
     for attribute in ["AXFocusedWindow", "AXMainWindow"] {
         let reference = context_ax_read(app, deadline, || try_copy_element_attr(app, attribute))?
-            .map_err(|_| ())?.ok_or(())?;
+            .map_err(|_| ())?
+            .ok_or(())?;
         owned.0.push(reference);
-        if CFEqual(reference as CFTypeRef, selected as CFTypeRef) == 0 { return Err(()); }
+        if CFEqual(reference as CFTypeRef, selected as CFTypeRef) == 0 {
+            return Err(());
+        }
     }
-    if Instant::now() >= deadline { return Err(()); }
+    if Instant::now() >= deadline {
+        return Err(());
+    }
     CFRetain(selected as CFTypeRef);
     Ok(ContextAxNodes(vec![selected]))
 }
@@ -813,8 +937,11 @@ fn context_births(source: WindowTarget, target: WindowTarget) -> Option<AppConte
 }
 
 fn accept_context_recheck(
-    expected: TransientHelperDetection, births: AppContextHelperProof,
-    current: TransientHelperDetection, current_births: Option<AppContextHelperProof>, in_budget: bool,
+    expected: TransientHelperDetection,
+    births: AppContextHelperProof,
+    current: TransientHelperDetection,
+    current_births: Option<AppContextHelperProof>,
+    in_budget: bool,
 ) -> bool {
     in_budget && current == expected && current_births == Some(births)
 }
@@ -827,12 +954,22 @@ fn detect_app_context_helper(
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     let before = crate::windows::all_windows_including_accessory_layers_with_snapshot();
-    if !before.succeeded || Instant::now() >= deadline { return Err(()); }
-    let detection = visible_app_owned_helper(&before.windows, source.pid,
-        |pid| trusted_shortcuts_pair(source.pid, pid));
-    if Instant::now() >= deadline { return Err(()); }
-    let TransientHelperDetection::Unique(target) = detection else { return Ok((detection, None)); };
-    if app_context_candidate(&before.windows, source, |pid| trusted_shortcuts_pair(source.pid, pid)) != detection {
+    if !before.succeeded || Instant::now() >= deadline {
+        return Err(());
+    }
+    let detection = visible_app_owned_helper(&before.windows, source.pid, |pid| {
+        trusted_shortcuts_pair(source.pid, pid)
+    });
+    if Instant::now() >= deadline {
+        return Err(());
+    }
+    let TransientHelperDetection::Unique(target) = detection else {
+        return Ok((detection, None));
+    };
+    if app_context_candidate(&before.windows, source, |pid| {
+        trusted_shortcuts_pair(source.pid, pid)
+    }) != detection
+    {
         return Err(());
     }
     let births = context_births(source, target).ok_or(())?;
@@ -842,23 +979,42 @@ fn detect_app_context_helper(
         let host_after = context_ax_window(source, false, deadline)?;
         let helper_after = context_ax_window(target, true, deadline)?;
         CFEqual(host_before.0[0] as CFTypeRef, host_after.0[0] as CFTypeRef) != 0
-            && CFEqual(helper_before.0[0] as CFTypeRef, helper_after.0[0] as CFTypeRef) != 0
+            && CFEqual(
+                helper_before.0[0] as CFTypeRef,
+                helper_after.0[0] as CFTypeRef,
+            ) != 0
     };
-    if !same_ax || Instant::now() >= deadline { return Err(()); }
+    if !same_ax || Instant::now() >= deadline {
+        return Err(());
+    }
     let after = crate::windows::all_windows_including_accessory_layers_with_snapshot();
-    if !after.succeeded || !accept_context_recheck(detection, births,
-        app_context_candidate(&after.windows, source, |pid| trusted_shortcuts_pair(source.pid, pid)),
-        context_births(source, target), Instant::now() < deadline)
-    { return Err(()); }
+    if !after.succeeded
+        || !accept_context_recheck(
+            detection,
+            births,
+            app_context_candidate(&after.windows, source, |pid| {
+                trusted_shortcuts_pair(source.pid, pid)
+            }),
+            context_births(source, target),
+            Instant::now() < deadline,
+        )
+    {
+        return Err(());
+    }
     Ok((detection, Some(births)))
 }
 
 /// Refuse host fallback even after a stale app-context route was removed.
 /// This broader presence check is never used to select an observation target.
-pub(crate) fn detect_transient_helper_for_input_guard(source: WindowTarget) -> TransientHelperDetection {
+pub(crate) fn detect_transient_helper_for_input_guard(
+    source: WindowTarget,
+) -> TransientHelperDetection {
     let old = detect_visible_transient_helper(source);
-    if old.helper_is_visible() { old }
-    else { detect_any_visible_transient_helper_for_host(source.pid) }
+    if old.helper_is_visible() {
+        old
+    } else {
+        detect_any_visible_transient_helper_for_host(source.pid)
+    }
 }
 
 /// Detect any visible trusted transient associated with a host process when a
@@ -872,13 +1028,19 @@ pub(crate) fn detect_any_visible_transient_helper_for_host(
         return TransientHelperDetection::None;
     }
     let snapshot = crate::windows::all_windows_including_accessory_layers_with_snapshot();
-    if !snapshot.succeeded { return TransientHelperDetection::Ambiguous; }
-    let old = detect_any_visible_transient_helper_for_host_in(&snapshot.windows, host_pid,
-        |pid| trusted_shortcuts_pair(host_pid, pid));
-    if old.helper_is_visible() { old }
-    else { visible_app_owned_helper(&snapshot.windows, host_pid,
-        |pid| trusted_shortcuts_pair(host_pid, pid)) }
-
+    if !snapshot.succeeded {
+        return TransientHelperDetection::Ambiguous;
+    }
+    let old = detect_any_visible_transient_helper_for_host_in(&snapshot.windows, host_pid, |pid| {
+        trusted_shortcuts_pair(host_pid, pid)
+    });
+    if old.helper_is_visible() {
+        old
+    } else {
+        visible_app_owned_helper(&snapshot.windows, host_pid, |pid| {
+            trusted_shortcuts_pair(host_pid, pid)
+        })
+    }
 }
 
 /// A narrow WindowServer proof for a helper whose AX window cannot be mapped
@@ -1130,40 +1292,89 @@ mod tests {
 
     #[test]
     fn nested_leaf_geometry_does_not_make_its_proven_save_parent_a_successor() {
-        let source = WindowTarget { pid: 42, window_id: 950 };
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 950,
+        };
         let windows = vec![
             current_window(42, 950, "", 0, rect(634.0, 451.0, 460.0, 183.0)),
             current_window(42, 900, "Save", 1, rect(679.0, 452.0, 370.0, 182.0)),
             current_window(42, 700, "Document", 2, rect(0.0, 33.0, 1728.0, 1020.0)),
         ];
         assert!(has_same_pid_transient_geometry_candidate(&windows, source));
-        assert_eq!(detect_same_pid_transient_in_front_in(
-            &windows, Some(&[same_pid_ax(700, 0, false, true, false)]), source, false),
+        assert_eq!(
+            detect_same_pid_transient_in_front_in(
+                &windows,
+                Some(&[same_pid_ax(700, 0, false, true, false)]),
+                source,
+                false
+            ),
             SamePidTransientDetection::Indeterminate,
-            "AXWindows can omit both sheets despite positive native attachment proof");
-        assert!(geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
-        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[]));
-        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[700]));
-        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[950, 900, 700]));
+            "AXWindows can omit both sheets despite positive native attachment proof"
+        );
+        assert!(geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[900, 700]
+        ));
+        assert!(!geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[]
+        ));
+        assert!(!geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[700]
+        ));
+        assert!(!geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[950, 900, 700]
+        ));
     }
 
     #[test]
     fn a_proven_sheet_ancestor_never_hides_an_unrelated_geometry_candidate() {
-        let source = WindowTarget { pid: 42, window_id: 950 };
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 950,
+        };
         let mut windows = vec![
             current_window(42, 950, "", 0, rect(0.0, 0.0, 460.0, 183.0)),
             current_window(42, 900, "Save", 1, rect(45.0, 1.0, 370.0, 182.0)),
         ];
-        assert!(geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
-        windows.push(current_window(42, 901, "Other dialog", 2, rect(50.0, 10.0, 100.0, 80.0)));
-        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
+        assert!(geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[900, 700]
+        ));
+        windows.push(current_window(
+            42,
+            901,
+            "Other dialog",
+            2,
+            rect(50.0, 10.0, 100.0, 80.0),
+        ));
+        assert!(!geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[900, 700]
+        ));
         windows.remove(1);
-        assert!(!geometry_candidates_are_proven_ancestors(&windows, source, &[900, 700]));
+        assert!(!geometry_candidates_are_proven_ancestors(
+            &windows,
+            source,
+            &[900, 700]
+        ));
     }
 
     #[test]
     fn ancestor_geometry_exception_retains_source_visibility_space_and_pid_gates() {
-        let source = WindowTarget { pid: 42, window_id: 950 };
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 950,
+        };
         let windows = vec![
             current_window(42, 950, "", 0, rect(0.0, 0.0, 460.0, 183.0)),
             current_window(42, 900, "Save", 1, rect(45.0, 1.0, 370.0, 182.0)),
@@ -1176,55 +1387,106 @@ mod tests {
                 2 => changed[0].pid = 99,
                 _ => changed[1].current_space_id = Some(2),
             }
-            assert!(!geometry_candidates_are_proven_ancestors(&changed, source, &[900, 700]));
+            assert!(!geometry_candidates_are_proven_ancestors(
+                &changed,
+                source,
+                &[900, 700]
+            ));
         }
     }
 
     #[test]
     fn ancestor_exception_rechecks_new_windows_and_changed_physical_identity() {
-        let source = WindowTarget { pid: 42, window_id: 950 };
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 950,
+        };
         let before = vec![
             current_window(42, 950, "", 0, rect(0.0, 0.0, 460.0, 183.0)),
             current_window(42, 900, "Save", 1, rect(45.0, 1.0, 370.0, 182.0)),
             current_window(42, 700, "Document", 2, rect(0.0, 0.0, 1728.0, 1020.0)),
         ];
         let snapshot = |windows| crate::windows::WindowEnumeration {
-            windows, current_space_id: Some(1), succeeded: true,
+            windows,
+            current_space_id: Some(1),
+            succeeded: true,
         };
-        assert!(recheck_ancestor_geometry(&before, source, &[900, 700], || true,
-            || snapshot(before.clone())));
+        assert!(recheck_ancestor_geometry(
+            &before,
+            source,
+            &[900, 700],
+            || true,
+            || snapshot(before.clone())
+        ));
         for kind in 0..6 {
             let mut changed = before.clone();
             match kind {
-                0 => changed.push(current_window(42, 901, "Other dialog", 0,
-                    rect(50.0, 10.0, 100.0, 80.0))),
+                0 => changed.push(current_window(
+                    42,
+                    901,
+                    "Other dialog",
+                    0,
+                    rect(50.0, 10.0, 100.0, 80.0),
+                )),
                 1 => changed[0].bounds.x += 1.0,
                 2 => changed[1].pid = 99,
                 3 => changed[2].current_space_id = Some(2),
                 4 => changed[2].is_on_screen = false,
-                _ => { changed.remove(1); }
+                _ => {
+                    changed.remove(1);
+                }
             }
-            assert!(!recheck_ancestor_geometry(&before, source, &[900, 700], || true,
-                || snapshot(changed)));
+            assert!(!recheck_ancestor_geometry(
+                &before,
+                source,
+                &[900, 700],
+                || true,
+                || snapshot(changed)
+            ));
         }
     }
 
     #[test]
     fn ancestor_exception_uses_original_budget_and_refuses_failed_enumeration() {
-        let source = WindowTarget { pid: 42, window_id: 950 };
-        assert!(!recheck_ancestor_geometry(&[], source, &[900], || false,
-            || panic!("expired proof must not start another WindowServer read")));
+        let source = WindowTarget {
+            pid: 42,
+            window_id: 950,
+        };
+        assert!(!recheck_ancestor_geometry(
+            &[],
+            source,
+            &[900],
+            || false,
+            || panic!("expired proof must not start another WindowServer read")
+        ));
         let polls = std::cell::Cell::new(0);
-        assert!(!recheck_ancestor_geometry(&[], source, &[900],
-            || { let n = polls.get(); polls.set(n + 1); n == 0 },
+        assert!(!recheck_ancestor_geometry(
+            &[],
+            source,
+            &[900],
+            || {
+                let n = polls.get();
+                polls.set(n + 1);
+                n == 0
+            },
             || crate::windows::WindowEnumeration {
-                windows: vec![], current_space_id: Some(1), succeeded: true,
-            }));
+                windows: vec![],
+                current_space_id: Some(1),
+                succeeded: true,
+            }
+        ));
         assert_eq!(polls.get(), 2, "the same budget is checked after the read");
-        assert!(!recheck_ancestor_geometry(&[], source, &[900], || true,
+        assert!(!recheck_ancestor_geometry(
+            &[],
+            source,
+            &[900],
+            || true,
             || crate::windows::WindowEnumeration {
-                windows: vec![], current_space_id: Some(1), succeeded: false,
-            }));
+                windows: vec![],
+                current_space_id: Some(1),
+                succeeded: false,
+            }
+        ));
     }
 
     #[test]
@@ -1297,7 +1559,8 @@ mod tests {
         );
     }
 
-    fn background_calc_sort_context() -> (WindowTarget, Vec<WindowInfo>, Vec<SamePidAxWindowFacts>) {
+    fn background_calc_sort_context() -> (WindowTarget, Vec<WindowInfo>, Vec<SamePidAxWindowFacts>)
+    {
         let source = WindowTarget {
             pid: 32147,
             window_id: 103577,
@@ -1853,7 +2116,11 @@ mod tests {
 
         assert_eq!(
             registry.resolve_with(&session, source, |_| None),
-            RouteResolution::Stale(TransientRoute { source, target, app_context: None })
+            RouteResolution::Stale(TransientRoute {
+                source,
+                target,
+                app_context: None
+            })
         );
         assert_eq!(
             registry.resolve_with(&session, source, |_| Some(target)),
@@ -1878,7 +2145,11 @@ mod tests {
 
         assert_eq!(
             registry.resolve_with(&session, source, |_| Some(target)),
-            RouteResolution::Live(TransientRoute { source, target, app_context: None })
+            RouteResolution::Live(TransientRoute {
+                source,
+                target,
+                app_context: None
+            })
         );
     }
 
@@ -1899,7 +2170,11 @@ mod tests {
 
         assert_eq!(
             registry.resolve_with(&session_a, source, |_| Some(target)),
-            RouteResolution::Live(TransientRoute { source, target, app_context: None })
+            RouteResolution::Live(TransientRoute {
+                source,
+                target,
+                app_context: None
+            })
         );
         assert_eq!(
             registry.resolve_with(&session_b, source, |_| Some(target)),
@@ -2055,7 +2330,11 @@ mod tests {
         registry.record(&session, source, Some(target));
         assert_eq!(
             registry.resolve_with(&session, source, |_| Some(target)),
-            RouteResolution::Live(TransientRoute { source, target, app_context: None }),
+            RouteResolution::Live(TransientRoute {
+                source,
+                target,
+                app_context: None
+            }),
             "the registry should accept fresh observations after recovery"
         );
     }
@@ -2096,37 +2375,83 @@ mod tests {
     }
     fn app_context_fixture() -> TransientRoute {
         TransientRoute {
-            source: WindowTarget { pid: 10, window_id: 100 },
-            target: WindowTarget { pid: 20, window_id: 200 },
-            app_context: Some(AppContextHelperProof { host_birth: (1, 2), helper_birth: (3, 4) }),
+            source: WindowTarget {
+                pid: 10,
+                window_id: 100,
+            },
+            target: WindowTarget {
+                pid: 20,
+                window_id: 200,
+            },
+            app_context: Some(AppContextHelperProof {
+                host_birth: (1, 2),
+                helper_birth: (3, 4),
+            }),
         }
     }
 
     #[test]
     fn app_context_recovery_never_runs_for_exact_or_old_positive_or_ambiguous() {
         let route = app_context_fixture();
-        for (app, old) in [(false, TransientHelperDetection::None),
+        for (app, old) in [
+            (false, TransientHelperDetection::None),
             (false, TransientHelperDetection::Unique(route.target)),
             (true, TransientHelperDetection::Unique(route.target)),
-            (true, TransientHelperDetection::Ambiguous)] {
-            assert_eq!(observation_detection_with(app, old, || panic!("must not recover")), Ok((old, None)));
+            (true, TransientHelperDetection::Ambiguous),
+        ] {
+            assert_eq!(
+                observation_detection_with(app, old, || panic!("must not recover")),
+                Ok((old, None))
+            );
         }
-        assert_eq!(observation_detection_with(true, TransientHelperDetection::None,
-            || Ok((TransientHelperDetection::Unique(route.target), route.app_context))),
-            Ok((TransientHelperDetection::Unique(route.target), route.app_context)));
-        assert!(observation_detection_with(true, TransientHelperDetection::None, || Err(())).is_err());
+        assert_eq!(
+            observation_detection_with(true, TransientHelperDetection::None, || Ok((
+                TransientHelperDetection::Unique(route.target),
+                route.app_context
+            ))),
+            Ok((
+                TransientHelperDetection::Unique(route.target),
+                route.app_context
+            ))
+        );
+        assert!(
+            observation_detection_with(true, TransientHelperDetection::None, || Err(())).is_err()
+        );
     }
 
     #[test]
     fn app_owned_helper_does_not_require_editor_title_or_containment() {
         let r = app_context_fixture();
-        let host = window(10, 100, "Shortcuts", "Editor A", 0, rect(0.0, 0.0, 100.0, 100.0));
-        let helper = window(20, 200, "Service", "Unrelated title", 8, rect(500.0, 500.0, 200.0, 200.0));
+        let host = window(
+            10,
+            100,
+            "Shortcuts",
+            "Editor A",
+            0,
+            rect(0.0, 0.0, 100.0, 100.0),
+        );
+        let helper = window(
+            20,
+            200,
+            "Service",
+            "Unrelated title",
+            8,
+            rect(500.0, 500.0, 200.0, 200.0),
+        );
         let windows = [host, helper];
-        assert_eq!(detect_visible_transient_helper_in(&windows, r.source, |_| true), TransientHelperDetection::None);
-        assert_eq!(app_context_candidate(&windows, r.source, |pid| pid == 20), TransientHelperDetection::Unique(r.target));
-        assert_eq!(visible_app_owned_helper(&windows[1..], r.source.pid, |_| true), TransientHelperDetection::Unique(r.target),
-            "windowless refusal must not depend on an editor being visible");
+        assert_eq!(
+            detect_visible_transient_helper_in(&windows, r.source, |_| true),
+            TransientHelperDetection::None
+        );
+        assert_eq!(
+            app_context_candidate(&windows, r.source, |pid| pid == 20),
+            TransientHelperDetection::Unique(r.target)
+        );
+        assert_eq!(
+            visible_app_owned_helper(&windows[1..], r.source.pid, |_| true),
+            TransientHelperDetection::Unique(r.target),
+            "windowless refusal must not depend on an editor being visible"
+        );
     }
 
     #[test]
@@ -2134,53 +2459,143 @@ mod tests {
         let r = app_context_fixture();
         let host = window(10, 100, "Host", "Editor", 0, rect(0.0, 0.0, 100.0, 100.0));
         let helper = window(20, 200, "Service", "Panel", 8, rect(0.0, 0.0, 100.0, 100.0));
-        assert_eq!(app_context_candidate(&[host.clone(), helper.clone()], r.source, |_| false), TransientHelperDetection::None);
+        assert_eq!(
+            app_context_candidate(&[host.clone(), helper.clone()], r.source, |_| false),
+            TransientHelperDetection::None
+        );
         for pid in [20, 30] {
-            let mut other = helper.clone(); other.pid = pid; other.window_id = 201;
-            assert_eq!(app_context_candidate(&[host.clone(), helper.clone(), other], r.source, |_| true), TransientHelperDetection::Ambiguous);
+            let mut other = helper.clone();
+            other.pid = pid;
+            other.window_id = 201;
+            assert_eq!(
+                app_context_candidate(&[host.clone(), helper.clone(), other], r.source, |_| true),
+                TransientHelperDetection::Ambiguous
+            );
         }
-        let mut hidden = helper.clone(); hidden.is_on_screen = false;
-        assert_eq!(app_context_candidate(&[host.clone(), hidden], r.source, |_| true), TransientHelperDetection::None);
-        let mut bad_host = host.clone(); bad_host.pid = 11;
-        assert_eq!(app_context_candidate(&[bad_host, helper.clone()], r.source, |_| true), TransientHelperDetection::None);
-        for (bundle, path) in [("foreign.service", SHORTCUTS_HELPER_SYSTEM_PATH),
-            (SHORTCUTS_HELPER_BUNDLE_ID, "/tmp/ShortcutsViewService")] {
-            assert_eq!(app_context_candidate(&[host.clone(), helper.clone()], r.source, |_| trusted_shortcuts_identity(
-                Some(SHORTCUTS_HOST_BUNDLE_ID), Some(bundle), true, Some(path))), TransientHelperDetection::None);
+        let mut hidden = helper.clone();
+        hidden.is_on_screen = false;
+        assert_eq!(
+            app_context_candidate(&[host.clone(), hidden], r.source, |_| true),
+            TransientHelperDetection::None
+        );
+        let mut bad_host = host.clone();
+        bad_host.pid = 11;
+        assert_eq!(
+            app_context_candidate(&[bad_host, helper.clone()], r.source, |_| true),
+            TransientHelperDetection::None
+        );
+        for (bundle, path) in [
+            ("foreign.service", SHORTCUTS_HELPER_SYSTEM_PATH),
+            (SHORTCUTS_HELPER_BUNDLE_ID, "/tmp/ShortcutsViewService"),
+        ] {
+            assert_eq!(
+                app_context_candidate(&[host.clone(), helper.clone()], r.source, |_| {
+                    trusted_shortcuts_identity(
+                        Some(SHORTCUTS_HOST_BUNDLE_ID),
+                        Some(bundle),
+                        true,
+                        Some(path),
+                    )
+                }),
+                TransientHelperDetection::None
+            );
         }
     }
 
     #[test]
     fn app_context_ax_identity_requires_exact_owner_physical_role_and_subrole() {
         let r = app_context_fixture();
-        assert!(app_context_ax_identity(r.target, Some(20), Some(200), Some("AXWindow"), Some("AXStandardWindow")));
+        assert!(app_context_ax_identity(
+            r.target,
+            Some(20),
+            Some(200),
+            Some("AXWindow"),
+            Some("AXStandardWindow")
+        ));
         for (owner, id, role, subrole) in [
             (None, Some(200), Some("AXWindow"), Some("AXStandardWindow")),
-            (Some(99), Some(200), Some("AXWindow"), Some("AXStandardWindow")),
+            (
+                Some(99),
+                Some(200),
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+            ),
             (Some(20), None, Some("AXWindow"), Some("AXStandardWindow")),
-            (Some(20), Some(0), Some("AXWindow"), Some("AXStandardWindow")),
-            (Some(20), Some(201), Some("AXWindow"), Some("AXStandardWindow")),
+            (
+                Some(20),
+                Some(0),
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+            ),
+            (
+                Some(20),
+                Some(201),
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+            ),
             (Some(20), Some(200), None, Some("AXStandardWindow")),
-            (Some(20), Some(200), Some("AXUnknown"), Some("AXStandardWindow")),
+            (
+                Some(20),
+                Some(200),
+                Some("AXUnknown"),
+                Some("AXStandardWindow"),
+            ),
             (Some(20), Some(200), Some("AXWindow"), None),
-        ] { assert!(!app_context_ax_identity(r.target, owner, id, role, subrole)); }
+        ] {
+            assert!(!app_context_ax_identity(r.target, owner, id, role, subrole));
+        }
     }
 
     #[test]
     fn app_context_recheck_rejects_disappearance_new_identity_and_expiry() {
-        let r = app_context_fixture(); let birth = r.app_context.unwrap();
+        let r = app_context_fixture();
+        let birth = r.app_context.unwrap();
         let before = TransientHelperDetection::Unique(r.target);
-        assert!(accept_context_recheck(before, birth, before, Some(birth), true));
-        for after in [TransientHelperDetection::None, TransientHelperDetection::Ambiguous,
-            TransientHelperDetection::Unique(WindowTarget { pid: 20, window_id: 201 })] {
-            assert!(!accept_context_recheck(before, birth, after, Some(birth), true));
+        assert!(accept_context_recheck(
+            before,
+            birth,
+            before,
+            Some(birth),
+            true
+        ));
+        for after in [
+            TransientHelperDetection::None,
+            TransientHelperDetection::Ambiguous,
+            TransientHelperDetection::Unique(WindowTarget {
+                pid: 20,
+                window_id: 201,
+            }),
+        ] {
+            assert!(!accept_context_recheck(
+                before,
+                birth,
+                after,
+                Some(birth),
+                true
+            ));
         }
-        for changed in [None,
-            Some(AppContextHelperProof { host_birth: (1, 3), ..birth }),
-            Some(AppContextHelperProof { helper_birth: (3, 5), ..birth })] {
-            assert!(!accept_context_recheck(before, birth, before, changed, true));
+        for changed in [
+            None,
+            Some(AppContextHelperProof {
+                host_birth: (1, 3),
+                ..birth
+            }),
+            Some(AppContextHelperProof {
+                helper_birth: (3, 5),
+                ..birth
+            }),
+        ] {
+            assert!(!accept_context_recheck(
+                before, birth, before, changed, true
+            ));
         }
-        assert!(!accept_context_recheck(before, birth, before, Some(birth), false));
+        assert!(!accept_context_recheck(
+            before,
+            birth,
+            before,
+            Some(birth),
+            false
+        ));
     }
 
     #[test]
@@ -2188,28 +2603,51 @@ mod tests {
         let r = app_context_fixture();
         let live = (TransientHelperDetection::Unique(r.target), r.app_context);
         assert!(r.revalidate_with(|_| panic!("wrong scope"), |_| Ok(live)));
-        for result in [Err(()), Ok((TransientHelperDetection::None, None)),
-            Ok((TransientHelperDetection::Unique(r.target), None))] {
+        for result in [
+            Err(()),
+            Ok((TransientHelperDetection::None, None)),
+            Ok((TransientHelperDetection::Unique(r.target), None)),
+        ] {
             assert!(!r.revalidate_with(|_| panic!("must not use title fallback"), |_| result));
         }
-        let old = TransientRoute { app_context: None, ..r };
+        let old = TransientRoute {
+            app_context: None,
+            ..r
+        };
         assert!(old.revalidate_with(|_| Some(r.target), |_| panic!("old route must stay old")));
     }
 
     #[test]
     fn same_numbers_with_new_context_proof_invalidate_older_registry_lookup() {
-        let registry = TransientUiRegistry::new(); let s = session("context-race");
+        let registry = TransientUiRegistry::new();
+        let s = session("context-race");
         let old = app_context_fixture();
-        let new = TransientRoute { app_context: Some(AppContextHelperProof {
-            helper_birth: (4, 5), ..old.app_context.unwrap()
-        }), ..old };
+        let new = TransientRoute {
+            app_context: Some(AppContextHelperProof {
+                helper_birth: (4, 5),
+                ..old.app_context.unwrap()
+            }),
+            ..old
+        };
         registry.record_route(&s, old.source, Some(old));
-        assert_eq!(registry.resolve_route_with(&s, old.source, |_| {
-            registry.record_route(&s, old.source, Some(new)); true
-        }), RouteResolution::Stale(old));
-        assert_eq!(registry.resolve_route_with(&s, new.source, |r| r == new), RouteResolution::Live(new));
-        assert_eq!(registry.resolve_route_with(&s, new.source, |_| false), RouteResolution::Stale(new));
-        assert_eq!(registry.resolve_route_with(&s, new.source, |_| panic!("removed")), RouteResolution::None);
+        assert_eq!(
+            registry.resolve_route_with(&s, old.source, |_| {
+                registry.record_route(&s, old.source, Some(new));
+                true
+            }),
+            RouteResolution::Stale(old)
+        );
+        assert_eq!(
+            registry.resolve_route_with(&s, new.source, |r| r == new),
+            RouteResolution::Live(new)
+        );
+        assert_eq!(
+            registry.resolve_route_with(&s, new.source, |_| false),
+            RouteResolution::Stale(new)
+        );
+        assert_eq!(
+            registry.resolve_route_with(&s, new.source, |_| panic!("removed")),
+            RouteResolution::None
+        );
     }
-
 }

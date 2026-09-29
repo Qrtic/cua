@@ -55,10 +55,11 @@ impl Tool for GetDesktopStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let input = match parse_typed_input::<GetDesktopStateInput>("get_desktop_state", args.clone()) {
-            Ok(input) => input,
-            Err(result) => return result,
-        };
+        let input =
+            match parse_typed_input::<GetDesktopStateInput>("get_desktop_state", args.clone()) {
+                Ok(input) => input,
+                Err(result) => return result,
+            };
         let screenshot_out_file = input.screenshot_out_file.map(|s| {
             // Expand ~ prefix (mirrors get_window_state).
             if let Some(relative) = s.strip_prefix("~/") {
@@ -89,11 +90,16 @@ impl Tool for GetDesktopStateTool {
                 // The worker owns both capture leases through child settlement,
                 // even if this async request is cancelled and drops its handle.
                 let (png, capture) = crate::capture::desktop::capture_owned(capture)?;
-                let (w, h) = crate::capture::png_dimensions(&png)
-                    .map_err(|_| ToolResult::error("Desktop screenshot has invalid PNG geometry"))?;
+                let (w, h) = crate::capture::png_dimensions(&png).map_err(|_| {
+                    ToolResult::error("Desktop screenshot has invalid PNG geometry")
+                })?;
                 capture.check()?;
                 let (b64, file) = if let Some(ref path) = out_file {
-                    crate::capture::desktop::write_output(std::path::Path::new(path), &png, || capture.check())?;
+                    crate::capture::desktop::write_output(
+                        std::path::Path::new(path),
+                        &png,
+                        || capture.check(),
+                    )?;
                     (None, Some(path.clone()))
                 } else {
                     (Some(BASE64.encode(&png)), None)
@@ -104,11 +110,12 @@ impl Tool for GetDesktopStateTool {
         )
         .await;
 
-        let (b64_opt, file_path, screenshot_width, screenshot_height, desktop_observation_id) = match res {
-            Ok(Ok(v)) => v,
-            Ok(Err(refusal)) => return refusal,
-            Err(e) => return ToolResult::error(format!("Desktop screenshot task error: {e}")),
-        };
+        let (b64_opt, file_path, screenshot_width, screenshot_height, desktop_observation_id) =
+            match res {
+                Ok(Ok(v)) => v,
+                Ok(Err(refusal)) => return refusal,
+                Err(e) => return ToolResult::error(format!("Desktop screenshot task error: {e}")),
+            };
 
         let mut content: Vec<Content> = Vec::new();
         if let Some(b64) = b64_opt {

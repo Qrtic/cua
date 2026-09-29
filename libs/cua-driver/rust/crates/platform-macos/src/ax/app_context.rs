@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 use super::bindings::{
     ax_get_window_id, copy_children, copy_string_attr, kAXErrorAttributeUnsupported,
-    kAXErrorCannotComplete, kAXErrorFailure, kAXErrorNoValue, try_copy_ax_windows, try_copy_element_attr,
-    AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
+    kAXErrorCannotComplete, kAXErrorFailure, kAXErrorNoValue, try_copy_ax_windows,
+    try_copy_element_attr, AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
 };
 
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 0.2;
@@ -616,7 +616,9 @@ fn resolve_app_context_with_read_policy(
     allow_busy_retry: bool,
 ) -> Result<ResolvedAppContext, AppContextResolveError> {
     let (identity, snapshot, selection) = select_context_with_busy_recovery(
-        pid, expected, allow_busy_retry,
+        pid,
+        expected,
+        allow_busy_retry,
         || running_app_identity(pid),
         || collect_app_context_snapshot(pid),
     )?;
@@ -1406,7 +1408,8 @@ mod tests {
 
     #[test]
     fn healthy_context_and_action_revalidation_do_not_add_retry_reads() {
-        for (allow_retry, snapshot) in [(true, settled_context(77)), (false, wholly_busy_context())] {
+        for (allow_retry, snapshot) in [(true, settled_context(77)), (false, wholly_busy_context())]
+        {
             let mut snapshot_reads = 0;
             let result = select_context_with_busy_recovery(
                 42,

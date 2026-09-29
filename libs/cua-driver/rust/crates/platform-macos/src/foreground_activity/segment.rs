@@ -368,8 +368,11 @@ impl NativeSegment {
         target: ExactWindowTarget,
     ) -> Result<(), ToolResult> {
         if self.preparation_cleanup_started() {
-            return Err(failure("foreground_segment_not_available",
-                "Dialog preparation ended; abort this segment before further input", true));
+            return Err(failure(
+                "foreground_segment_not_available",
+                "Dialog preparation ended; abort this segment before further input",
+                true,
+            ));
         }
         if self.completed_return_source().is_some() {
             return Err(failure(
@@ -466,7 +469,10 @@ impl NativeSegment {
     }
 
     fn preparation_cleanup_started(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).preparation_cleanup
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .preparation_cleanup
             != PreparationCleanup::NotStarted
     }
 
@@ -563,18 +569,32 @@ impl Call {
     }
 
     fn claim_failed_preparation(&self, now: u64, activity: Snapshot) -> bool {
-        if !self.prepares_dialog || !self.is_dialog() || !self.segment.owner_live()
+        if !self.prepares_dialog
+            || !self.is_dialog()
+            || !self.segment.owner_live()
             || self.target != self.segment.current_target()
-            || self.reservation.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            || self
+                .reservation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
         {
             return false;
         }
         let mut inner = self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if !inner.activated || inner.resources.is_none() || inner.cleanup_unknown
-            || inner.ending || inner.restoring || !inner.policy.in_flight()
-            || inner.policy.calls_reserved() != 1 || inner.policy.steps_reserved() != 0
+        if !inner.activated
+            || inner.resources.is_none()
+            || inner.cleanup_unknown
+            || inner.ending
+            || inner.restoring
+            || !inner.policy.in_flight()
+            || inner.policy.calls_reserved() != 1
+            || inner.policy.steps_reserved() != 0
             || inner.preparation_cleanup != PreparationCleanup::NotStarted
-            || inner.policy.check(&self.segment.binding, now, activity).is_err()
+            || inner
+                .policy
+                .check(&self.segment.binding, now, activity)
+                .is_err()
         {
             return false;
         }
@@ -590,14 +610,23 @@ impl Call {
     // the same call can report its original error, but cannot send more input.
     pub(super) fn check_failed_preparation_settled(&self) -> anyhow::Result<()> {
         let confirmed = self.prepares_dialog
-            && self.segment.inner.lock().unwrap_or_else(|e| e.into_inner()).preparation_cleanup
+            && self
+                .segment
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .preparation_cleanup
                 == PreparationCleanup::Confirmed;
-        failed_preparation_settled_with(confirmed,
-            || self.segment.check_liveness(), || owned_exact_front(self.segment.original))
+        failed_preparation_settled_with(
+            confirmed,
+            || self.segment.check_liveness(),
+            || owned_exact_front(self.segment.original),
+        )
     }
 
     pub(super) fn settle_after_dialog_call(
-        &self, mut check_live: impl FnMut() -> anyhow::Result<()>,
+        &self,
+        mut check_live: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<bool> {
         if self.failed_preparation_cleanup_started() {
             check_live()?;
@@ -610,9 +639,18 @@ impl Call {
     }
 
     fn cleanup_failed_preparation(self: &Arc<Self>, context: &InvocationContext) {
-        if !context.segment_call.as_ref().is_some_and(|call| Arc::ptr_eq(call, self))
-            || !self.prepares_dialog || self.segment.preparation_cleanup_started()
-            || !self.segment.inner.lock().unwrap_or_else(|e| e.into_inner()).activated
+        if !context
+            .segment_call
+            .as_ref()
+            .is_some_and(|call| Arc::ptr_eq(call, self))
+            || !self.prepares_dialog
+            || self.segment.preparation_cleanup_started()
+            || !self
+                .segment
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .activated
         {
             return;
         }
@@ -626,8 +664,13 @@ impl Call {
             }
             Ok(())
         };
-        if live().is_err() { return; }
-        let Ok(focus) = crate::input::skylight::FailedPreparationFocus::capture(source, original) else { return; };
+        if live().is_err() {
+            return;
+        }
+        let Ok(focus) = crate::input::skylight::FailedPreparationFocus::capture(source, original)
+        else {
+            return;
+        };
         let phase = Cell::new(crate::input::skylight::ExactRestorationPhase::BeforeFrontRequest);
         let check = || focus.check(phase.get(), || live());
         // No activation/AX attempt after cancellation, expiry or unknown focus.
@@ -637,23 +680,30 @@ impl Call {
         struct UnwoundRestore<'a>(&'a Call, bool);
         impl Drop for UnwoundRestore<'_> {
             fn drop(&mut self) {
-                if !self.1 { self.0.cleanup_unknown(); }
+                if !self.1 {
+                    self.0.cleanup_unknown();
+                }
             }
         }
         let mut unwind = UnwoundRestore(self, false);
         let restored = failed_preparation_restore_with(
             check,
             || owned_exact_front(original),
-            |guard| crate::input::skylight::restore_exact_window_guarded_with_phase(
-                original.pid, original.window_id, |next| {
-                    // Only the native restorer can signal successful 0x200.
-                    phase.set(next);
-                    guard()
-                }),
+            |guard| {
+                crate::input::skylight::restore_exact_window_guarded_with_phase(
+                    original.pid,
+                    original.window_id,
+                    |next| {
+                        // Only the native restorer can signal successful 0x200.
+                        phase.set(next);
+                        guard()
+                    },
+                )
+            },
         );
         unwind.1 = true;
-        let confirmed = matches!(restored, Ok(true))
-            && self.confirm_failed_preparation(clock_ms(), snapshot());
+        let confirmed =
+            matches!(restored, Ok(true)) && self.confirm_failed_preparation(clock_ms(), snapshot());
         tracing::debug!(target: "cua_foreground_segment", ?restored, confirmed,
             source_pid = source.pid, source_window = source.window_id,
             original_pid = original.pid, original_window = original.window_id,
@@ -664,10 +714,17 @@ impl Call {
 
     fn confirm_failed_preparation(&self, now: u64, activity: Snapshot) -> bool {
         let mut inner = self.segment.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.prepares_dialog || !self.segment.owner_live() || inner.cleanup_unknown
-            || inner.ending || inner.restoring || !inner.policy.in_flight()
+        if !self.prepares_dialog
+            || !self.segment.owner_live()
+            || inner.cleanup_unknown
+            || inner.ending
+            || inner.restoring
+            || !inner.policy.in_flight()
             || inner.preparation_cleanup != PreparationCleanup::Running
-            || inner.policy.check(&self.segment.binding, now, activity).is_err()
+            || inner
+                .policy
+                .check(&self.segment.binding, now, activity)
+                .is_err()
         {
             return false;
         }
@@ -896,7 +953,10 @@ impl Call {
                         };
                         if exact_front(source)
                             && self.segment.record_completed_dialog_result(
-                                before, &successor, clock_ms(), snapshot(),
+                                before,
+                                &successor,
+                                clock_ms(),
+                                snapshot(),
                             )
                         {
                             tracing::debug!(target: "cua_focus_restore", pid=source.pid,
@@ -1222,8 +1282,10 @@ pub(super) fn admit_call(args: &Value, tool: &str) -> Result<Option<Arc<Call>>, 
 }
 
 fn owned_exact_front(target: ExactWindowTarget) -> bool {
-    matches!(crate::windows::resolve_window_owner(target.pid, target.window_id),
-        crate::windows::WindowOwner::SamePid) && exact_front(target)
+    matches!(
+        crate::windows::resolve_window_owner(target.pid, target.window_id),
+        crate::windows::WindowOwner::SamePid
+    ) && exact_front(target)
 }
 
 fn failed_preparation_restore_with(
@@ -1495,7 +1557,10 @@ pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
         Err(result) => return result,
     };
     let context = current_invocation();
-    let Some(call) = context.as_ref().and_then(|context| context.segment_call.clone()) else {
+    let Some(call) = context
+        .as_ref()
+        .and_then(|context| context.segment_call.clone())
+    else {
         return failure(
             "foreground_dialog_required",
             "A live native dialog segment is required",
@@ -1520,9 +1585,11 @@ pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
             {
                 anyhow::bail!("dialog attachment changed before activation");
             }
-            crate::input::skylight::with_foreground_hid_activation(target.pid, target.window_id, || {
-                Ok(())
-            })
+            crate::input::skylight::with_foreground_hid_activation(
+                target.pid,
+                target.window_id,
+                || Ok(()),
+            )
         })();
         // Only a normal returned error enters cleanup, after Episode has
         // released its owned controls. Cancellation/unwind never substitutes
@@ -1543,63 +1610,116 @@ pub(crate) async fn prepare_dialog(args: Value) -> ToolResult {
 }
 
 fn rendering_window_attributes(
-    role: Option<&str>, subrole: Option<&str>, modal: Option<bool>,
-    minimized: Option<bool>, sheets_absent: bool,
+    role: Option<&str>,
+    subrole: Option<&str>,
+    modal: Option<bool>,
+    minimized: Option<bool>,
+    sheets_absent: bool,
 ) -> bool {
-    role == Some("AXWindow") && subrole == Some("AXStandardWindow")
-        && modal != Some(true) && minimized == Some(false) && sheets_absent
+    role == Some("AXWindow")
+        && subrole == Some("AXStandardWindow")
+        && modal != Some(true)
+        && minimized == Some(false)
+        && sheets_absent
 }
 
 fn rendering_target_available(target: ExactWindowTarget) -> bool {
     use crate::ax::bindings as ax;
-    use core_foundation::{array::CFArray, base::{CFRelease, CFTypeRef, TCFType}, string::CFString};
+    use core_foundation::{
+        array::CFArray,
+        base::{CFRelease, CFTypeRef, TCFType},
+        string::CFString,
+    };
     // Exact identity lookups intentionally omit Space metadata. This path
     // needs a positive, display-specific current-Space proof before activation.
     let snapshot = crate::windows::visible_windows_with_space_snapshot();
-    let Some(info) = snapshot.windows.into_iter().find(|w| w.window_id == target.window_id) else { return false };
-    if info.pid != target.pid || !info.is_on_screen || info.layer != 0
-        || info.on_current_space != Some(true) {
+    let Some(info) = snapshot
+        .windows
+        .into_iter()
+        .find(|w| w.window_id == target.window_id)
+    else {
+        return false;
+    };
+    if info.pid != target.pid
+        || !info.is_on_screen
+        || info.layer != 0
+        || info.on_current_space != Some(true)
+    {
         tracing::debug!(target: "cua_app_context", pid = target.pid, window_id = target.window_id,
             on_current_space = ?info.on_current_space, "Rendering recovery lacks visible current-Space ownership proof");
         return false;
     }
     struct Owned(ax::AXUIElementRef);
     impl Drop for Owned {
-        fn drop(&mut self) { unsafe { CFRelease(self.0 as _) }; }
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0 as _) };
+        }
     }
     unsafe {
         let raw = ax::AXUIElementCreateApplication(target.pid);
-        if raw.is_null() { return false; }
+        if raw.is_null() {
+            return false;
+        }
         let app = Owned(raw);
-        if ax::AXUIElementSetMessagingTimeout(app.0, 0.1) != ax::kAXErrorSuccess { return false; }
-        let Ok(snapshot) = ax::try_copy_ax_windows(app.0) else { return false };
+        if ax::AXUIElementSetMessagingTimeout(app.0, 0.1) != ax::kAXErrorSuccess {
+            return false;
+        }
+        let Ok(snapshot) = ax::try_copy_ax_windows(app.0) else {
+            return false;
+        };
         // Own every returned element before an early return; no retained AX leak.
         let windows: Vec<Owned> = snapshot.windows.into_iter().map(Owned).collect();
-        if windows.len() > 64 { return false; }
+        if windows.len() > 64 {
+            return false;
+        }
         let deadline = std::time::Instant::now() + Duration::from_millis(600);
         for window in windows {
-            if std::time::Instant::now() >= deadline || check_request().is_err() { return false; }
-            if ax::AXUIElementSetMessagingTimeout(window.0, 0.1) != ax::kAXErrorSuccess { continue; }
-            if ax::ax_get_window_id(window.0) != Some(target.window_id) { continue; }
+            if std::time::Instant::now() >= deadline || check_request().is_err() {
+                return false;
+            }
+            if ax::AXUIElementSetMessagingTimeout(window.0, 0.1) != ax::kAXErrorSuccess {
+                continue;
+            }
+            if ax::ax_get_window_id(window.0) != Some(target.window_id) {
+                continue;
+            }
             let mut pid = 0;
-            if ax::AXUIElementGetPid(window.0, &mut pid) != ax::kAXErrorSuccess || pid != target.pid { return false; }
+            if ax::AXUIElementGetPid(window.0, &mut pid) != ax::kAXErrorSuccess || pid != target.pid
+            {
+                return false;
+            }
             let role = ax::copy_string_attr(window.0, "AXRole");
             let subrole = ax::copy_string_attr(window.0, "AXSubrole");
             let modal = ax::copy_bool_attr(window.0, "AXModal");
             let minimized = ax::copy_bool_attr(window.0, "AXMinimized");
             let attribute = CFString::new("AXSheets");
             let mut value: CFTypeRef = std::ptr::null();
-            let status = ax::AXUIElementCopyAttributeValue(window.0, attribute.as_concrete_TypeRef(), &mut value);
+            let status = ax::AXUIElementCopyAttributeValue(
+                window.0,
+                attribute.as_concrete_TypeRef(),
+                &mut value,
+            );
             let sheets_absent = match status {
                 ax::kAXErrorAttributeUnsupported | ax::kAXErrorNoValue => true,
-                ax::kAXErrorSuccess if !value.is_null()
-                    && core_foundation::base::CFGetTypeID(value) == CFArray::<CFTypeRef>::type_id() =>
-                    CFArray::<CFTypeRef>::wrap_under_get_rule(value as _).len() == 0,
+                ax::kAXErrorSuccess
+                    if !value.is_null()
+                        && core_foundation::base::CFGetTypeID(value)
+                            == CFArray::<CFTypeRef>::type_id() =>
+                {
+                    CFArray::<CFTypeRef>::wrap_under_get_rule(value as _).len() == 0
+                }
                 _ => false,
             };
-            if !value.is_null() { CFRelease(value); }
+            if !value.is_null() {
+                CFRelease(value);
+            }
             let ordinary_document = rendering_window_attributes(
-                role.as_deref(), subrole.as_deref(), modal, minimized, sheets_absent);
+                role.as_deref(),
+                subrole.as_deref(),
+                modal,
+                minimized,
+                sheets_absent,
+            );
             if !ordinary_document {
                 tracing::debug!(target: "cua_app_context", pid = target.pid, window_id = target.window_id,
                     ?role, ?subrole, ?modal, ?minimized, sheets_absent,
@@ -1614,29 +1734,47 @@ fn rendering_target_available(target: ExactWindowTarget) -> bool {
 /// No click/key is used as a rendering probe. The wrapper keeps this original
 /// segment through one observation, then explicitly settles it before returning.
 pub(crate) async fn prepare_observation(args: Value) -> ToolResult {
-    let target = match target_from_args(&args) { Ok(target) => target, Err(result) => return result };
-    let Some(call) = current_invocation().and_then(|context| context.segment_call.clone()) else {
-        return failure("foreground_segment_required", "Rendering recovery requires a live exact-window segment", true);
+    let target = match target_from_args(&args) {
+        Ok(target) => target,
+        Err(result) => return result,
     };
-    if call.segment.dialog_host.is_some() || call.target() != target
-        || args.get("delivery_mode").and_then(Value::as_str) != Some("foreground") {
-        return failure("rendering_target_unavailable", "Rendering recovery requires an exact ordinary document target", true);
+    let Some(call) = current_invocation().and_then(|context| context.segment_call.clone()) else {
+        return failure(
+            "foreground_segment_required",
+            "Rendering recovery requires a live exact-window segment",
+            true,
+        );
+    };
+    if call.segment.dialog_host.is_some()
+        || call.target() != target
+        || args.get("delivery_mode").and_then(Value::as_str) != Some("foreground")
+    {
+        return failure(
+            "rendering_target_unavailable",
+            "Rendering recovery requires an exact ordinary document target",
+            true,
+        );
     }
     let prepared = spawn_blocking(move || {
         check_request()?;
         if !rendering_target_available(target) {
             return Ok(false);
         }
-        crate::input::skylight::with_foreground_hid_activation(target.pid, target.window_id, || {
-            let started = std::time::Instant::now();
-            while started.elapsed() < Duration::from_millis(600) {
-                check_request()?;
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            check_request()
-        })?;
+        crate::input::skylight::with_foreground_hid_activation(
+            target.pid,
+            target.window_id,
+            || {
+                let started = std::time::Instant::now();
+                while started.elapsed() < Duration::from_millis(600) {
+                    check_request()?;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                check_request()
+            },
+        )?;
         Ok::<_, anyhow::Error>(true)
-    }).await;
+    })
+    .await;
     match prepared {
         Ok(Ok(true)) => ToolResult::text("Exact document exposure completed; observe its actual state once and finish the segment. No click or key was sent.")
             .with_structured(json!({"phase":"prepared", "pid":target.pid, "window_id":target.window_id,
@@ -2050,17 +2188,67 @@ mod tests {
 
     #[test]
     fn rendering_recovery_refuses_non_documents_minimized_windows_and_sheets() {
-        assert!(rendering_window_attributes(Some("AXWindow"), Some("AXStandardWindow"), Some(false), Some(false), true));
+        assert!(rendering_window_attributes(
+            Some("AXWindow"),
+            Some("AXStandardWindow"),
+            Some(false),
+            Some(false),
+            true
+        ));
         for (role, subrole, modal, minimized, no_sheets) in [
-            (Some("AXSheet"), Some("AXStandardWindow"), Some(false), Some(false), true),
-            (Some("AXWindow"), Some("AXDialog"), Some(false), Some(false), true),
-            (Some("AXWindow"), Some("AXStandardWindow"), Some(true), Some(false), true),
-            (Some("AXWindow"), Some("AXStandardWindow"), Some(false), Some(true), true),
-            (Some("AXWindow"), Some("AXStandardWindow"), Some(false), None, true),
-            (Some("AXWindow"), Some("AXStandardWindow"), Some(false), Some(false), false),
-            (None, Some("AXStandardWindow"), Some(false), Some(false), true),
+            (
+                Some("AXSheet"),
+                Some("AXStandardWindow"),
+                Some(false),
+                Some(false),
+                true,
+            ),
+            (
+                Some("AXWindow"),
+                Some("AXDialog"),
+                Some(false),
+                Some(false),
+                true,
+            ),
+            (
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+                Some(true),
+                Some(false),
+                true,
+            ),
+            (
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+                Some(false),
+                Some(true),
+                true,
+            ),
+            (
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+                Some(false),
+                None,
+                true,
+            ),
+            (
+                Some("AXWindow"),
+                Some("AXStandardWindow"),
+                Some(false),
+                Some(false),
+                false,
+            ),
+            (
+                None,
+                Some("AXStandardWindow"),
+                Some(false),
+                Some(false),
+                true,
+            ),
         ] {
-            assert!(!rendering_window_attributes(role, subrole, modal, minimized, no_sheets));
+            assert!(!rendering_window_attributes(
+                role, subrole, modal, minimized, no_sheets
+            ));
         }
     }
 
@@ -2156,13 +2344,21 @@ mod tests {
     async fn preparation_fixture() -> (Arc<NativeSegment>, Arc<Call>) {
         let (mut segment, _, _) = fixture().await;
         Arc::get_mut(&mut segment).unwrap().dialog_host = Some(ExactWindowTarget {
-            pid: 42, window_id: 70,
+            pid: 42,
+            window_id: 70,
         });
-        let reservation = segment.inner.lock().unwrap().policy
-            .reserve(&segment.binding, 5_000, idle(), CallKind::Activation).unwrap();
+        let reservation = segment
+            .inner
+            .lock()
+            .unwrap()
+            .policy
+            .reserve(&segment.binding, 5_000, idle(), CallKind::Activation)
+            .unwrap();
         let ticket = Arc::new(Call {
-            segment: Arc::clone(&segment), target: segment.current_target(),
-            dialog_transition: Mutex::new(None), reservation: Mutex::new(Some(reservation)),
+            segment: Arc::clone(&segment),
+            target: segment.current_target(),
+            dialog_transition: Mutex::new(None),
+            reservation: Mutex::new(Some(reservation)),
             prepares_dialog: true,
         });
         ticket.mark_activated();
@@ -2177,7 +2373,12 @@ mod tests {
         assert!(ticket.claim_failed_preparation(5_001, idle()));
         assert!(!ticket.claim_failed_preparation(5_001, idle()));
         assert!(ticket.check().is_err()); // latch rejects before any native focus query
-        for tool in ["prepare_dialog", "get_window_state", "press_key", "set_value"] {
+        for tool in [
+            "prepare_dialog",
+            "get_window_state",
+            "press_key",
+            "set_value",
+        ] {
             assert!(segment.validate_dialog_call(tool, ticket.target()).is_err());
         }
         assert!(ticket.confirm_failed_preparation(5_002, idle()));
@@ -2187,7 +2388,10 @@ mod tests {
             let mut inner = segment.inner.lock().unwrap();
             assert_eq!(inner.policy.deadline_ms(), deadline);
             assert_eq!(inner.policy.state(), SegmentState::Open);
-            assert!(inner.policy.reserve(&segment.binding, 5_003, idle(), CallKind::Mutation).is_err());
+            assert!(inner
+                .policy
+                .reserve(&segment.binding, 5_003, idle(), CallKind::Mutation)
+                .is_err());
             assert!(inner.resources.is_some());
         }
         ticket.settle();
@@ -2213,7 +2417,10 @@ mod tests {
         assert!(segment.inner.lock().unwrap().policy.in_flight());
         ticket.settle();
         assert!(segment.cleanup_is_settled());
-        assert_eq!(ticket.closed_summary().unwrap()["restoration"], "skipped_interrupted");
+        assert_eq!(
+            ticket.closed_summary().unwrap()["restoration"],
+            "skipped_interrupted"
+        );
     }
 
     #[tokio::test]
@@ -2225,7 +2432,11 @@ mod tests {
             match case {
                 0 => Arc::get_mut(&mut ticket).unwrap().prepares_dialog = false,
                 1 => segment.inner.lock().unwrap().activated = false,
-                2 => { segment.owner.close(cua_driver_core::session::SessionEndReason::ProcessExit); },
+                2 => {
+                    segment
+                        .owner
+                        .close(cua_driver_core::session::SessionEndReason::ProcessExit);
+                }
                 3 => now = u64::MAX,
                 4 => activity.generation += 1,
                 5 => activity.reliable = false,
@@ -2234,7 +2445,10 @@ mod tests {
                 8 => segment.inner.lock().unwrap().restoring = true,
                 _ => ticket.settle(),
             }
-            assert!(!ticket.claim_failed_preparation(now, activity), "case {case}");
+            assert!(
+                !ticket.claim_failed_preparation(now, activity),
+                "case {case}"
+            );
             assert!(!segment.preparation_cleanup_started(), "case {case}");
             {
                 let mut inner = segment.inner.lock().unwrap();
@@ -2269,13 +2483,17 @@ mod tests {
                 || {
                     let n = checks.get();
                     checks.set(n + 1);
-                    if n == denied_at { anyhow::bail!("original authority ended"); }
+                    if n == denied_at {
+                        anyhow::bail!("original authority ended");
+                    }
                     Ok(())
                 },
                 || original.get(),
                 |guard| {
                     for _ in 0..3 {
-                        if guard().is_err() { return false; }
+                        if guard().is_err() {
+                            return false;
+                        }
                         writes.set(writes.get() + 1);
                     }
                     original.set(true);
@@ -2291,38 +2509,60 @@ mod tests {
     fn failed_prepare_restore_requires_exact_readback_and_preserves_guard_failure() {
         let original = Cell::new(false);
         let calls = Cell::new(0);
-        assert!(failed_preparation_restore_with(|| Ok(()), || original.get(), |guard| {
-            guard().unwrap();
-            calls.set(calls.get() + 1);
-            original.set(true);
-            true
-        }).unwrap());
+        assert!(failed_preparation_restore_with(
+            || Ok(()),
+            || original.get(),
+            |guard| {
+                guard().unwrap();
+                calls.set(calls.get() + 1);
+                original.set(true);
+                true
+            }
+        )
+        .unwrap());
         assert_eq!(calls.get(), 1);
-        assert!(failed_preparation_restore_with(|| Ok(()), || true,
-            |_| panic!("already-original must not restore again")).unwrap());
+        assert!(failed_preparation_restore_with(
+            || Ok(()),
+            || true,
+            |_| panic!("already-original must not restore again")
+        )
+        .unwrap());
         for native_result in [false, true] {
-            assert!(!failed_preparation_restore_with(|| Ok(()), || false,
-                |_| native_result).unwrap());
+            assert!(
+                !failed_preparation_restore_with(|| Ok(()), || false, |_| native_result).unwrap()
+            );
         }
         let changed = Cell::new(false);
         assert!(failed_preparation_restore_with(
-            || if changed.get() { anyhow::bail!("lease expired"); } else { Ok(()) },
-            || { changed.set(true); true },
+            || if changed.get() {
+                anyhow::bail!("lease expired");
+            } else {
+                Ok(())
+            },
+            || {
+                changed.set(true);
+                true
+            },
             |_| panic!("expired read must not write"),
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[test]
     fn failed_prepare_restore_unwind_cannot_produce_confirmed_readback() {
         let checked_after_write = Cell::new(false);
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            failed_preparation_restore_with(|| Ok(()), || {
-                checked_after_write.set(true);
-                false
-            }, |_| {
-                checked_after_write.set(false);
-                panic!("native restoration unwound");
-            })
+            failed_preparation_restore_with(
+                || Ok(()),
+                || {
+                    checked_after_write.set(true);
+                    false
+                },
+                |_| {
+                    checked_after_write.set(false);
+                    panic!("native restoration unwound");
+                },
+            )
         }));
         assert!(unwind.is_err());
         assert!(!checked_after_write.get());
@@ -2332,15 +2572,28 @@ mod tests {
 
     #[test]
     fn failed_prepare_settlement_is_not_an_error_or_focus_bypass() {
-        assert!(failed_preparation_settled_with(false,
+        assert!(failed_preparation_settled_with(
+            false,
             || panic!("unconfirmed cleanup must not bypass old checks"),
-            || panic!("unconfirmed cleanup must not query native focus")).is_err());
+            || panic!("unconfirmed cleanup must not query native focus")
+        )
+        .is_err());
         assert!(failed_preparation_settled_with(true, || Ok(()), || true).is_ok());
         assert!(failed_preparation_settled_with(true, || Ok(()), || false).is_err());
         let changed = Cell::new(false);
-        assert!(failed_preparation_settled_with(true,
-            || if changed.get() { anyhow::bail!("owner lost"); } else { Ok(()) },
-            || { changed.set(true); true }).is_err());
+        assert!(failed_preparation_settled_with(
+            true,
+            || if changed.get() {
+                anyhow::bail!("owner lost");
+            } else {
+                Ok(())
+            },
+            || {
+                changed.set(true);
+                true
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -2812,13 +3065,21 @@ mod tests {
         use crate::ax::attached_sheet::{AttachedSheetSuccessor, DialogAttachment};
         let (mut segment, _, _) = fixture().await;
         let before = DialogAttachment {
-            window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+            window_id: 71,
+            panel_id: 71,
+            host_id: 70,
+            path: vec![71, 70],
         };
         let successor = AttachedSheetSuccessor {
-            window_id: 99, host_id: 70, path: vec![99, 70],
+            window_id: 99,
+            host_id: 70,
+            path: vec![99, 70],
         };
         let mutable = Arc::get_mut(&mut segment).unwrap();
-        mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+        mutable.dialog_host = Some(ExactWindowTarget {
+            pid: 42,
+            window_id: 70,
+        });
         mutable.dialog_panel = Some(71);
         mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
         let ticket = call(&segment);
@@ -2831,16 +3092,36 @@ mod tests {
         assert_eq!(ticket.target(), binding.target);
         assert_eq!(segment.current_target(), binding.target);
         assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
-        assert_eq!(segment.restoration_source(), ExactWindowTarget { pid: 42, window_id: 99 });
+        assert_eq!(
+            segment.restoration_source(),
+            ExactWindowTarget {
+                pid: 42,
+                window_id: 99
+            }
+        );
         assert_eq!(segment.expected_front(), segment.restoration_source());
         assert_eq!(ticket.dialog_closed_summary().unwrap()["phase"], "closed");
-        for tool in ["get_window_state", "click", "type_text", "set_value", "prepare_dialog"] {
+        for tool in [
+            "get_window_state",
+            "click",
+            "type_text",
+            "set_value",
+            "prepare_dialog",
+        ] {
             assert!(segment.validate_dialog_call(tool, binding.target).is_err());
         }
-        assert!(!binding_matches(&segment, &binding.owner, segment.restoration_source(), &segment.owner));
+        assert!(!binding_matches(
+            &segment,
+            &binding.owner,
+            segment.restoration_source(),
+            &segment.owner
+        ));
         assert!(segment.record_completed_dialog_result(&before, &successor, 5_002, idle()));
         ticket.settle();
-        assert!(segment.inner.lock().unwrap().resources.is_some(), "A normal end still owns cleanup");
+        assert!(
+            segment.inner.lock().unwrap().resources.is_some(),
+            "A normal end still owns cleanup"
+        );
         ticket.revoke();
         assert!(segment.cleanup_is_settled());
     }
@@ -2850,13 +3131,21 @@ mod tests {
         use crate::ax::attached_sheet::{AttachedSheetSuccessor, DialogAttachment};
         let (mut segment, _, _) = fixture().await;
         let before = DialogAttachment {
-            window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+            window_id: 71,
+            panel_id: 71,
+            host_id: 70,
+            path: vec![71, 70],
         };
         let successor = AttachedSheetSuccessor {
-            window_id: 99, host_id: 70, path: vec![99, 70],
+            window_id: 99,
+            host_id: 70,
+            path: vec![99, 70],
         };
         let mutable = Arc::get_mut(&mut segment).unwrap();
-        mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+        mutable.dialog_host = Some(ExactWindowTarget {
+            pid: 42,
+            window_id: 70,
+        });
         mutable.dialog_panel = Some(71);
         mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
         let ticket = call(&segment);
@@ -2867,20 +3156,28 @@ mod tests {
         // Episode::finish and the outer tool invocation both reconcile the
         // same successful Save before this call releases its reservation.
         for phase in ["inner native episode", "outer tool completion"] {
-            assert!(settle_dialog_condition(
-                Duration::from_millis(100),
-                || Ok(()),
-                || segment.record_completed_dialog_result(&before, &successor, 5_001, idle()),
-            ).unwrap(), "same proven result was rejected by {phase}");
+            assert!(
+                settle_dialog_condition(
+                    Duration::from_millis(100),
+                    || Ok(()),
+                    || segment.record_completed_dialog_result(&before, &successor, 5_001, idle()),
+                )
+                .unwrap(),
+                "same proven result was rejected by {phase}"
+            );
             assert_eq!(segment.binding, binding);
             assert_eq!(segment.current_target(), binding.target);
             assert_eq!(segment.inner.lock().unwrap().policy.deadline_ms(), deadline);
             assert_eq!(ticket.dialog_closed_summary().unwrap()["phase"], "closed");
-            assert!(segment.validate_dialog_call("click", binding.target).is_err());
+            assert!(segment
+                .validate_dialog_call("click", binding.target)
+                .is_err());
         }
         ticket.settle();
-        assert!(!segment.record_completed_dialog_result(&before, &successor, 5_002, idle()),
-            "a completed call cannot gain another reservation by reusing the proof");
+        assert!(
+            !segment.record_completed_dialog_result(&before, &successor, 5_002, idle()),
+            "a completed call cannot gain another reservation by reusing the proof"
+        );
         ticket.revoke();
         assert!(segment.cleanup_is_settled());
     }
@@ -2891,13 +3188,21 @@ mod tests {
         for scenario in 0..9 {
             let (mut segment, _, _) = fixture().await;
             let before = DialogAttachment {
-                window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+                window_id: 71,
+                panel_id: 71,
+                host_id: 70,
+                path: vec![71, 70],
             };
             let mut successor = AttachedSheetSuccessor {
-                window_id: 99, host_id: 70, path: vec![99, 70],
+                window_id: 99,
+                host_id: 70,
+                path: vec![99, 70],
             };
             let mutable = Arc::get_mut(&mut segment).unwrap();
-            mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+            mutable.dialog_host = Some(ExactWindowTarget {
+                pid: 42,
+                window_id: 70,
+            });
             mutable.dialog_panel = Some(71);
             mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
             let ticket = call(&segment);
@@ -2907,7 +3212,10 @@ mod tests {
             let mut activity = idle();
             let mut now = 5_002;
             match scenario {
-                0 => { successor.window_id = 98; successor.path[0] = 98; },
+                0 => {
+                    successor.window_id = 98;
+                    successor.path[0] = 98;
+                }
                 1 => activity.generation += 1,
                 2 => now = u64::MAX,
                 3 => ticket.revoke(),
@@ -2915,12 +3223,22 @@ mod tests {
                 5 => segment.inner.lock().unwrap().ending = true,
                 6 => segment.inner.lock().unwrap().restoring = true,
                 7 => segment.inner.lock().unwrap().cleanup_unknown = true,
-                8 => { segment.owner.close(cua_driver_core::session::SessionEndReason::ProcessExit); },
+                8 => {
+                    segment
+                        .owner
+                        .close(cua_driver_core::session::SessionEndReason::ProcessExit);
+                }
                 _ => unreachable!(),
             }
-            assert!(!segment.record_completed_dialog_result(&before, &successor, now, activity),
-                "completed proof incorrectly accepted scenario {scenario}");
-            assert_eq!(segment.restoration_source(), retained, "return source must stay frozen");
+            assert!(
+                !segment.record_completed_dialog_result(&before, &successor, now, activity),
+                "completed proof incorrectly accepted scenario {scenario}"
+            );
+            assert_eq!(
+                segment.restoration_source(),
+                retained,
+                "return source must stay frozen"
+            );
             {
                 let mut inner = segment.inner.lock().unwrap();
                 inner.ending = false;
@@ -2938,13 +3256,21 @@ mod tests {
         for scenario in 0..9 {
             let (mut segment, _, _) = fixture().await;
             let mut before = DialogAttachment {
-                window_id: 71, panel_id: 71, host_id: 70, path: vec![71, 70],
+                window_id: 71,
+                panel_id: 71,
+                host_id: 70,
+                path: vec![71, 70],
             };
             let mut successor = AttachedSheetSuccessor {
-                window_id: 99, host_id: 70, path: vec![99, 70],
+                window_id: 99,
+                host_id: 70,
+                path: vec![99, 70],
             };
             let mutable = Arc::get_mut(&mut segment).unwrap();
-            mutable.dialog_host = Some(ExactWindowTarget { pid: 42, window_id: 70 });
+            mutable.dialog_host = Some(ExactWindowTarget {
+                pid: 42,
+                window_id: 70,
+            });
             mutable.dialog_panel = Some(71);
             mutable.inner.lock().unwrap().dialog_target = Some(before.clone());
             let ticket = call(&segment);
@@ -2963,7 +3289,10 @@ mod tests {
                 8 => ticket.settle(),
                 _ => unreachable!(),
             }
-            assert!(!segment.record_completed_dialog_result(&before, &successor, now, activity), "scenario {scenario}");
+            assert!(
+                !segment.record_completed_dialog_result(&before, &successor, now, activity),
+                "scenario {scenario}"
+            );
             assert_eq!(segment.completed_return_source(), None);
             assert!(!segment.dialog_closed());
             ticket.revoke();

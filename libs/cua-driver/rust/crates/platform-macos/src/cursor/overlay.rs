@@ -47,8 +47,8 @@ use indexmap::IndexMap;
 mod displays;
 mod surfaces;
 mod visibility;
-pub(crate) use surfaces::is_owned_cursor_window;
 use displays::{DisplayGeometry, DisplayLayout};
+pub(crate) use surfaces::is_owned_cursor_window;
 use visibility::{Rect, WindowClips};
 
 // ── Arrival-signal channels (one waiter slot per cursor key) ──────────────

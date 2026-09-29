@@ -14,9 +14,9 @@ use cua_driver_core::background_input::{
 use std::collections::{HashMap, HashSet};
 
 use super::bindings::{
-    ax_get_window_id, copy_bool_attr, focused_element_of_pid,
-    kAXErrorAttributeUnsupported, kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr,
-    AXError, AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
+    ax_get_window_id, copy_bool_attr, focused_element_of_pid, kAXErrorAttributeUnsupported,
+    kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr, AXError,
+    AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use crate::windows::all_automation_windows;
 
@@ -152,7 +152,9 @@ unsafe fn ax_window_records(
 ) -> (Vec<AxWindowRecord>, Option<u32>) {
     let snapshot = try_copy_ax_windows(app).ok();
     let complete = snapshot.as_ref().is_some_and(|snapshot| snapshot.complete);
-    let mut records: Vec<_> = snapshot.map(|snapshot| snapshot.windows).unwrap_or_default()
+    let mut records: Vec<_> = snapshot
+        .map(|snapshot| snapshot.windows)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|window| {
             let record = ax_get_window_id(window).map(|window_id| AxWindowRecord {
@@ -173,7 +175,9 @@ unsafe fn ax_window_records(
                     // A missing ordinary window inventory cannot grant new
                     // pointer or PID-keyboard authority via this supplement.
                     // Exact semantic AX remains available with its own proof.
-                    minimized: complete.then(|| background_window_minimized(pid, id, panel)).flatten(),
+                    minimized: complete
+                        .then(|| background_window_minimized(pid, id, panel))
+                        .flatten(),
                 });
             }
         }
@@ -303,10 +307,15 @@ pub(crate) fn gather_ax_window_lifecycle_evidence(
                 AxWindowSnapshot { records, complete }
             });
             if let Some(snapshot) = records.as_mut() {
-                if window_ids.iter().any(|id| !snapshot.records.iter().any(|r| r.window_id == *id)) {
+                if window_ids
+                    .iter()
+                    .any(|id| !snapshot.records.iter().any(|r| r.window_id == *id))
+                {
                     if let Some(panel) = super::focused_panel::copy_focused_panel(pid, None) {
                         if let Some(id) = ax_get_window_id(panel) {
-                            if window_ids.contains(&id) && !snapshot.records.iter().any(|r| r.window_id == id) {
+                            if window_ids.contains(&id)
+                                && !snapshot.records.iter().any(|r| r.window_id == id)
+                            {
                                 snapshot.records.push(AxWindowRecord {
                                     window_id: id,
                                     minimized: copy_bool_attr(panel, "AXMinimized"),
@@ -586,8 +595,14 @@ mod tests {
         // proof. It remains a separate keyboard destination, never two copies.
         let rows = [(42, 10), (42, 99), (42, 99)];
         let records = [ax_window(10, Some(false)), ax_window(99, Some(false))];
-        assert_eq!(count_competing_keyboard_destinations(42, 10, rows, &records), 1);
-        assert_eq!(count_competing_keyboard_destinations(42, 99, rows, &records), 1);
+        assert_eq!(
+            count_competing_keyboard_destinations(42, 10, rows, &records),
+            1
+        );
+        assert_eq!(
+            count_competing_keyboard_destinations(42, 99, rows, &records),
+            1
+        );
     }
 
     #[test]

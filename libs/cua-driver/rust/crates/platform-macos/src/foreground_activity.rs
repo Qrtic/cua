@@ -18,10 +18,11 @@ use cua_driver_core::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use foreign_types::ForeignType;
 use std::cell::{Cell, RefCell};
 
-mod segment;
 pub(crate) mod desktop;
+mod segment;
 pub(crate) use segment::{
-    begin_segment, end_segment, prepare_dialog, prepare_observation, stop_runtime_segments, stop_session_segments,
+    begin_segment, end_segment, prepare_dialog, prepare_observation, stop_runtime_segments,
+    stop_session_segments,
 };
 
 fn foreground_writer() -> Arc<tokio::sync::Mutex<()>> {
@@ -60,7 +61,10 @@ pub(crate) fn guard_tool(inner: Box<dyn Tool>) -> Box<dyn Tool> {
             "type": "string", "minLength": 1, "maxLength": 128,
             "description": "Private native foreground segment token; requires the same canonical transport, session, runtime and exact PID/window that began it."
         });
-        if matches!(inner.def().name.as_str(), "click" | "drag" | "press_key" | "hotkey") {
+        if matches!(
+            inner.def().name.as_str(),
+            "click" | "drag" | "press_key" | "hotkey"
+        ) {
             def.input_schema["properties"]["desktop_observation_id"] = serde_json::json!({
                 "type": "string", "minLength": 1, "maxLength": 128,
                 "description": "One-use native desktop observation binding; required for explicit desktop input with the same canonical owner."
@@ -98,8 +102,12 @@ struct InvocationContext {
 impl InvocationContext {
     fn mark_cleanup_unknown(&self) {
         self.cleanup_unconfirmed.store(true, Ordering::Release);
-        if let Some(authority) = &self._desktop_authority { authority.cleanup_unknown(); }
-        if let Some(call) = &self.segment_call { call.cleanup_unknown(); }
+        if let Some(authority) = &self._desktop_authority {
+            authority.cleanup_unknown();
+        }
+        if let Some(call) = &self.segment_call {
+            call.cleanup_unknown();
+        }
     }
 
     fn mark_interrupted(&self, cause: &'static str) {
@@ -213,7 +221,9 @@ impl InvocationContext {
         {
             if let Some(call) = &self.segment_call {
                 call.settle();
-                if call.cleanup_is_unknown() { self.mark_cleanup_unknown(); }
+                if call.cleanup_is_unknown() {
+                    self.mark_cleanup_unknown();
+                }
             }
         }
     }
@@ -430,8 +440,10 @@ pub(crate) fn mark_native_cleanup_unconfirmed() {
 }
 
 fn poison_current_desktop_authority() {
-    if let Some(authority) = current_invocation().and_then(|context| context._desktop_authority.clone())
-        .or_else(cua_driver_core::desktop_authority::current) {
+    if let Some(authority) = current_invocation()
+        .and_then(|context| context._desktop_authority.clone())
+        .or_else(cua_driver_core::desktop_authority::current)
+    {
         authority.cleanup_unknown();
     }
 }
@@ -520,17 +532,24 @@ impl Tool for ActivityGuardedTool {
             .await
     }
     async fn invoke(&self, args: serde_json::Value) -> cua_driver_core::protocol::ToolResult {
-        let desktop_requested = args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop");
+        let desktop_requested =
+            args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop");
         if !desktop_requested && args.get("desktop_observation_id").is_some() {
             return cua_driver_core::protocol::ToolResult::error("A desktop binding cannot authorize app input")
                 .with_structured(serde_json::json!({"code":"desktop_target_invalid", "effect":"refused", "retryable":false}));
         }
-        let desktop = if desktop_requested && matches!(self.def().name.as_str(), "click" | "drag" | "press_key" | "hotkey") {
+        let desktop = if desktop_requested
+            && matches!(
+                self.def().name.as_str(),
+                "click" | "drag" | "press_key" | "hotkey"
+            ) {
             match desktop::admit(&args, &self.def().name) {
                 Ok(admission) => Some(admission),
                 Err(refusal) => return refusal,
             }
-        } else { None };
+        } else {
+            None
+        };
         let segment_call = match segment::admit_call(&args, &self.def().name) {
             Ok(call) => call,
             Err(result) => return result,
@@ -550,11 +569,12 @@ impl Tool for ActivityGuardedTool {
             return self.inner.invoke(args).await;
         }
         let unsupported = matches!(self.def().name.as_str(), "bring_to_front" | "invoke_menu")
-            || (desktop.is_none() && args
-                .get("scope")
-                .or_else(|| args.get("capture_scope"))
-                .and_then(serde_json::Value::as_str)
-                == Some("desktop"));
+            || (desktop.is_none()
+                && args
+                    .get("scope")
+                    .or_else(|| args.get("capture_scope"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("desktop"));
         let activity = snapshot();
         if unsupported || !activity.reliable {
             if let Some(call) = &segment_call {
@@ -567,11 +587,12 @@ impl Tool for ActivityGuardedTool {
                 "Native activity coverage or a bounded foreground episode is unavailable; no input was dispatched.",
             );
         }
-        let foreground = desktop.is_some() || crate::tools::DeliveryMode::parse(
-            args.get("delivery_mode")
-                .and_then(serde_json::Value::as_str),
-        )
-        .is_foreground();
+        let foreground = desktop.is_some()
+            || crate::tools::DeliveryMode::parse(
+                args.get("delivery_mode")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .is_foreground();
         let session_id = args
             .get("_session_id")
             .and_then(serde_json::Value::as_str)
@@ -858,10 +879,8 @@ impl Episode {
                         crate::windows::WindowOwner::SamePid
                     ))
             {
-                let source_window = owned_return_source_window_with_retained(
-                    self.lease.pid,
-                    self.lease.window,
-                );
+                let source_window =
+                    owned_return_source_window_with_retained(self.lease.pid, self.lease.window);
                 let Some(source_window) = source_window.filter(|_| {
                     matches!(
                         crate::windows::resolve_window_owner(pid, window),
@@ -910,13 +929,19 @@ impl Episode {
     /// verified successful presentation may retain focus; failures use the
     /// existing guarded restoration path, and interruption never restores.
     pub(crate) fn finish_presenting<T>(self, result: anyhow::Result<T>) -> anyhow::Result<T> {
-        if result.is_err() { return self.finish(result); }
+        if result.is_err() {
+            return self.finish(result);
+        }
         if self.segment.is_some() || !PRESSED.with(|held| held.borrow().is_empty()) {
-            return self.finish(Err(anyhow::anyhow!("presentation cannot retain a segment or held input")));
+            return self.finish(Err(anyhow::anyhow!(
+                "presentation cannot retain a segment or held input"
+            )));
         }
         self.check()?;
         if !exact_target_is_frontmost(self.lease) {
-            return self.finish(Err(anyhow::anyhow!("presentation target lost exact foreground ownership")));
+            return self.finish(Err(anyhow::anyhow!(
+                "presentation target lost exact foreground ownership"
+            )));
         }
         result
     }
@@ -927,7 +952,9 @@ fn unconfirmed_episode_restoration<T>(
     reason: &'static str,
 ) -> anyhow::Result<T> {
     if let Some(context) = current_invocation() {
-        context.restoration_unconfirmed.store(true, Ordering::Release);
+        context
+            .restoration_unconfirmed
+            .store(true, Ordering::Release);
     }
     let message = format!("foreground_restore_unconfirmed: owned input settled; {reason}");
     match result {
@@ -985,7 +1012,10 @@ fn owned_return_source_window(assisted_pid: i32) -> Option<u32> {
     owned_return_source_window_with_retained(assisted_pid, 0)
 }
 
-fn owned_return_source_window_with_retained(assisted_pid: i32, retained_window: u32) -> Option<u32> {
+fn owned_return_source_window_with_retained(
+    assisted_pid: i32,
+    retained_window: u32,
+) -> Option<u32> {
     let front_pid = crate::apps::frontmost_pid();
     if front_pid != Some(assisted_pid) {
         tracing::debug!(target: "cua_focus_restore", assisted_pid, ?front_pid,
@@ -1350,7 +1380,8 @@ pub(crate) fn capture_restore(pid: i32) -> Option<RestoreEvidence> {
 fn background_restore_evidence_current(evidence: RestoreEvidence, expected_pid: i32) -> bool {
     let current = snapshot();
     expected_pid == evidence.pid
-        && current.reliable && current.generation == evidence.generation
+        && current.reliable
+        && current.generation == evidence.generation
         && matches!(
             crate::windows::resolve_window_owner(evidence.pid, evidence.window),
             crate::windows::WindowOwner::SamePid
@@ -1379,19 +1410,29 @@ pub(crate) fn complete_background_focus(
     expected_pid: i32,
     mut check_lease: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    crate::input::skylight::complete_exact_window_restore_guarded(evidence.pid, evidence.window, || {
-        check_lease()?;
-        if !background_restore_evidence_current(evidence, expected_pid) {
-            anyhow::bail!("background restoration activity or exact window evidence was revoked");
-        }
-        check_lease()
-    })
+    crate::input::skylight::complete_exact_window_restore_guarded(
+        evidence.pid,
+        evidence.window,
+        || {
+            check_lease()?;
+            if !background_restore_evidence_current(evidence, expected_pid) {
+                anyhow::bail!(
+                    "background restoration activity or exact window evidence was revoked"
+                );
+            }
+            check_lease()
+        },
+    )
 }
 
 #[cfg(test)]
 impl RestoreEvidence {
     pub(crate) fn for_test(pid: i32, window: u32, generation: u64) -> Self {
-        Self { pid, window, generation }
+        Self {
+            pid,
+            window,
+            generation,
+        }
     }
 }
 
@@ -1672,7 +1713,13 @@ fn environment_is_reliable() -> bool {
         && unsafe { CGPreflightListenEventAccess() && !IsSecureEventInputEnabled() }
 }
 
-fn record_native_activity(state: &mut Activity, now_ms: u64, kind: u32, flags: u64, source: Source) {
+fn record_native_activity(
+    state: &mut Activity,
+    now_ms: u64,
+    kind: u32,
+    flags: u64,
+    source: Source,
+) {
     // NonCoalesced is a delivery property, not a held modifier. Any other flag
     // or event kind keeps the conservative interaction veto. In particular,
     // MouseDragged and a modified MouseMoved are never treated as plain motion.
@@ -1922,13 +1969,15 @@ fn start_monitor() {
                     let mask = events
                         .iter()
                         .fold(0_u64, |mask, event| mask | (1_u64 << *event as u32));
-                    let port =
-                        unsafe { CGEventTapCreate(1, 0, 1, mask, observe_event, std::ptr::null_mut()) };
+                    let port = unsafe {
+                        CGEventTapCreate(1, 0, 1, mask, observe_event, std::ptr::null_mut())
+                    };
                     if port.is_null() {
                         return;
                     }
-                    let tap =
-                        unsafe { core_foundation::mach_port::CFMachPort::wrap_under_create_rule(port) };
+                    let tap = unsafe {
+                        core_foundation::mach_port::CFMachPort::wrap_under_create_rule(port)
+                    };
                     let Ok(source) = tap.create_runloop_source(0) else {
                         unsafe {
                             core_foundation::mach_port::CFMachPortInvalidate(port);
@@ -2083,14 +2132,40 @@ mod external_event_diagnostic_tests {
     #[test]
     fn target_hint_reads_are_bounded_and_exclude_mouse_fields_on_other_events() {
         let activity = covered().ordering_snapshot(5_000);
-        for kind in [1, 2, 3, 4, 5, 6, 7, 22, 25, 26, 27, 0, 10, 11, 12, 23, 24, u32::MAX] {
+        for kind in [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            22,
+            25,
+            26,
+            27,
+            0,
+            10,
+            11,
+            12,
+            23,
+            24,
+            u32::MAX,
+        ] {
             let mut reads = Vec::new();
             let hints = EventTargetHints::capture(kind, activity, |field| {
                 reads.push(field);
                 i64::from(field)
             });
             let pointer = matches!(kind, 1..=7 | 22 | 25..=27);
-            assert_eq!(reads, if pointer { vec![39, 40, 45, 91, 92] } else { vec![39, 40, 45] });
+            assert_eq!(
+                reads,
+                if pointer {
+                    vec![39, 40, 45, 91, 92]
+                } else {
+                    vec![39, 40, 45]
+                }
+            );
             assert_eq!(hints.window_under_pointer_raw, pointer.then_some(91));
             assert_eq!(hints.window_that_can_handle_raw, pointer.then_some(92));
         }
@@ -2103,16 +2178,24 @@ mod external_event_diagnostic_tests {
         event.target_hints = Some(EventTargetHints::capture(
             10,
             covered().ordering_snapshot(5_000),
-            |field| match field { 39 => i64::MAX, 40 => 0, 45 => -1, _ => panic!("unexpected field") },
+            |field| match field {
+                39 => i64::MAX,
+                40 => 0,
+                45 => -1,
+                _ => panic!("unexpected field"),
+            },
         ));
         assert_eq!(event.diagnostic(110), existing);
         let internal = event.ordering_diagnostic(110);
         assert_eq!(internal.as_object().unwrap().len(), 5);
-        assert_eq!(internal["session_tap_target_hints"], serde_json::json!({
-            "target_psn_raw": i64::MAX, "target_pid_raw": 0, "source_state_raw": -1,
-            "window_under_pointer_raw": null, "window_that_can_handle_raw": null,
-            "generation_after_event": 0, "non_motion_generation_after_event": 0,
-        }));
+        assert_eq!(
+            internal["session_tap_target_hints"],
+            serde_json::json!({
+                "target_psn_raw": i64::MAX, "target_pid_raw": 0, "source_state_raw": -1,
+                "window_under_pointer_raw": null, "window_that_can_handle_raw": null,
+                "generation_after_event": 0, "non_motion_generation_after_event": 0,
+            })
+        );
         let hints = EventTargetHints::capture(5, covered().ordering_snapshot(5_000), |_| 0);
         assert_eq!(hints.source_state_raw, 0);
         assert_eq!(hints.window_under_pointer_raw, Some(0));
@@ -2128,23 +2211,38 @@ mod external_event_diagnostic_tests {
         let mut event = ExternalEventEvidence::from_event(5_001, 10, 42, 42, false).unwrap();
         record_native_activity(&mut state, 5_001, 10, 0, Source::Unknown);
         event.target_hints = Some(EventTargetHints::capture(
-            10, state.ordering_snapshot(5_001), |_| 42,
+            10,
+            state.ordering_snapshot(5_001),
+            |_| 42,
         ));
-        assert_eq!(event.target_hints.unwrap().non_motion_generation_after_event, 1);
+        assert_eq!(
+            event
+                .target_hints
+                .unwrap()
+                .non_motion_generation_after_event,
+            1
+        );
         // The single last-event record can later describe only pointer motion.
         let mut latest = ExternalEventEvidence::from_event(5_002, 5, 42, 42, false).unwrap();
         record_native_activity(&mut state, 5_002, 5, 0, Source::Unknown);
         latest.target_hints = Some(EventTargetHints::capture(
-            5, state.ordering_snapshot(5_002), |_| 42,
+            5,
+            state.ordering_snapshot(5_002),
+            |_| 42,
         ));
         let captured = latest.target_hints.unwrap();
         assert_eq!(captured.generation_after_event, 2);
         assert_eq!(captured.non_motion_generation_after_event, 1);
-        assert_ne!(captured.non_motion_generation_after_event, before.non_motion_generation);
+        assert_ne!(
+            captured.non_motion_generation_after_event,
+            before.non_motion_generation
+        );
         assert!(!lease.permits(5_002, state.snapshot(5_002)));
         state.invalidate();
-        assert_ne!(captured.non_motion_generation_after_event,
-            state.ordering_snapshot(5_003).non_motion_generation);
+        assert_ne!(
+            captured.non_motion_generation_after_event,
+            state.ordering_snapshot(5_003).non_motion_generation
+        );
         assert!(!lease.permits(5_003, state.snapshot(5_003)));
     }
 
@@ -2153,7 +2251,12 @@ mod external_event_diagnostic_tests {
         let mut reads = 0;
         let external = ExternalEventEvidence::from_event(100, 5, 42, 42, true).map(|mut event| {
             event.target_hints = Some(EventTargetHints::capture(
-                5, covered().ordering_snapshot(5_000), |_| { reads += 1; 42 },
+                5,
+                covered().ordering_snapshot(5_000),
+                |_| {
+                    reads += 1;
+                    42
+                },
             ));
             event
         });
@@ -2179,7 +2282,13 @@ mod ordering_activity_tests {
         for flags in [0, CGEventFlags::CGEventFlagNonCoalesced.bits()] {
             let mut state = covered();
             let before = state.ordering_snapshot(5_000);
-            record_native_activity(&mut state, 5_001, CGEventType::MouseMoved as u32, flags, Source::Unknown);
+            record_native_activity(
+                &mut state,
+                5_001,
+                CGEventType::MouseMoved as u32,
+                flags,
+                Source::Unknown,
+            );
             let after = state.ordering_snapshot(5_001);
             assert_eq!(after.non_motion_generation, before.non_motion_generation);
             assert_ne!(after.activity.generation, before.activity.generation);
@@ -2190,24 +2299,49 @@ mod ordering_activity_tests {
     #[test]
     fn every_other_watched_event_or_modified_move_revokes_ordering() {
         use CGEventType::*;
-        for kind in [LeftMouseDown, LeftMouseUp, RightMouseDown, RightMouseUp,
-            LeftMouseDragged, RightMouseDragged, KeyDown, KeyUp, FlagsChanged,
-            ScrollWheel, TabletPointer, TabletProximity, OtherMouseDown, OtherMouseUp,
-            OtherMouseDragged, Null] {
+        for kind in [
+            LeftMouseDown,
+            LeftMouseUp,
+            RightMouseDown,
+            RightMouseUp,
+            LeftMouseDragged,
+            RightMouseDragged,
+            KeyDown,
+            KeyUp,
+            FlagsChanged,
+            ScrollWheel,
+            TabletPointer,
+            TabletProximity,
+            OtherMouseDown,
+            OtherMouseUp,
+            OtherMouseDragged,
+            Null,
+        ] {
             let mut state = covered();
             let before = state.ordering_snapshot(5_000);
             record_native_activity(&mut state, 5_001, kind as u32, 0, Source::Unknown);
             record_native_activity(&mut state, 5_002, MouseMoved as u32, 0, Source::Unknown);
-            assert_ne!(state.ordering_snapshot(5_002).non_motion_generation, before.non_motion_generation,
-                "a later move must not mask {kind:?}");
+            assert_ne!(
+                state.ordering_snapshot(5_002).non_motion_generation,
+                before.non_motion_generation,
+                "a later move must not mask {kind:?}"
+            );
         }
-        for flags in [CGEventFlags::CGEventFlagShift.bits(), CGEventFlags::CGEventFlagCommand.bits(),
-            CGEventFlags::CGEventFlagControl.bits(), CGEventFlags::CGEventFlagAlternate.bits(),
-            CGEventFlags::CGEventFlagSecondaryFn.bits(), 1_u64 << 63] {
+        for flags in [
+            CGEventFlags::CGEventFlagShift.bits(),
+            CGEventFlags::CGEventFlagCommand.bits(),
+            CGEventFlags::CGEventFlagControl.bits(),
+            CGEventFlags::CGEventFlagAlternate.bits(),
+            CGEventFlags::CGEventFlagSecondaryFn.bits(),
+            1_u64 << 63,
+        ] {
             let mut state = covered();
             let before = state.ordering_snapshot(5_000);
             record_native_activity(&mut state, 5_001, MouseMoved as u32, flags, Source::Unknown);
-            assert_ne!(state.ordering_snapshot(5_001).non_motion_generation, before.non_motion_generation);
+            assert_ne!(
+                state.ordering_snapshot(5_001).non_motion_generation,
+                before.non_motion_generation
+            );
         }
     }
 }
@@ -2410,22 +2544,36 @@ mod episode_lifecycle_tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let dispatch = tokio::spawn(async move {
-            let _cancel = CancelInvocation { context: Arc::clone(&context), completed: false };
-            INVOCATION.scope(context, async move {
-                spawn_blocking(move || {
-                    started_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                }).await.unwrap();
-            }).await;
+            let _cancel = CancelInvocation {
+                context: Arc::clone(&context),
+                completed: false,
+            };
+            INVOCATION
+                .scope(context, async move {
+                    spawn_blocking(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    })
+                    .await
+                    .unwrap();
+                })
+                .await;
         });
         started_rx.await.unwrap();
         dispatch.abort();
         let _ = dispatch.await;
         let capture = authority.acquire(false);
         tokio::pin!(capture);
-        assert!(tokio::time::timeout(Duration::from_millis(10), &mut capture).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut capture)
+                .await
+                .is_err()
+        );
         release_tx.send(()).unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(1), capture).await.unwrap().is_ok());
+        assert!(tokio::time::timeout(Duration::from_secs(1), capture)
+            .await
+            .unwrap()
+            .is_ok());
     }
 
     #[tokio::test]
@@ -2434,9 +2582,13 @@ mod episode_lifecycle_tests {
         let lease = authority.acquire(true).await.unwrap();
         let mut context = context();
         Arc::get_mut(&mut context).unwrap()._desktop_authority = Some(lease);
-        INVOCATION.scope(context, async {
-            spawn_blocking(mark_native_cleanup_unconfirmed).await.unwrap();
-        }).await;
+        INVOCATION
+            .scope(context, async {
+                spawn_blocking(mark_native_cleanup_unconfirmed)
+                    .await
+                    .unwrap();
+            })
+            .await;
         assert!(authority.acquire(false).await.is_err());
         assert!(authority.acquire(true).await.is_err());
     }
@@ -2444,7 +2596,9 @@ mod episode_lifecycle_tests {
     #[test]
     fn settled_input_with_unconfirmed_return_is_not_reported_as_dispatch_success() {
         let context = context();
-        context.restoration_unconfirmed.store(true, Ordering::Release);
+        context
+            .restoration_unconfirmed
+            .store(true, Ordering::Release);
         let mut result = cua_driver_core::protocol::ToolResult::text("input completed")
             .with_structured(serde_json::json!({"effect": "confirmed", "verified": true}));
         context.project_native_result(&mut result);
@@ -2466,9 +2620,13 @@ mod episode_lifecycle_tests {
     fn restoration_diagnostic_does_not_mask_unsettled_input_or_interruption() {
         for cleanup in [false, true] {
             let context = context();
-            context.restoration_unconfirmed.store(true, Ordering::Release);
+            context
+                .restoration_unconfirmed
+                .store(true, Ordering::Release);
             context.interrupted.store(true, Ordering::Release);
-            context.cleanup_unconfirmed.store(cleanup, Ordering::Release);
+            context
+                .cleanup_unconfirmed
+                .store(cleanup, Ordering::Release);
             let mut result = cua_driver_core::protocol::ToolResult::text("input completed");
             context.project_native_result(&mut result);
             assert_eq!(

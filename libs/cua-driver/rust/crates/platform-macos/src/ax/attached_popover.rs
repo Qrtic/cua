@@ -12,10 +12,9 @@
 //! Keep physical window identities intact for pointer and keyboard routing.
 
 use super::bindings::{
-    ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorNoValue, kAXErrorSuccess,
-    AXUIElementGetTypeID,
-    AXUIElementCopyAttributeValue, AXUIElementGetPid, AXUIElementRef,
-    AXUIElementSetMessagingTimeout, _AXUIElementGetWindow,
+    _AXUIElementGetWindow, ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorNoValue,
+    kAXErrorSuccess, AXUIElementCopyAttributeValue, AXUIElementGetPid, AXUIElementGetTypeID,
+    AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use core_foundation::{
     array::CFArray,
@@ -68,7 +67,10 @@ fn container_role(role: &str) -> bool {
 // These are host-side anchors, never controls or an expanded path inside a
 // popover. They require the exact host's logical and physical identity below.
 fn host_collection_role(role: &str) -> bool {
-    matches!(role, "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea" | "AXTabGroup")
+    matches!(
+        role,
+        "AXCell" | "AXRow" | "AXOutline" | "AXLayoutArea" | "AXTabGroup"
+    )
 }
 
 // Only literal inner structural roles are candidates. Neither missing AXRole
@@ -85,7 +87,11 @@ enum ControlWindow<N> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControlWindowKind { Present, NoValue, Unavailable }
+enum ControlWindowKind {
+    Present,
+    NoValue,
+    Unavailable,
+}
 
 fn control_window_kind(error: i32, value_present: bool, is_element: bool) -> ControlWindowKind {
     match (error, value_present, is_element) {
@@ -99,7 +105,11 @@ fn control_window_kind(error: i32, value_present: bool, is_element: bool) -> Con
 // observed unmapped result is usable only inside the strict NoValue semantic
 // proof; it cannot authorize pointer or process-keyboard routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControlPhysicalWindow { Mapped(u32), IllegalArgumentZero, Unavailable }
+enum ControlPhysicalWindow {
+    Mapped(u32),
+    IllegalArgumentZero,
+    Unavailable,
+}
 
 fn control_physical_window(error: i32, id: u32) -> ControlPhysicalWindow {
     match (error, id) {
@@ -120,17 +130,22 @@ trait PopoverTree {
     fn owner(&self, node: &Self::Node) -> Option<i32>;
     fn window(&self, node: &Self::Node) -> Option<Self::Node>;
     fn control_window(&self, node: &Self::Node) -> ControlWindow<Self::Node> {
-        self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present)
+        self.window(node)
+            .map_or(ControlWindow::Unavailable, ControlWindow::Present)
     }
     fn window_id(&self, node: &Self::Node) -> Option<u32>;
     fn control_physical(&self, node: &Self::Node) -> ControlPhysicalWindow {
-        self.window_id(node).filter(|id| *id != 0)
-            .map_or(ControlPhysicalWindow::Unavailable, ControlPhysicalWindow::Mapped)
+        self.window_id(node).filter(|id| *id != 0).map_or(
+            ControlPhysicalWindow::Unavailable,
+            ControlPhysicalWindow::Mapped,
+        )
     }
     fn parent(&self, node: &Self::Node) -> Option<Self::Node>;
     fn contains_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
     fn contains_unique_child(&self, parent: &Self::Node, child: &Self::Node) -> bool;
-    fn virtual_button_child(&self, _parent: &Self::Node, _child: &Self::Node) -> bool { false }
+    fn virtual_button_child(&self, _parent: &Self::Node, _child: &Self::Node) -> bool {
+        false
+    }
     fn same(&self, left: &Self::Node, right: &Self::Node) -> bool;
     fn within_budget(&self) -> bool;
     fn visible_menu_window(&self, node: &Self::Node, pid: i32) -> Option<u32>;
@@ -157,8 +172,12 @@ fn revalidate_host_collection<T: PopoverTree>(
             || tree.owner(node) != Some(pid)
             || tree.role(node).as_deref() != Some(role.as_str())
             || tree.window_id(node) != Some(if index == 0 { popover_id } else { host_id })
-            || !tree.window(node).is_some_and(|window| tree.same(&window, host))
-            || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
+            || !tree
+                .window(node)
+                .is_some_and(|window| tree.same(&window, host))
+            || !tree
+                .parent(node)
+                .is_some_and(|live| tree.same(&live, parent))
             || !tree.contains_unique_child(parent, node)
             || !tree.within_budget()
         {
@@ -192,18 +211,25 @@ fn revalidate_inner_structure<T: PopoverTree>(
         if !tree.within_budget()
             || tree.owner(node) != Some(pid)
             || tree.role(node).as_deref() != Some(role.as_str())
-            || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
+            || !tree
+                .parent(node)
+                .is_some_and(|live| tree.same(&live, parent))
             || !tree.contains_unique_child(parent, node)
         {
             return false;
         }
         if inner_structural_role(role) {
-            let Some((_, window)) = structural_windows.iter().find(|(inner, _)| tree.same(inner, node)) else {
+            let Some((_, window)) = structural_windows
+                .iter()
+                .find(|(inner, _)| tree.same(inner, node))
+            else {
                 return false;
             };
             if tree.owner(window) != Some(pid)
                 || tree.window_id(node) != Some(popover_id)
-                || !tree.window(node).is_some_and(|live| tree.same(&live, window))
+                || !tree
+                    .window(node)
+                    .is_some_and(|live| tree.same(&live, window))
             {
                 return false;
             }
@@ -220,9 +246,16 @@ fn revalidate_inner_structure<T: PopoverTree>(
 /// node has a positive logical window and the phase's exact physical ID.
 /// The direct control may instead retain the exact unmapped SPI result.
 fn revalidate_no_value_path<T: PopoverTree>(
-    tree: &T, pid: i32, host_id: u32, popover_id: u32,
-    popover: &T::Node, host: &T::Node, host_role: &str,
-    nodes: &[T::Node], roles: &[String], windows: &[Option<T::Node>],
+    tree: &T,
+    pid: i32,
+    host_id: u32,
+    popover_id: u32,
+    popover: &T::Node,
+    host: &T::Node,
+    host_role: &str,
+    nodes: &[T::Node],
+    roles: &[String],
+    windows: &[Option<T::Node>],
     control_physical: ControlPhysicalWindow,
 ) -> bool {
     if nodes.is_empty() || nodes.len() != roles.len() || nodes.len() != windows.len() {
@@ -240,23 +273,32 @@ fn revalidate_no_value_path<T: PopoverTree>(
                 !control_physical_matches(control_physical, popover_id)
                     || tree.control_physical(node) != control_physical
             } else {
-                tree.window_id(node) != Some(if index <= popup_index { popover_id } else { host_id })
+                tree.window_id(node)
+                    != Some(if index <= popup_index {
+                        popover_id
+                    } else {
+                        host_id
+                    })
             }
-            || !tree.parent(node).is_some_and(|live| tree.same(&live, parent))
+            || !tree
+                .parent(node)
+                .is_some_and(|live| tree.same(&live, parent))
             || !tree.contains_unique_child(parent, node)
         {
             return false;
         }
         let window_unchanged = if index == 0 {
-            windows[index].is_none()
-                && matches!(tree.control_window(node), ControlWindow::NoValue)
+            windows[index].is_none() && matches!(tree.control_window(node), ControlWindow::NoValue)
         } else {
             windows[index].as_ref().is_some_and(|window| {
-                tree.window(node).is_some_and(|live| tree.same(&live, window))
+                tree.window(node)
+                    .is_some_and(|live| tree.same(&live, window))
                     && tree.owner(window) == Some(pid)
             })
         };
-        if !window_unchanged || !tree.within_budget() { return false; }
+        if !window_unchanged || !tree.within_budget() {
+            return false;
+        }
     }
     tree.within_budget()
         && tree.owner(host) == Some(pid)
@@ -410,7 +452,10 @@ fn prove_checked<T: PopoverTree>(
     let mut no_value_role = None;
     let popover = if is_popover_root {
         element.clone()
-    } else if let Some(role) = tree.role(control).filter(|role| native_control_role(Some(role.as_str()))) {
+    } else if let Some(role) = tree
+        .role(control)
+        .filter(|role| native_control_role(Some(role.as_str())))
+    {
         match tree.control_window(control) {
             ControlWindow::Present(window) => {
                 let popover = match tree.role(&window).as_deref() {
@@ -499,18 +544,34 @@ fn prove_checked<T: PopoverTree>(
         if tree.same(&current, &host) {
             if no_value_control {
                 let roles = [inner_roles, host_roles].concat();
-                return (crossed_popover && revalidate_no_value_path(
-                    tree, pid, host_id, popover_id, &popover, &host,
-                    host_role.as_deref().expect("accepted host role"),
-                    &visited, &roles, &no_value_windows, no_value_physical,
-                )).then_some(()).ok_or("no_value_attachment_changed");
+                return (crossed_popover
+                    && revalidate_no_value_path(
+                        tree,
+                        pid,
+                        host_id,
+                        popover_id,
+                        &popover,
+                        &host,
+                        host_role.as_deref().expect("accepted host role"),
+                        &visited,
+                        &roles,
+                        &no_value_windows,
+                        no_value_physical,
+                    ))
+                .then_some(())
+                .ok_or("no_value_attachment_changed");
             }
             // Re-read the attachment after traversal; an old AXParent alone
             // must not authorize a closed or reattached panel.
             let unchanged = (structural_windows.is_empty()
                 || revalidate_inner_structure(
-                    tree, pid, popover_id, &popover,
-                    &visited[..host_segment_start], &inner_roles, &structural_windows,
+                    tree,
+                    pid,
+                    popover_id,
+                    &popover,
+                    &visited[..host_segment_start],
+                    &inner_roles,
+                    &structural_windows,
                 ))
                 && crossed_popover
                 && tree.window_id(&current) == Some(host_id)
@@ -572,11 +633,15 @@ fn prove_checked<T: PopoverTree>(
             } else {
                 tree.window_id(&current) == Some(if crossed_popover { host_id } else { popover_id })
             };
-            if !physical_matches { return Err("no_value_node_identity_missing"); }
+            if !physical_matches {
+                return Err("no_value_node_identity_missing");
+            }
             if tree.same(&current, control) {
                 None
             } else {
-                let window = tree.window(&current).ok_or("no_value_ancestor_window_missing")?;
+                let window = tree
+                    .window(&current)
+                    .ok_or("no_value_ancestor_window_missing")?;
                 let logical_matches = if crossed_popover || tree.same(&current, &popover) {
                     tree.same(&window, &host)
                 } else {
@@ -587,14 +652,18 @@ fn prove_checked<T: PopoverTree>(
                 }
                 Some(window)
             }
-        } else { None };
+        } else {
+            None
+        };
         match role.as_deref() {
             Some("AXPopover") if tree.same(&current, &popover) && !crossed_popover => {
                 crossed_popover = true;
                 host_segment_start = visited.len();
             }
             Some(role) if !crossed_popover && inner_structural_role(role) => {
-                let window = strict_window.clone().or_else(|| tree.window(&current))
+                let window = strict_window
+                    .clone()
+                    .or_else(|| tree.window(&current))
                     .ok_or("inner_list_window_missing")?;
                 if tree.owner(&window) != Some(pid)
                     || tree.window_id(&current) != Some(popover_id)
@@ -607,7 +676,9 @@ fn prove_checked<T: PopoverTree>(
             }
             Some(role) if crossed_popover && host_collection_role(role) => {
                 if tree.window_id(&current) != Some(host_id)
-                    || !strict_window.clone().or_else(|| tree.window(&current))
+                    || !strict_window
+                        .clone()
+                        .or_else(|| tree.window(&current))
                         .is_some_and(|window| tree.same(&window, &host))
                     || !tree.within_budget()
                 {
@@ -647,7 +718,9 @@ fn prove_checked<T: PopoverTree>(
         } else {
             inner_roles.push(role.expect("accepted role"));
         }
-        if no_value_control { no_value_windows.push(strict_window); }
+        if no_value_control {
+            no_value_windows.push(strict_window);
+        }
         visited.push(current);
         current = parent;
     }
@@ -731,7 +804,9 @@ impl PopoverTree for NativeTree {
     }
     fn control_window(&self, node: &AxNode) -> ControlWindow<AxNode> {
         if !self.allow_control_no_value {
-            return self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present);
+            return self
+                .window(node)
+                .map_or(ControlWindow::Unavailable, ControlWindow::Present);
         }
         // One AXWindow query, as on the existing successful path. Preserve the
         // raw status here: the legacy Option intentionally merges missing and
@@ -739,7 +814,8 @@ impl PopoverTree for NativeTree {
         unsafe {
             let attr = CFString::new("AXWindow");
             let mut value: CFTypeRef = std::ptr::null();
-            let error = AXUIElementCopyAttributeValue(node.0, attr.as_concrete_TypeRef(), &mut value);
+            let error =
+                AXUIElementCopyAttributeValue(node.0, attr.as_concrete_TypeRef(), &mut value);
             let types = (error == kAXErrorSuccess && !value.is_null())
                 .then(|| (CFGetTypeID(value), AXUIElementGetTypeID()));
             match control_window_kind(error, !value.is_null(), types.is_some_and(|(a, b)| a == b)) {
@@ -751,9 +827,14 @@ impl PopoverTree for NativeTree {
                         actual_type_id = ?types.map(|(actual, _)| actual),
                         expected_type_id = ?types.map(|(_, expected)| expected),
                         "action control AXWindow unavailable");
-                    if !value.is_null() { CFRelease(value); }
-                    if kind == ControlWindowKind::NoValue { ControlWindow::NoValue }
-                    else { ControlWindow::Unavailable }
+                    if !value.is_null() {
+                        CFRelease(value);
+                    }
+                    if kind == ControlWindowKind::NoValue {
+                        ControlWindow::NoValue
+                    } else {
+                        ControlWindow::Unavailable
+                    }
                 }
             }
         }
@@ -807,12 +888,15 @@ impl PopoverTree for NativeTree {
             }
             let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
             children.len() <= MAX_CHILDREN
-                && (0..children.len()).filter(|index| {
-                    CFEqual(
-                        *children.get(*index).expect("bounded index"),
-                        child.0 as CFTypeRef,
-                    ) != 0
-                }).count() == 1
+                && (0..children.len())
+                    .filter(|index| {
+                        CFEqual(
+                            *children.get(*index).expect("bounded index"),
+                            child.0 as CFTypeRef,
+                        ) != 0
+                    })
+                    .count()
+                    == 1
         }
     }
     fn same(&self, left: &AxNode, right: &AxNode) -> bool {
@@ -943,31 +1027,47 @@ unsafe fn native_control_physical(element: AXUIElementRef) -> ControlPhysicalWin
 // This selects the existing semantic gate, not permission to dispatch. Keep
 // ordinary displaced controls first, with no new query on that path.
 fn semantic_popover_candidate(
-    displaced: bool, role: Option<&str>, host_id: u32,
+    displaced: bool,
+    role: Option<&str>,
+    host_id: u32,
     unmapped_no_value: impl FnOnce() -> bool,
     nearest_surface: impl FnOnce() -> Option<u32>,
 ) -> bool {
-    displaced || (native_control_role(role) && unmapped_no_value()
-        && nearest_surface().is_some_and(|id| id != 0 && id != host_id))
+    displaced
+        || (native_control_role(role)
+            && unmapped_no_value()
+            && nearest_surface().is_some_and(|id| id != 0 && id != host_id))
 }
 
 /// Semantic element callers only. Coordinate/foreground/middle/key routes
 /// must keep their original physical classifier. The fresh background gate
 /// and immediate pre-write guard still perform the full retained proof.
 pub(crate) unsafe fn has_semantic_popover_candidate(
-    element: AXUIElementRef, host_id: u32, role: Option<&str>,
+    element: AXUIElementRef,
+    host_id: u32,
+    role: Option<&str>,
 ) -> bool {
-    semantic_popover_candidate(has_displaced_popover_window(element, host_id), role, host_id, || {
-        if native_control_physical(element) != ControlPhysicalWindow::IllegalArgumentZero {
-            return false;
-        }
-        let attr = CFString::new("AXWindow");
-        let mut value: CFTypeRef = std::ptr::null();
-        let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-        let matches = control_window_kind(error, !value.is_null(), false) == ControlWindowKind::NoValue;
-        if !value.is_null() { CFRelease(value); }
-        matches
-    }, || super::element_ancestry::parent_window_id(element))
+    semantic_popover_candidate(
+        has_displaced_popover_window(element, host_id),
+        role,
+        host_id,
+        || {
+            if native_control_physical(element) != ControlPhysicalWindow::IllegalArgumentZero {
+                return false;
+            }
+            let attr = CFString::new("AXWindow");
+            let mut value: CFTypeRef = std::ptr::null();
+            let error =
+                AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+            let matches =
+                control_window_kind(error, !value.is_null(), false) == ControlWindowKind::NoValue;
+            if !value.is_null() {
+                CFRelease(value);
+            }
+            matches
+        },
+        || super::element_ancestry::parent_window_id(element),
+    )
 }
 
 /// # Safety
@@ -1016,22 +1116,40 @@ pub(crate) unsafe fn proves_attached_popover_before(
         return false;
     };
     Instant::now() < deadline
-        && prove(&NativeTree { deadline, allow_control_no_value: false }, pid, host_id, &element)
+        && prove(
+            &NativeTree {
+                deadline,
+                allow_control_no_value: false,
+            },
+            pid,
+            host_id,
+            &element,
+        )
         && Instant::now() < deadline
 }
 
 /// Project a real hit-tested preview control, not the actionless outer tile.
 /// Only an exact displaced popover child is returned; caller must CFRelease.
-pub(crate) unsafe fn copy_virtual_popover_button(wrapper: AXUIElementRef) -> Option<AXUIElementRef> {
+pub(crate) unsafe fn copy_virtual_popover_button(
+    wrapper: AXUIElementRef,
+) -> Option<AXUIElementRef> {
     let mut pid = 0;
-    if AXUIElementGetPid(wrapper, &mut pid) != kAXErrorSuccess || pid <= 0 { return None; }
+    if AXUIElementGetPid(wrapper, &mut pid) != kAXErrorSuccess || pid <= 0 {
+        return None;
+    }
     let host = AxNode::owned(copy_element_attr(wrapper, "AXWindow")?)?;
-    if !matches!(copy_string_attr(host.0, "AXRole").as_deref(), Some("AXWindow" | "AXSheet")) {
+    if !matches!(
+        copy_string_attr(host.0, "AXRole").as_deref(),
+        Some("AXWindow" | "AXSheet")
+    ) {
         return None;
     }
     let host_id = ax_get_window_id(host.0)?;
-    if ax_get_window_id(wrapper)? == host_id { return None; }
-    let child = super::virtual_button::copy_child(wrapper, Instant::now() + Duration::from_millis(750))?;
+    if ax_get_window_id(wrapper)? == host_id {
+        return None;
+    }
+    let child =
+        super::virtual_button::copy_child(wrapper, Instant::now() + Duration::from_millis(750))?;
     if proves_attached_popover(pid, host_id, child) {
         Some(child)
     } else {
@@ -1097,7 +1215,12 @@ mod tests {
         fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
             self.nodes.get(parent).is_some_and(|node| {
                 node.children.len() <= MAX_CHILDREN as usize
-                    && node.children.iter().filter(|candidate| self.same(candidate, child)).count() == 1
+                    && node
+                        .children
+                        .iter()
+                        .filter(|candidate| self.same(candidate, child))
+                        .count()
+                        == 1
             })
         }
         fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
@@ -1173,20 +1296,44 @@ mod tests {
         // Retained live native structure: the collection and layout nodes are
         // outside the popover, with the host's logical and physical identity.
         let roles = [
-            "AXCheckBox", "AXGroup", "AXPopover", "AXGroup", "AXCell", "AXRow",
-            "AXOutline", "AXScrollArea", "AXLayoutArea", "AXSplitGroup", "AXWindow",
+            "AXCheckBox",
+            "AXGroup",
+            "AXPopover",
+            "AXGroup",
+            "AXCell",
+            "AXRow",
+            "AXOutline",
+            "AXScrollArea",
+            "AXLayoutArea",
+            "AXSplitGroup",
+            "AXWindow",
         ];
         let mut tree = pages();
-        tree.nodes = roles.into_iter().enumerate().map(|(index, role)| {
-            let node = index as u32;
-            (node, Node {
-                identity: node, role, owner: 42,
-                window: if node == 0 { Some(2) } else if node < 10 { Some(10) } else { None },
-                id: Some(if node <= 2 { 900 } else { 700 }),
-                parent: (node < 10).then_some(node + 1),
-                children: if node == 0 { vec![] } else { vec![node - 1] },
+        tree.nodes = roles
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let node = index as u32;
+                (
+                    node,
+                    Node {
+                        identity: node,
+                        role,
+                        owner: 42,
+                        window: if node == 0 {
+                            Some(2)
+                        } else if node < 10 {
+                            Some(10)
+                        } else {
+                            None
+                        },
+                        id: Some(if node <= 2 { 900 } else { 700 }),
+                        parent: (node < 10).then_some(node + 1),
+                        children: if node == 0 { vec![] } else { vec![node - 1] },
+                    },
+                )
             })
-        }).collect();
+            .collect();
         tree.budget.set(500);
         tree
     }
@@ -1202,10 +1349,18 @@ mod tests {
     }
     impl ChangingHost {
         fn new(tree: Tree, node: u32, field: &'static str) -> Self {
-            Self { tree, node, field, reads: Cell::new(0), unique_reads: Cell::new(0) }
+            Self {
+                tree,
+                node,
+                field,
+                reads: Cell::new(0),
+                unique_reads: Cell::new(0),
+            }
         }
         fn changed(&self, node: &u32, field: &str) -> bool {
-            if *node != self.node || field != self.field { return false; }
+            if *node != self.node || field != self.field {
+                return false;
+            }
             let reads = self.reads.get();
             self.reads.set(reads + 1);
             reads > 0
@@ -1214,33 +1369,59 @@ mod tests {
     impl PopoverTree for ChangingHost {
         type Node = u32;
         fn role(&self, node: &u32) -> Option<String> {
-            if self.changed(node, "role") { Some("AXGroup".into()) } else { self.tree.role(node) }
+            if self.changed(node, "role") {
+                Some("AXGroup".into())
+            } else {
+                self.tree.role(node)
+            }
         }
         fn owner(&self, node: &u32) -> Option<i32> {
-            if self.changed(node, "owner") { Some(99) } else { self.tree.owner(node) }
+            if self.changed(node, "owner") {
+                Some(99)
+            } else {
+                self.tree.owner(node)
+            }
         }
         fn window(&self, node: &u32) -> Option<u32> {
-            if self.changed(node, "window") { Some(9) } else { self.tree.window(node) }
+            if self.changed(node, "window") {
+                Some(9)
+            } else {
+                self.tree.window(node)
+            }
         }
         fn window_id(&self, node: &u32) -> Option<u32> {
-            if self.changed(node, "id") { Some(701) } else { self.tree.window_id(node) }
+            if self.changed(node, "id") {
+                Some(701)
+            } else {
+                self.tree.window_id(node)
+            }
         }
         fn parent(&self, node: &u32) -> Option<u32> {
-            if self.changed(node, "parent") { None } else { self.tree.parent(node) }
+            if self.changed(node, "parent") {
+                None
+            } else {
+                self.tree.parent(node)
+            }
         }
         fn contains_child(&self, parent: &u32, child: &u32) -> bool {
             !self.changed(parent, "children") && self.tree.contains_child(parent, child)
         }
         fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
             self.unique_reads.set(self.unique_reads.get() + 1);
-            if self.field == "deadline" { self.tree.budget.set(0); }
+            if self.field == "deadline" {
+                self.tree.budget.set(0);
+            }
             !self.changed(parent, "children") && self.tree.contains_unique_child(parent, child)
         }
         fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
             self.tree.virtual_button_child(parent, child)
         }
-        fn same(&self, left: &u32, right: &u32) -> bool { self.tree.same(left, right) }
-        fn within_budget(&self) -> bool { self.tree.within_budget() }
+        fn same(&self, left: &u32, right: &u32) -> bool {
+            self.tree.same(left, right)
+        }
+        fn within_budget(&self) -> bool {
+            self.tree.within_budget()
+        }
         fn visible_menu_window(&self, node: &u32, pid: i32) -> Option<u32> {
             self.tree.visible_menu_window(node, pid)
         }
@@ -1262,33 +1443,60 @@ mod tests {
             tree.nodes.get_mut(&0).unwrap().role = "AXTextField";
             tree.nodes.get_mut(&0).unwrap().window = None;
             tree.budget.set(1000);
-            Self { tree, raw: (kAXErrorNoValue, false, false), late: None,
-                edges: 6, unique_reads: Cell::new(0), control_reads: Cell::new(0),
-                changed_reads: Cell::new(0) }
+            Self {
+                tree,
+                raw: (kAXErrorNoValue, false, false),
+                late: None,
+                edges: 6,
+                unique_reads: Cell::new(0),
+                control_reads: Cell::new(0),
+                changed_reads: Cell::new(0),
+            }
         }
         fn changed(&self, node: u32, field: &str) -> bool {
-            let changed = self.unique_reads.get() >= self.edges
-                && self.late == Some((node, field));
-            if changed { self.changed_reads.set(self.changed_reads.get() + 1); }
+            let changed = self.unique_reads.get() >= self.edges && self.late == Some((node, field));
+            if changed {
+                self.changed_reads.set(self.changed_reads.get() + 1);
+            }
             changed
         }
     }
     impl PopoverTree for NoValueTree {
         type Node = u32;
         fn role(&self, node: &u32) -> Option<String> {
-            if self.changed(*node, "role") { Some("AXWebArea".into()) } else { self.tree.role(node) }
+            if self.changed(*node, "role") {
+                Some("AXWebArea".into())
+            } else {
+                self.tree.role(node)
+            }
         }
         fn owner(&self, node: &u32) -> Option<i32> {
-            if self.changed(*node, "owner") { Some(99) } else { self.tree.owner(node) }
+            if self.changed(*node, "owner") {
+                Some(99)
+            } else {
+                self.tree.owner(node)
+            }
         }
         fn window(&self, node: &u32) -> Option<u32> {
-            if self.changed(*node, "window") { Some(9) } else { self.tree.window(node) }
+            if self.changed(*node, "window") {
+                Some(9)
+            } else {
+                self.tree.window(node)
+            }
         }
         fn control_window(&self, node: &u32) -> ControlWindow<u32> {
-            if *node != 0 { return self.window(node).map_or(ControlWindow::Unavailable, ControlWindow::Present); }
+            if *node != 0 {
+                return self
+                    .window(node)
+                    .map_or(ControlWindow::Unavailable, ControlWindow::Present);
+            }
             self.control_reads.set(self.control_reads.get() + 1);
-            if self.changed(*node, "raw") { return ControlWindow::Unavailable; }
-            if self.changed(*node, "window_present") { return ControlWindow::Present(6); }
+            if self.changed(*node, "raw") {
+                return ControlWindow::Unavailable;
+            }
+            if self.changed(*node, "window_present") {
+                return ControlWindow::Present(6);
+            }
             match control_window_kind(self.raw.0, self.raw.1, self.raw.2) {
                 ControlWindowKind::NoValue => ControlWindow::NoValue,
                 ControlWindowKind::Present => ControlWindow::Present(6),
@@ -1296,10 +1504,18 @@ mod tests {
             }
         }
         fn window_id(&self, node: &u32) -> Option<u32> {
-            if self.changed(*node, "id") { None } else { self.tree.window_id(node) }
+            if self.changed(*node, "id") {
+                None
+            } else {
+                self.tree.window_id(node)
+            }
         }
         fn parent(&self, node: &u32) -> Option<u32> {
-            if self.changed(*node, "parent") { None } else { self.tree.parent(node) }
+            if self.changed(*node, "parent") {
+                None
+            } else {
+                self.tree.parent(node)
+            }
         }
         fn contains_child(&self, parent: &u32, child: &u32) -> bool {
             self.tree.contains_child(parent, child)
@@ -1312,7 +1528,9 @@ mod tests {
         fn virtual_button_child(&self, parent: &u32, child: &u32) -> bool {
             self.tree.virtual_button_child(parent, child)
         }
-        fn same(&self, a: &u32, b: &u32) -> bool { self.tree.same(a, b) }
+        fn same(&self, a: &u32, b: &u32) -> bool {
+            self.tree.same(a, b)
+        }
         fn within_budget(&self) -> bool {
             !self.changed(0, "deadline") && self.tree.within_budget()
         }
@@ -1323,16 +1541,37 @@ mod tests {
 
     #[test]
     fn no_value_control_requires_exact_raw_error_and_null() {
-        assert_eq!(control_window_kind(kAXErrorNoValue, false, false), ControlWindowKind::NoValue);
-        assert_eq!(control_window_kind(kAXErrorSuccess, true, true), ControlWindowKind::Present);
-        for raw in [(kAXErrorNoValue, true, true), (kAXErrorSuccess, false, false),
-            (kAXErrorSuccess, true, false), (-25204, false, false), (-25202, false, false),
-            (-25201, true, true)] {
-            assert_eq!(control_window_kind(raw.0, raw.1, raw.2), ControlWindowKind::Unavailable);
+        assert_eq!(
+            control_window_kind(kAXErrorNoValue, false, false),
+            ControlWindowKind::NoValue
+        );
+        assert_eq!(
+            control_window_kind(kAXErrorSuccess, true, true),
+            ControlWindowKind::Present
+        );
+        for raw in [
+            (kAXErrorNoValue, true, true),
+            (kAXErrorSuccess, false, false),
+            (kAXErrorSuccess, true, false),
+            (-25204, false, false),
+            (-25202, false, false),
+            (-25201, true, true),
+        ] {
+            assert_eq!(
+                control_window_kind(raw.0, raw.1, raw.2),
+                ControlWindowKind::Unavailable
+            );
             let mut tree = NoValueTree::new(wrapped_toolbar_popover());
             tree.raw = raw;
-            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("element_window_missing"));
-            assert_eq!(tree.unique_reads.get(), 0, "raw failure must not enter alternative proof");
+            assert_eq!(
+                prove_checked(&tree, 42, 700, &0),
+                Err("element_window_missing")
+            );
+            assert_eq!(
+                tree.unique_reads.get(),
+                0,
+                "raw failure must not enter alternative proof"
+            );
         }
     }
 
@@ -1340,7 +1579,9 @@ mod tests {
     fn no_value_native_field_proves_complete_retained_toolbar_path_twice() {
         for sheet in [false, true] {
             let mut tree = NoValueTree::new(wrapped_toolbar_popover());
-            if sheet { tree.tree.nodes.get_mut(&6).unwrap().role = "AXSheet"; }
+            if sheet {
+                tree.tree.nodes.get_mut(&6).unwrap().role = "AXSheet";
+            }
             assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
             assert_eq!(tree.control_reads.get(), 2);
             assert_eq!(tree.unique_reads.get(), 12, "six actual edges on each pass");
@@ -1354,11 +1595,18 @@ mod tests {
         direct.tree.nodes.get_mut(&6).unwrap().children = vec![4];
         direct.edges = 3;
         assert_eq!(prove_checked(&direct, 42, 700, &0), Ok(()));
-        assert_eq!(direct.unique_reads.get(), 6, "direct field/popover/toolbar/host path");
+        assert_eq!(
+            direct.unique_reads.get(),
+            6,
+            "direct field/popover/toolbar/host path"
+        );
         let mut legacy = wrapped_toolbar_popover();
         legacy.nodes.get_mut(&0).unwrap().window = None;
-        assert_eq!(prove_checked(&legacy, 42, 700, &0), Err("element_window_missing"),
-            "a collapsed Option is not NoValue evidence");
+        assert_eq!(
+            prove_checked(&legacy, 42, 700, &0),
+            Err("element_window_missing"),
+            "a collapsed Option is not NoValue evidence"
+        );
     }
 
     #[test]
@@ -1367,8 +1615,11 @@ mod tests {
             for field in ["owner", "id_missing", "id_other"] {
                 let mut tree = NoValueTree::new(wrapped_toolbar_popover());
                 let entry = tree.tree.nodes.get_mut(&node).unwrap();
-                match field { "owner" => entry.owner = 99, "id_missing" => entry.id = None,
-                    _ => entry.id = Some(701) }
+                match field {
+                    "owner" => entry.owner = 99,
+                    "id_missing" => entry.id = None,
+                    _ => entry.id = Some(701),
+                }
                 assert!(!prove(&tree, 42, 700, &0), "node {node} field {field}");
             }
         }
@@ -1379,16 +1630,27 @@ mod tests {
                 assert!(!prove(&tree, 42, 700, &0), "node {node} window {window:?}");
             }
         }
-        for id in [0, 701] { assert!(!prove(&NoValueTree::new(pages()), 42, id, &0)); }
+        for id in [0, 701] {
+            assert!(!prove(&NoValueTree::new(pages()), 42, id, &0));
+        }
         let mut tree = NoValueTree::new(pages());
-        for node in 0..=2 { tree.tree.nodes.get_mut(&node).unwrap().id = Some(0); }
+        for node in 0..=2 {
+            tree.tree.nodes.get_mut(&node).unwrap().id = Some(0);
+        }
         assert!(!prove(&tree, 42, 700, &0));
     }
 
     #[test]
     fn no_value_route_never_accepts_opaque_boundaries_or_virtual_edges() {
         for node in [1, 3, 4] {
-            for role in ["AXUnknown", "AXWebArea", "AXApplication", "AXTable", "AXPopover", "AXWindow"] {
+            for role in [
+                "AXUnknown",
+                "AXWebArea",
+                "AXApplication",
+                "AXTable",
+                "AXPopover",
+                "AXWindow",
+            ] {
                 let mut tree = NoValueTree::new(wrapped_toolbar_popover());
                 tree.tree.nodes.get_mut(&node).unwrap().role = role;
                 assert!(!prove(&tree, 42, 700, &0), "node {node} role {role}");
@@ -1397,7 +1659,10 @@ mod tests {
         assert!(!prove(&NoValueTree::new(virtual_preview()), 42, 700, &0));
         let mut menu = NoValueTree::new(calendar_menu());
         menu.tree.nodes.get_mut(&0).unwrap().role = "AXPopUpButton";
-        assert_eq!(prove_checked(&menu, 42, 700, &8), Err("element_window_missing"));
+        assert_eq!(
+            prove_checked(&menu, 42, 700, &8),
+            Err("element_window_missing")
+        );
     }
 
     #[test]
@@ -1406,8 +1671,15 @@ mod tests {
             for duplicate in [false, true] {
                 let mut tree = NoValueTree::new(wrapped_toolbar_popover());
                 let children = &mut tree.tree.nodes.get_mut(&parent).unwrap().children;
-                if duplicate { children.push(parent - 1); } else { children.clear(); }
-                assert!(!prove(&tree, 42, 700, &0), "parent {parent} duplicate {duplicate}");
+                if duplicate {
+                    children.push(parent - 1);
+                } else {
+                    children.clear();
+                }
+                assert!(
+                    !prove(&tree, 42, 700, &0),
+                    "parent {parent} duplicate {duplicate}"
+                );
             }
         }
         let mut tree = NoValueTree::new(pages());
@@ -1417,32 +1689,63 @@ mod tests {
         let mut tree = NoValueTree::new(pages());
         tree.tree.nodes.get_mut(&2).unwrap().children = vec![1; MAX_CHILDREN as usize + 1];
         assert!(!prove(&tree, 42, 700, &0));
-        let tree = NoValueTree::new(pages());tree.tree.budget.set(0);
+        let tree = NoValueTree::new(pages());
+        tree.tree.budget.set(0);
         assert!(!prove(&tree, 42, 700, &0));
         let mut deep = NoValueTree::new(pages());
         deep.tree.nodes.get_mut(&0).unwrap().parent = Some(100);
         for id in 100..=132 {
-            deep.tree.nodes.insert(id, Node { identity: id, role: "AXGroup", owner: 42,
-                window: Some(6), id: Some(900),
-                parent: Some(if id == 132 { 2 } else { id + 1 }),
-                children: vec![if id == 100 { 0 } else { id - 1 }] });
+            deep.tree.nodes.insert(
+                id,
+                Node {
+                    identity: id,
+                    role: "AXGroup",
+                    owner: 42,
+                    window: Some(6),
+                    id: Some(900),
+                    parent: Some(if id == 132 { 2 } else { id + 1 }),
+                    children: vec![if id == 100 { 0 } else { id - 1 }],
+                },
+            );
         }
         deep.tree.nodes.get_mut(&2).unwrap().children = vec![132];
-        assert_eq!(prove_checked(&deep, 42, 700, &0), Err("popover_lookup_depth_limit"));
+        assert_eq!(
+            prove_checked(&deep, 42, 700, &0),
+            Err("popover_lookup_depth_limit")
+        );
     }
 
     #[test]
     fn no_value_route_rechecks_retained_facts_after_the_whole_first_walk() {
-        for (node, field) in [(0, "owner"), (0, "role"), (0, "id"), (0, "parent"),
-            (0, "raw"), (0, "window_present"), (1, "window"), (2, "window"),
-            (3, "parent"), (4, "role"), (5, "id"), (6, "children"),
-            (6, "owner"), (6, "role"), (6, "id"), (0, "deadline")] {
+        for (node, field) in [
+            (0, "owner"),
+            (0, "role"),
+            (0, "id"),
+            (0, "parent"),
+            (0, "raw"),
+            (0, "window_present"),
+            (1, "window"),
+            (2, "window"),
+            (3, "parent"),
+            (4, "role"),
+            (5, "id"),
+            (6, "children"),
+            (6, "owner"),
+            (6, "role"),
+            (6, "id"),
+            (0, "deadline"),
+        ] {
             let mut tree = NoValueTree::new(wrapped_toolbar_popover());
             tree.late = Some((node, field));
-            assert!(prove_checked(&tree, 42, 700, &0).is_err(),
-                "late node {node} field {field}");
+            assert!(
+                prove_checked(&tree, 42, 700, &0).is_err(),
+                "late node {node} field {field}"
+            );
             assert!(tree.unique_reads.get() >= 6, "must finish first walk");
-            assert!(tree.changed_reads.get() > 0, "must exercise actual late {field} read");
+            assert!(
+                tree.changed_reads.get() > 0,
+                "must exercise actual late {field} read"
+            );
         }
     }
 
@@ -1450,7 +1753,9 @@ mod tests {
     fn host_collection_proves_native_control_and_popover_root_to_exact_host() {
         for logical_host in [false, true] {
             let mut tree = host_collection();
-            if logical_host { tree.nodes.get_mut(&0).unwrap().window = Some(10); }
+            if logical_host {
+                tree.nodes.get_mut(&0).unwrap().window = Some(10);
+            }
             assert!(prove(&tree, 42, 700, &0));
             assert!(prove(&tree, 42, 700, &2));
             assert!(!prove(&tree, 42, 701, &0));
@@ -1464,7 +1769,11 @@ mod tests {
             tree.nodes.get_mut(&0).unwrap().role = "AXButton";
             tree.nodes.get_mut(&0).unwrap().window = Some(10);
             tree.nodes.get_mut(&1).unwrap().role = role;
-            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("popover_lookup_boundary"), "{role}");
+            assert_eq!(
+                prove_checked(&tree, 42, 700, &0),
+                Err("popover_lookup_boundary"),
+                "{role}"
+            );
         }
     }
 
@@ -1477,7 +1786,10 @@ mod tests {
             tree.nodes.get_mut(&0).unwrap().window = Some(10);
             assert!(!prove(&tree, 42, 700, &0), "host-named inner {role}");
             assert!(!prove(&host_collection(), 42, 700, &4));
-            assert_eq!(advertised_action(Some(role), "press", &["AXPress".into()]), None);
+            assert_eq!(
+                advertised_action(Some(role), "press", &["AXPress".into()]),
+                None
+            );
         }
     }
 
@@ -1505,11 +1817,26 @@ mod tests {
             for duplicate in [false, true] {
                 let mut tree = host_collection();
                 let entry = tree.nodes.get_mut(&parent).unwrap();
-                if duplicate { entry.children.push(parent - 1); } else { entry.children.clear(); }
-                assert!(!prove(&tree, 42, 700, &0), "parent {parent} duplicate {duplicate}");
+                if duplicate {
+                    entry.children.push(parent - 1);
+                } else {
+                    entry.children.clear();
+                }
+                assert!(
+                    !prove(&tree, 42, 700, &0),
+                    "parent {parent} duplicate {duplicate}"
+                );
             }
         }
-        for role in ["AXTable", "AXList", "AXWebArea", "AXApplication", "AXWindow", "AXSheet", "AXPopover"] {
+        for role in [
+            "AXTable",
+            "AXList",
+            "AXWebArea",
+            "AXApplication",
+            "AXWindow",
+            "AXSheet",
+            "AXPopover",
+        ] {
             let mut tree = host_collection();
             tree.nodes.get_mut(&5).unwrap().role = role;
             assert!(!prove(&tree, 42, 700, &0), "boundary {role}");
@@ -2061,10 +2388,18 @@ mod tests {
         tree.nodes.get_mut(&1).unwrap().role = "AXCheckBox";
         tree.nodes.get_mut(&1).unwrap().parent = Some(8);
         tree.nodes.get_mut(&2).unwrap().children = vec![8];
-        tree.nodes.insert(8, Node {
-            identity: 8, role: "AXList", owner: 42,
-            window: Some(6), id: Some(900), parent: Some(2), children: vec![1],
-        });
+        tree.nodes.insert(
+            8,
+            Node {
+                identity: 8,
+                role: "AXList",
+                owner: 42,
+                window: Some(6),
+                id: Some(900),
+                parent: Some(2),
+                children: vec![1],
+            },
+        );
         tree
     }
 
@@ -2081,7 +2416,10 @@ mod tests {
         let mut tree = inner_list(true);
         tree.nodes.insert(10, tree.nodes[&6].clone());
         tree.nodes.get_mut(&8).unwrap().window = Some(10);
-        assert!(prove(&tree, 42, 700, &0), "CF-equivalent logical host proxy");
+        assert!(
+            prove(&tree, 42, 700, &0),
+            "CF-equivalent logical host proxy"
+        );
     }
 
     #[test]
@@ -2090,11 +2428,25 @@ mod tests {
             let mut tree = inner_list(logical_host);
             assert!(!prove(&tree, 42, 700, &8), "list is not a control");
             tree.nodes.get_mut(&3).unwrap().role = "AXList";
-            assert_eq!(prove_checked(&tree, 42, 700, &0), Err("ancestor_role_unexpected"));
+            assert_eq!(
+                prove_checked(&tree, 42, 700, &0),
+                Err("ancestor_role_unexpected")
+            );
         }
         for action in ["press", "click", "show_menu", "confirm", "cancel"] {
-            assert_eq!(advertised_action(Some("AXList"), action,
-                &["AXPress".into(), "AXShowMenu".into(), "AXConfirm".into(), "AXCancel".into()]), None);
+            assert_eq!(
+                advertised_action(
+                    Some("AXList"),
+                    action,
+                    &[
+                        "AXPress".into(),
+                        "AXShowMenu".into(),
+                        "AXConfirm".into(),
+                        "AXCancel".into()
+                    ]
+                ),
+                None
+            );
         }
     }
 
@@ -2113,9 +2465,18 @@ mod tests {
                     5 => list.window = Some(9), // Same PID/physical ID, different retained window.
                     _ => list.parent = None,
                 }
-                assert!(!prove(&tree, 42, 700, &0), "logical_host={logical_host} kind={kind}");
+                assert!(
+                    !prove(&tree, 42, 700, &0),
+                    "logical_host={logical_host} kind={kind}"
+                );
             }
-            for role in ["AXWebArea", "AXTable", "AXIncrementor", "AXApplication", "AXPopover"] {
+            for role in [
+                "AXWebArea",
+                "AXTable",
+                "AXIncrementor",
+                "AXApplication",
+                "AXPopover",
+            ] {
                 let mut tree = inner_list(logical_host);
                 tree.nodes.get_mut(&1).unwrap().role = role;
                 assert!(!prove(&tree, 42, 700, &0), "inner boundary {role}");
@@ -2124,7 +2485,10 @@ mod tests {
             tree.nodes.insert(10, tree.nodes[&2].clone());
             tree.nodes.get_mut(&10).unwrap().identity = 10;
             tree.nodes.get_mut(&8).unwrap().window = Some(10);
-            assert!(!prove(&tree, 42, 700, &0), "same-ID sibling popup is not the retained popup");
+            assert!(
+                !prove(&tree, 42, 700, &0),
+                "same-ID sibling popup is not the retained popup"
+            );
         }
     }
 
@@ -2135,8 +2499,15 @@ mod tests {
                 for duplicate in [false, true] {
                     let mut tree = inner_list(logical_host);
                     let node = tree.nodes.get_mut(&parent).unwrap();
-                    if duplicate { node.children.push(node.children[0]); } else { node.children.clear(); }
-                    assert!(!prove(&tree, 42, 700, &0), "parent={parent} duplicate={duplicate}");
+                    if duplicate {
+                        node.children.push(node.children[0]);
+                    } else {
+                        node.children.clear();
+                    }
+                    assert!(
+                        !prove(&tree, 42, 700, &0),
+                        "parent={parent} duplicate={duplicate}"
+                    );
                 }
             }
             let mut tree = inner_list(logical_host);
@@ -2158,11 +2529,18 @@ mod tests {
             let last = 10 + MAX_DEPTH as u32;
             tree.nodes.get_mut(&8).unwrap().children = vec![last];
             for node in 10..=last {
-                tree.nodes.insert(node, Node {
-                    identity: node, role: "AXGroup", owner: 42, window: Some(6), id: Some(900),
-                    parent: Some(if node == last { 8 } else { node + 1 }),
-                    children: vec![if node == 10 { 1 } else { node - 1 }],
-                });
+                tree.nodes.insert(
+                    node,
+                    Node {
+                        identity: node,
+                        role: "AXGroup",
+                        owner: 42,
+                        window: Some(6),
+                        id: Some(900),
+                        parent: Some(if node == last { 8 } else { node + 1 }),
+                        children: vec![if node == 10 { 1 } else { node - 1 }],
+                    },
+                );
             }
             assert!(!prove(&tree, 42, 700, &0), "existing depth bound");
         }
@@ -2181,7 +2559,9 @@ mod tests {
     impl LateInnerChange {
         fn changed(&self, field: &str) -> bool {
             let changed = self.armed.get() && self.field == field;
-            if changed { self.late_reads.set(self.late_reads.get() + 1); }
+            if changed {
+                self.late_reads.set(self.late_reads.get() + 1);
+            }
             changed
         }
     }
@@ -2194,35 +2574,62 @@ mod tests {
                 Some("AXList".into())
             } else if *node == 8 && self.changed("role_missing") {
                 None
-            } else { self.tree.role(node) }
+            } else {
+                self.tree.role(node)
+            }
         }
         fn owner(&self, node: &u32) -> Option<i32> {
-            if *node == 8 && self.changed("owner") { None } else { self.tree.owner(node) }
+            if *node == 8 && self.changed("owner") {
+                None
+            } else {
+                self.tree.owner(node)
+            }
         }
         fn window(&self, node: &u32) -> Option<u32> {
             // Popup and host are each ordinarily allowed, but switching the
             // retained logical window after qualification must still refuse.
-            if *node == 8 && self.changed("window") { Some(2) } else { self.tree.window(node) }
+            if *node == 8 && self.changed("window") {
+                Some(2)
+            } else {
+                self.tree.window(node)
+            }
         }
         fn window_id(&self, node: &u32) -> Option<u32> {
-            if *node == 8 && self.changed("id") { Some(700) } else { self.tree.window_id(node) }
+            if *node == 8 && self.changed("id") {
+                Some(700)
+            } else {
+                self.tree.window_id(node)
+            }
         }
         fn parent(&self, node: &u32) -> Option<u32> {
-            if *node == 5 { self.armed.set(true); }
-            if (*node == 8 && self.changed("parent")) || (*node == 1 && self.changed("prefix_parent")) {
+            if *node == 5 {
+                self.armed.set(true);
+            }
+            if (*node == 8 && self.changed("parent"))
+                || (*node == 1 && self.changed("prefix_parent"))
+            {
                 None
-            } else { self.tree.parent(node) }
+            } else {
+                self.tree.parent(node)
+            }
         }
         fn contains_child(&self, parent: &u32, child: &u32) -> bool {
             self.tree.contains_child(parent, child)
         }
         fn contains_unique_child(&self, parent: &u32, child: &u32) -> bool {
             self.unique_reads.set(self.unique_reads.get() + 1);
-            if *parent == 8 && self.changed("deadline") { self.tree.budget.set(0); }
-            !(*parent == 8 && self.changed("children")) && self.tree.contains_unique_child(parent, child)
+            if *parent == 8 && self.changed("deadline") {
+                self.tree.budget.set(0);
+            }
+            !(*parent == 8 && self.changed("children"))
+                && self.tree.contains_unique_child(parent, child)
         }
-        fn same(&self, a: &u32, b: &u32) -> bool { self.tree.same(a, b) }
-        fn within_budget(&self) -> bool { self.tree.within_budget() }
+        fn same(&self, a: &u32, b: &u32) -> bool {
+            self.tree.same(a, b)
+        }
+        fn within_budget(&self) -> bool {
+            self.tree.within_budget()
+        }
         fn visible_menu_window(&self, node: &u32, pid: i32) -> Option<u32> {
             self.tree.visible_menu_window(node, pid)
         }
@@ -2231,13 +2638,38 @@ mod tests {
     #[test]
     fn inner_list_revalidates_retained_facts_after_the_successful_walk() {
         for logical_host in [false, true] {
-            for field in ["role", "owner", "window", "id", "parent", "children", "deadline", "prefix_role", "prefix_parent"] {
-                let tree = LateInnerChange { tree: inner_list(logical_host), field,
-                    armed: Cell::new(false), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
-                assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "{field}");
+            for field in [
+                "role",
+                "owner",
+                "window",
+                "id",
+                "parent",
+                "children",
+                "deadline",
+                "prefix_role",
+                "prefix_parent",
+            ] {
+                let tree = LateInnerChange {
+                    tree: inner_list(logical_host),
+                    field,
+                    armed: Cell::new(false),
+                    late_reads: Cell::new(0),
+                    unique_reads: Cell::new(0),
+                };
+                assert_eq!(
+                    prove_checked(&tree, 42, 700, &0),
+                    Err("attachment_changed"),
+                    "{field}"
+                );
                 assert!(tree.armed.get());
-                assert!(tree.late_reads.get() > 0, "late {field} must actually be read");
-                assert!(tree.unique_reads.get() >= 2, "must enter final inner-path proof");
+                assert!(
+                    tree.late_reads.get() > 0,
+                    "late {field} must actually be read"
+                );
+                assert!(
+                    tree.unique_reads.get() >= 2,
+                    "must enter final inner-path proof"
+                );
             }
         }
     }
@@ -2245,8 +2677,13 @@ mod tests {
     #[test]
     fn inner_list_revalidation_does_not_run_on_legacy_routes() {
         for legacy in [pages(), wrapped_toolbar_popover()] {
-            let tree = LateInnerChange { tree: legacy, field: "none",
-                armed: Cell::new(false), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+            let tree = LateInnerChange {
+                tree: legacy,
+                field: "none",
+                armed: Cell::new(false),
+                late_reads: Cell::new(0),
+                unique_reads: Cell::new(0),
+            };
             assert!(prove(&tree, 42, 700, &0));
             assert_eq!(tree.unique_reads.get(), 0);
             assert_eq!(tree.late_reads.get(), 0);
@@ -2254,7 +2691,11 @@ mod tests {
     }
 
     fn tab_group_host(logical_host: bool, with_inner_list: bool) -> Tree {
-        let mut tree = if with_inner_list { inner_list(logical_host) } else { wrapped_toolbar_popover() };
+        let mut tree = if with_inner_list {
+            inner_list(logical_host)
+        } else {
+            wrapped_toolbar_popover()
+        };
         tree.nodes.get_mut(&0).unwrap().window = Some(if logical_host { 6 } else { 2 });
         // Exact native outer shape: popup -> button -> tab group -> split -> host.
         tree.nodes.get_mut(&4).unwrap().role = "AXTabGroup";
@@ -2273,10 +2714,18 @@ mod tests {
         tree.nodes.get_mut(&8).unwrap().role = "AXUnknown";
         tree.nodes.get_mut(&8).unwrap().children = vec![11];
         for (node, parent, child) in [(10, 11, 1), (11, 8, 10)] {
-            tree.nodes.insert(node, Node {
-                identity: node, role: "AXList", owner: 42,
-                window: Some(6), id: Some(900), parent: Some(parent), children: vec![child],
-            });
+            tree.nodes.insert(
+                node,
+                Node {
+                    identity: node,
+                    role: "AXList",
+                    owner: 42,
+                    window: Some(6),
+                    id: Some(900),
+                    parent: Some(parent),
+                    children: vec![child],
+                },
+            );
         }
         tree
     }
@@ -2297,13 +2746,22 @@ mod tests {
             tree.nodes.get_mut(&1).unwrap().role = "AXUnknown";
             assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
             let mut tree = inner_structural_chain(logical_host);
-            for node in [10, 11] { tree.nodes.get_mut(&node).unwrap().role = "AXUnknown"; }
-            assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()), "no List is needed to trigger revalidation");
+            for node in [10, 11] {
+                tree.nodes.get_mut(&node).unwrap().role = "AXUnknown";
+            }
+            assert_eq!(
+                prove_checked(&tree, 42, 700, &0),
+                Ok(()),
+                "no List is needed to trigger revalidation"
+            );
         }
         let mut tree = inner_structural_chain(true);
         tree.nodes.insert(9000, tree.nodes[&6].clone());
         tree.nodes.get_mut(&8).unwrap().window = Some(9000);
-        assert!(prove(&tree, 42, 700, &0), "CF-equivalent retained host proxy");
+        assert!(
+            prove(&tree, 42, 700, &0),
+            "CF-equivalent retained host proxy"
+        );
     }
 
     #[test]
@@ -2329,9 +2787,17 @@ mod tests {
                     assert!(!prove(&tree, 42, 700, &0), "node={node} kind={kind}");
                 }
             }
-            let tree = LateInnerChange { tree: inner_structural_chain(logical_host), field: "role_missing",
-                armed: Cell::new(true), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
-            assert!(!prove(&tree, 42, 700, &0), "missing AXRole is not literal AXUnknown");
+            let tree = LateInnerChange {
+                tree: inner_structural_chain(logical_host),
+                field: "role_missing",
+                armed: Cell::new(true),
+                late_reads: Cell::new(0),
+                unique_reads: Cell::new(0),
+            };
+            assert!(
+                !prove(&tree, 42, 700, &0),
+                "missing AXRole is not literal AXUnknown"
+            );
             assert!(tree.late_reads.get() > 0);
         }
     }
@@ -2342,17 +2808,43 @@ mod tests {
         assert!(!container_role("AXUnknown"));
         assert!(!host_collection_role("AXUnknown"));
         for action in ["press", "click", "pick", "show_menu", "confirm", "cancel"] {
-            assert_eq!(advertised_action(Some("AXUnknown"), action,
-                &["AXPress".into(), "AXPick".into(), "AXShowMenu".into(), "AXConfirm".into(), "AXCancel".into()]), None);
+            assert_eq!(
+                advertised_action(
+                    Some("AXUnknown"),
+                    action,
+                    &[
+                        "AXPress".into(),
+                        "AXPick".into(),
+                        "AXShowMenu".into(),
+                        "AXConfirm".into(),
+                        "AXCancel".into()
+                    ]
+                ),
+                None
+            );
         }
         for logical_host in [false, true] {
-            assert!(!prove(&inner_structural_chain(logical_host), 42, 700, &8), "structure is not a target");
+            assert!(
+                !prove(&inner_structural_chain(logical_host), 42, 700, &8),
+                "structure is not a target"
+            );
             for node in [2, 3, 4, 5, 6] {
                 let mut tree = inner_structural_chain(logical_host);
                 tree.nodes.get_mut(&node).unwrap().role = "AXUnknown";
-                assert!(!prove(&tree, 42, 700, &0), "Unknown cannot replace popup/host or an outer node {node}");
+                assert!(
+                    !prove(&tree, 42, 700, &0),
+                    "Unknown cannot replace popup/host or an outer node {node}"
+                );
             }
-            for role in ["AXWebArea", "AXTable", "AXIncrementor", "AXApplication", "AXTabGroup", "AXOutline", "AXPopover"] {
+            for role in [
+                "AXWebArea",
+                "AXTable",
+                "AXIncrementor",
+                "AXApplication",
+                "AXTabGroup",
+                "AXOutline",
+                "AXPopover",
+            ] {
                 let mut tree = inner_structural_chain(logical_host);
                 tree.nodes.get_mut(&8).unwrap().role = role;
                 assert!(!prove(&tree, 42, 700, &0), "inner boundary {role}");
@@ -2367,8 +2859,15 @@ mod tests {
                 for duplicate in [false, true] {
                     let mut tree = inner_structural_chain(logical_host);
                     let entry = tree.nodes.get_mut(&parent).unwrap();
-                    if duplicate { entry.children.push(entry.children[0]); } else { entry.children.clear(); }
-                    assert!(!prove(&tree, 42, 700, &0), "parent={parent} duplicate={duplicate}");
+                    if duplicate {
+                        entry.children.push(entry.children[0]);
+                    } else {
+                        entry.children.clear();
+                    }
+                    assert!(
+                        !prove(&tree, 42, 700, &0),
+                        "parent={parent} duplicate={duplicate}"
+                    );
                 }
             }
             let mut tree = inner_structural_chain(logical_host);
@@ -2385,15 +2884,30 @@ mod tests {
                 let last = 100 + extra as u32 - 1;
                 tree.nodes.get_mut(&2).unwrap().children = vec![last];
                 for node in 100..=last {
-                    tree.nodes.insert(node, Node {
-                        identity: node, role: "AXUnknown", owner: 42,
-                        window: Some(6), id: Some(900),
-                        parent: Some(if node == last { 2 } else { node + 1 }),
-                        children: vec![if node == 100 { 8 } else { node - 1 }],
-                    });
+                    tree.nodes.insert(
+                        node,
+                        Node {
+                            identity: node,
+                            role: "AXUnknown",
+                            owner: 42,
+                            window: Some(6),
+                            id: Some(900),
+                            parent: Some(if node == last { 2 } else { node + 1 }),
+                            children: vec![if node == 100 { 8 } else { node - 1 }],
+                        },
+                    );
                 }
-                let expected = if extra == MAX_DEPTH - 10 { Ok(()) } else { Err("ancestry_depth_limit") };
-                assert_eq!(prove_checked(&tree, 42, 700, &0), expected, "total depth {}", extra + 10);
+                let expected = if extra == MAX_DEPTH - 10 {
+                    Ok(())
+                } else {
+                    Err("ancestry_depth_limit")
+                };
+                assert_eq!(
+                    prove_checked(&tree, 42, 700, &0),
+                    expected,
+                    "total depth {}",
+                    extra + 10
+                );
             }
             for count in [MAX_CHILDREN as usize, MAX_CHILDREN as usize + 1] {
                 let mut tree = inner_structural_chain(logical_host);
@@ -2404,7 +2918,11 @@ mod tests {
                     tree.nodes.insert(node, sibling);
                     tree.nodes.get_mut(&8).unwrap().children.push(node);
                 }
-                assert_eq!(prove(&tree, 42, 700, &0), count == MAX_CHILDREN as usize, "children={count}");
+                assert_eq!(
+                    prove(&tree, 42, 700, &0),
+                    count == MAX_CHILDREN as usize,
+                    "children={count}"
+                );
             }
         }
     }
@@ -2412,10 +2930,31 @@ mod tests {
     #[test]
     fn inner_structural_revalidates_unknown_and_prefix_after_the_complete_walk() {
         for logical_host in [false, true] {
-            for field in ["role", "role_to_list", "role_missing", "owner", "window", "id", "parent", "children", "deadline", "prefix_role", "prefix_parent"] {
-                let tree = LateInnerChange { tree: inner_structural_chain(logical_host), field,
-                    armed: Cell::new(false), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
-                assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "late {field}");
+            for field in [
+                "role",
+                "role_to_list",
+                "role_missing",
+                "owner",
+                "window",
+                "id",
+                "parent",
+                "children",
+                "deadline",
+                "prefix_role",
+                "prefix_parent",
+            ] {
+                let tree = LateInnerChange {
+                    tree: inner_structural_chain(logical_host),
+                    field,
+                    armed: Cell::new(false),
+                    late_reads: Cell::new(0),
+                    unique_reads: Cell::new(0),
+                };
+                assert_eq!(
+                    prove_checked(&tree, 42, 700, &0),
+                    Err("attachment_changed"),
+                    "late {field}"
+                );
                 assert!(tree.armed.get());
                 assert!(tree.late_reads.get() > 0, "late {field} must be read");
                 assert!(tree.unique_reads.get() >= 2);
@@ -2429,16 +2968,29 @@ mod tests {
             for field in ["role", "owner", "window", "id", "parent", "children"] {
                 let node = if field == "children" { 5 } else { 4 };
                 let tree = ChangingHost::new(inner_structural_chain(logical_host), node, field);
-                assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "outer {field}");
+                assert_eq!(
+                    prove_checked(&tree, 42, 700, &0),
+                    Err("attachment_changed"),
+                    "outer {field}"
+                );
                 assert!(tree.reads.get() >= 2);
                 assert!(tree.unique_reads.get() > 0);
             }
         }
         for legacy in [pages(), wrapped_toolbar_popover()] {
-            let tree = LateInnerChange { tree: legacy, field: "role_missing",
-                armed: Cell::new(true), late_reads: Cell::new(0), unique_reads: Cell::new(0) };
+            let tree = LateInnerChange {
+                tree: legacy,
+                field: "role_missing",
+                armed: Cell::new(true),
+                late_reads: Cell::new(0),
+                unique_reads: Cell::new(0),
+            };
             assert!(prove(&tree, 42, 700, &0));
-            assert_eq!(tree.unique_reads.get(), 0, "legacy-only route never enters structural revalidation");
+            assert_eq!(
+                tree.unique_reads.get(),
+                0,
+                "legacy-only route never enters structural revalidation"
+            );
             assert_eq!(tree.late_reads.get(), 0);
         }
     }
@@ -2460,15 +3012,36 @@ mod tests {
         assert!(!container_role("AXTabGroup"));
         assert!(!native_control_role(Some("AXTabGroup")));
         for action in ["press", "click", "show_menu", "confirm", "cancel"] {
-            assert_eq!(advertised_action(Some("AXTabGroup"), action,
-                &["AXPress".into(), "AXShowMenu".into(), "AXConfirm".into(), "AXCancel".into()]), None);
+            assert_eq!(
+                advertised_action(
+                    Some("AXTabGroup"),
+                    action,
+                    &[
+                        "AXPress".into(),
+                        "AXShowMenu".into(),
+                        "AXConfirm".into(),
+                        "AXCancel".into()
+                    ]
+                ),
+                None
+            );
         }
         for logical_host in [false, true] {
             let mut tree = tab_group_host(logical_host, false);
-            assert!(!prove(&tree, 42, 700, &4), "tab group is not an action target");
+            assert!(
+                !prove(&tree, 42, 700, &4),
+                "tab group is not an action target"
+            );
             tree.nodes.get_mut(&1).unwrap().role = "AXTabGroup";
             assert!(!prove(&tree, 42, 700, &0), "tab group inside popup");
-            for role in ["AXList", "AXWebArea", "AXTable", "AXWindow", "AXPopover", "AXUnknown"] {
+            for role in [
+                "AXList",
+                "AXWebArea",
+                "AXTable",
+                "AXWindow",
+                "AXPopover",
+                "AXUnknown",
+            ] {
                 let mut tree = tab_group_host(logical_host, true);
                 tree.nodes.get_mut(&4).unwrap().role = role;
                 assert!(!prove(&tree, 42, 700, &0), "outer boundary {role}");
@@ -2499,8 +3072,15 @@ mod tests {
                 for duplicate in [false, true] {
                     let mut tree = tab_group_host(logical_host, true);
                     let entry = tree.nodes.get_mut(&parent).unwrap();
-                    if duplicate { entry.children.push(parent - 1); } else { entry.children.clear(); }
-                    assert!(!prove(&tree, 42, 700, &0), "parent={parent} duplicate={duplicate}");
+                    if duplicate {
+                        entry.children.push(parent - 1);
+                    } else {
+                        entry.children.clear();
+                    }
+                    assert!(
+                        !prove(&tree, 42, 700, &0),
+                        "parent={parent} duplicate={duplicate}"
+                    );
                 }
             }
             let mut tree = tab_group_host(logical_host, true);
@@ -2518,10 +3098,21 @@ mod tests {
             for with_inner_list in [false, true] {
                 for field in ["role", "owner", "window", "id", "parent", "children"] {
                     let node = if field == "children" { 5 } else { 4 };
-                    let tree = ChangingHost::new(tab_group_host(logical_host, with_inner_list), node, field);
-                    assert_eq!(prove_checked(&tree, 42, 700, &0), Err("attachment_changed"), "late {field}");
+                    let tree = ChangingHost::new(
+                        tab_group_host(logical_host, with_inner_list),
+                        node,
+                        field,
+                    );
+                    assert_eq!(
+                        prove_checked(&tree, 42, 700, &0),
+                        Err("attachment_changed"),
+                        "late {field}"
+                    );
                     assert!(tree.reads.get() >= 2, "late {field} re-read must occur");
-                    assert!(tree.unique_reads.get() > 0, "must reach final retained proof");
+                    assert!(
+                        tree.unique_reads.get() > 0,
+                        "must reach final retained proof"
+                    );
                 }
             }
         }
@@ -2709,7 +3300,6 @@ mod tests {
         }
     }
 
-
     struct UnmappedLeafTree {
         inner: NoValueTree,
         physical: (i32, u32),
@@ -2729,165 +3319,372 @@ mod tests {
             tree.nodes.get_mut(&4).unwrap().children = vec![2];
             tree.nodes.get_mut(&4).unwrap().parent = Some(6);
             tree.nodes.get_mut(&6).unwrap().children = vec![4];
-            let mut inner = NoValueTree::new(tree); inner.edges = 3;
-            Self { inner, physical: (-25201, 0), late_physical: None,
-                physical_reads: Cell::new(0) }
+            let mut inner = NoValueTree::new(tree);
+            inner.edges = 3;
+            Self {
+                inner,
+                physical: (-25201, 0),
+                late_physical: None,
+                physical_reads: Cell::new(0),
+            }
         }
     }
     impl PopoverTree for UnmappedLeafTree {
         type Node = u32;
-        fn role(&self, n: &u32) -> Option<String> { self.inner.role(n) }
-        fn owner(&self, n: &u32) -> Option<i32> { self.inner.owner(n) }
-        fn window(&self, n: &u32) -> Option<u32> { self.inner.window(n) }
-        fn control_window(&self, n: &u32) -> ControlWindow<u32> { self.inner.control_window(n) }
-        fn window_id(&self, n: &u32) -> Option<u32> { self.inner.window_id(n) }
+        fn role(&self, n: &u32) -> Option<String> {
+            self.inner.role(n)
+        }
+        fn owner(&self, n: &u32) -> Option<i32> {
+            self.inner.owner(n)
+        }
+        fn window(&self, n: &u32) -> Option<u32> {
+            self.inner.window(n)
+        }
+        fn control_window(&self, n: &u32) -> ControlWindow<u32> {
+            self.inner.control_window(n)
+        }
+        fn window_id(&self, n: &u32) -> Option<u32> {
+            self.inner.window_id(n)
+        }
         fn control_physical(&self, n: &u32) -> ControlPhysicalWindow {
             assert_eq!(*n, 0, "unmapped exception is only the direct control");
             self.physical_reads.set(self.physical_reads.get() + 1);
             let raw = if self.inner.unique_reads.get() >= self.inner.edges {
                 self.late_physical.unwrap_or(self.physical)
-            } else { self.physical };
+            } else {
+                self.physical
+            };
             control_physical_window(raw.0, raw.1)
         }
-        fn parent(&self, n: &u32) -> Option<u32> { self.inner.parent(n) }
-        fn contains_child(&self, p: &u32, c: &u32) -> bool { self.inner.contains_child(p, c) }
-        fn contains_unique_child(&self, p: &u32, c: &u32) -> bool { self.inner.contains_unique_child(p, c) }
-        fn virtual_button_child(&self, p: &u32, c: &u32) -> bool { self.inner.virtual_button_child(p, c) }
-        fn same(&self, a: &u32, b: &u32) -> bool { self.inner.same(a, b) }
-        fn within_budget(&self) -> bool { self.inner.within_budget() }
-        fn visible_menu_window(&self, n: &u32, pid: i32) -> Option<u32> { self.inner.visible_menu_window(n, pid) }
+        fn parent(&self, n: &u32) -> Option<u32> {
+            self.inner.parent(n)
+        }
+        fn contains_child(&self, p: &u32, c: &u32) -> bool {
+            self.inner.contains_child(p, c)
+        }
+        fn contains_unique_child(&self, p: &u32, c: &u32) -> bool {
+            self.inner.contains_unique_child(p, c)
+        }
+        fn virtual_button_child(&self, p: &u32, c: &u32) -> bool {
+            self.inner.virtual_button_child(p, c)
+        }
+        fn same(&self, a: &u32, b: &u32) -> bool {
+            self.inner.same(a, b)
+        }
+        fn within_budget(&self) -> bool {
+            self.inner.within_budget()
+        }
+        fn visible_menu_window(&self, n: &u32, pid: i32) -> Option<u32> {
+            self.inner.visible_menu_window(n, pid)
+        }
     }
 
     #[test]
     fn unmapped_leaf_classification_keeps_errors_zero_and_contradictions_distinct() {
-        assert_eq!(control_physical_window(-25201, 0), ControlPhysicalWindow::IllegalArgumentZero);
-        assert_eq!(control_physical_window(0, 900), ControlPhysicalWindow::Mapped(900));
-        for raw in [(0,0),(-25201,900),(-25212,0),(-25204,0),(-25202,0),(-25205,0)] {
-            assert_eq!(control_physical_window(raw.0,raw.1), ControlPhysicalWindow::Unavailable);
-            let mut tree=UnmappedLeafTree::new(); tree.physical=raw;
-            assert!(!prove(&tree,42,700,&0), "raw {raw:?}");
+        assert_eq!(
+            control_physical_window(-25201, 0),
+            ControlPhysicalWindow::IllegalArgumentZero
+        );
+        assert_eq!(
+            control_physical_window(0, 900),
+            ControlPhysicalWindow::Mapped(900)
+        );
+        for raw in [
+            (0, 0),
+            (-25201, 900),
+            (-25212, 0),
+            (-25204, 0),
+            (-25202, 0),
+            (-25205, 0),
+        ] {
+            assert_eq!(
+                control_physical_window(raw.0, raw.1),
+                ControlPhysicalWindow::Unavailable
+            );
+            let mut tree = UnmappedLeafTree::new();
+            tree.physical = raw;
+            assert!(!prove(&tree, 42, 700, &0), "raw {raw:?}");
         }
-        let mut wrong=UnmappedLeafTree::new(); wrong.physical=(0,701);
-        assert!(!prove(&wrong,42,700,&0), "a nonzero contradictory mapping is never ignored");
+        let mut wrong = UnmappedLeafTree::new();
+        wrong.physical = (0, 701);
+        assert!(
+            !prove(&wrong, 42, 700, &0),
+            "a nonzero contradictory mapping is never ignored"
+        );
     }
 
     #[test]
     fn unmapped_leaf_actual_shape_proves_twice_without_synthetic_window_id() {
-        let tree=UnmappedLeafTree::new();
-        assert_eq!(prove_checked(&tree,42,700,&0),Ok(()));
-        assert_eq!(tree.physical_reads.get(),2);
-        assert_eq!(tree.inner.unique_reads.get(),6);
-        assert_eq!(tree.inner.control_reads.get(),2);
-        assert_eq!(tree.window_id(&0),None,"proof must not fill in a physical ID");
-        assert_eq!(tree.window(&0),None,"proof must not fill in AXWindow");
+        let tree = UnmappedLeafTree::new();
+        assert_eq!(prove_checked(&tree, 42, 700, &0), Ok(()));
+        assert_eq!(tree.physical_reads.get(), 2);
+        assert_eq!(tree.inner.unique_reads.get(), 6);
+        assert_eq!(tree.inner.control_reads.get(), 2);
+        assert_eq!(
+            tree.window_id(&0),
+            None,
+            "proof must not fill in a physical ID"
+        );
+        assert_eq!(tree.window(&0), None, "proof must not fill in AXWindow");
     }
 
     #[test]
     fn unmapped_leaf_requires_explicit_no_value_and_strict_nonleaf_anchors() {
-        for raw in [(0,false,false),(-25204,false,false),(kAXErrorNoValue,true,true),(0,true,false)] {
-            let mut tree=UnmappedLeafTree::new(); tree.inner.raw=raw;
-            assert!(!prove(&tree,42,700,&0));
-            assert_eq!(tree.inner.unique_reads.get(),0);
+        for raw in [
+            (0, false, false),
+            (-25204, false, false),
+            (kAXErrorNoValue, true, true),
+            (0, true, false),
+        ] {
+            let mut tree = UnmappedLeafTree::new();
+            tree.inner.raw = raw;
+            assert!(!prove(&tree, 42, 700, &0));
+            assert_eq!(tree.inner.unique_reads.get(), 0);
         }
-        for id in [2,4,6] {
-            for field in ["id_none","id_wrong","owner","role","window"] {
-                let mut tree=UnmappedLeafTree::new(); let n=tree.inner.tree.nodes.get_mut(&id).unwrap();
-                match field { "id_none"=>n.id=None,"id_wrong"=>n.id=Some(if id == 2 { 700 } else { 701 }),
-                    "owner"=>n.owner=99,"role"=>n.role="AXUnknown",_=>n.window=None }
+        for id in [2, 4, 6] {
+            for field in ["id_none", "id_wrong", "owner", "role", "window"] {
+                let mut tree = UnmappedLeafTree::new();
+                let n = tree.inner.tree.nodes.get_mut(&id).unwrap();
+                match field {
+                    "id_none" => n.id = None,
+                    "id_wrong" => n.id = Some(if id == 2 { 700 } else { 701 }),
+                    "owner" => n.owner = 99,
+                    "role" => n.role = "AXUnknown",
+                    _ => n.window = None,
+                }
                 // The terminal host never required its own AXWindow property.
-                if id == 6 && field == "window" { continue; }
-                assert!(!prove(&tree,42,700,&0), "node {id} field {field}");
+                if id == 6 && field == "window" {
+                    continue;
+                }
+                assert!(!prove(&tree, 42, 700, &0), "node {id} field {field}");
             }
         }
-        for parent in [2,4,6] {
-            for duplicate in [false,true] {
-                let mut tree=UnmappedLeafTree::new(); let n=tree.inner.tree.nodes.get_mut(&parent).unwrap();
-                if duplicate { n.children.push(n.children[0]); } else { n.children.clear(); }
-                assert!(!prove(&tree,42,700,&0), "parent {parent} duplicate {duplicate}");
+        for parent in [2, 4, 6] {
+            for duplicate in [false, true] {
+                let mut tree = UnmappedLeafTree::new();
+                let n = tree.inner.tree.nodes.get_mut(&parent).unwrap();
+                if duplicate {
+                    n.children.push(n.children[0]);
+                } else {
+                    n.children.clear();
+                }
+                assert!(
+                    !prove(&tree, 42, 700, &0),
+                    "parent {parent} duplicate {duplicate}"
+                );
             }
         }
     }
 
     #[test]
     fn unmapped_leaf_rejects_late_physical_status_and_mapping_changes() {
-        for raw in [(0,900),(0,0),(0,701),(-25201,900),(-25204,0)] {
-            let mut tree=UnmappedLeafTree::new(); tree.late_physical=Some(raw);
-            assert!(!prove(&tree,42,700,&0), "late {raw:?}");
-            assert_eq!(tree.physical_reads.get(),2);
-            assert!(tree.inner.unique_reads.get()>=3);
+        for raw in [(0, 900), (0, 0), (0, 701), (-25201, 900), (-25204, 0)] {
+            let mut tree = UnmappedLeafTree::new();
+            tree.late_physical = Some(raw);
+            assert!(!prove(&tree, 42, 700, &0), "late {raw:?}");
+            assert_eq!(tree.physical_reads.get(), 2);
+            assert!(tree.inner.unique_reads.get() >= 3);
         }
-        let mut changed=UnmappedLeafTree::new(); changed.physical=(0,900);
-        changed.late_physical=Some((-25201,0));
-        assert!(!prove(&changed,42,700,&0), "mapped to unmapped is a changed attachment");
+        let mut changed = UnmappedLeafTree::new();
+        changed.physical = (0, 900);
+        changed.late_physical = Some((-25201, 0));
+        assert!(
+            !prove(&changed, 42, 700, &0),
+            "mapped to unmapped is a changed attachment"
+        );
     }
 
     #[test]
     fn unmapped_leaf_rejects_late_retained_chain_and_deadline_changes() {
-        for late in [(0,"raw"),(0,"window_present"),(0,"role"),(0,"owner"),(0,"parent"),
-            (2,"window"),(2,"children"),(2,"parent"),(2,"id"),(4,"role"),(4,"id"),
-            (6,"owner"),(6,"role"),(6,"id"),(6,"children"),(0,"deadline")] {
-            let mut tree=UnmappedLeafTree::new(); tree.inner.late=Some(late);
-            assert!(!prove(&tree,42,700,&0), "late {late:?}");
-            assert!(tree.inner.unique_reads.get()>=3);
-            assert!(tree.inner.changed_reads.get()>0);
+        for late in [
+            (0, "raw"),
+            (0, "window_present"),
+            (0, "role"),
+            (0, "owner"),
+            (0, "parent"),
+            (2, "window"),
+            (2, "children"),
+            (2, "parent"),
+            (2, "id"),
+            (4, "role"),
+            (4, "id"),
+            (6, "owner"),
+            (6, "role"),
+            (6, "id"),
+            (6, "children"),
+            (0, "deadline"),
+        ] {
+            let mut tree = UnmappedLeafTree::new();
+            tree.inner.late = Some(late);
+            assert!(!prove(&tree, 42, 700, &0), "late {late:?}");
+            assert!(tree.inner.unique_reads.get() >= 3);
+            assert!(tree.inner.changed_reads.get() > 0);
         }
     }
 
     #[test]
     fn semantic_candidate_preserves_displaced_fast_path_and_role_boundary() {
-        assert!(semantic_popover_candidate(true,None,700,||panic!("old displaced route must not query"),||panic!("no parent query")));
-        for role in [None,Some("AXUnknown"),Some("AXWebArea"),Some("AXPopover"),Some("AXToolbar")] {
-            assert!(!semantic_popover_candidate(false,role,700,||panic!("not an action control"),||panic!("no parent query")));
+        assert!(semantic_popover_candidate(
+            true,
+            None,
+            700,
+            || panic!("old displaced route must not query"),
+            || panic!("no parent query")
+        ));
+        for role in [
+            None,
+            Some("AXUnknown"),
+            Some("AXWebArea"),
+            Some("AXPopover"),
+            Some("AXToolbar"),
+        ] {
+            assert!(!semantic_popover_candidate(
+                false,
+                role,
+                700,
+                || panic!("not an action control"),
+                || panic!("no parent query")
+            ));
         }
-        let reads=Cell::new(0);
-        assert!(semantic_popover_candidate(false,Some("AXTextField"),700,||{reads.set(reads.get()+1);true},||Some(900)));
-        assert_eq!(reads.get(),1);
-        assert!(!semantic_popover_candidate(false,Some("AXTextField"),700,||false,||panic!("raw failure must not query parent")));
+        let reads = Cell::new(0);
+        assert!(semantic_popover_candidate(
+            false,
+            Some("AXTextField"),
+            700,
+            || {
+                reads.set(reads.get() + 1);
+                true
+            },
+            || Some(900)
+        ));
+        assert_eq!(reads.get(), 1);
+        assert!(!semantic_popover_candidate(
+            false,
+            Some("AXTextField"),
+            700,
+            || false,
+            || panic!("raw failure must not query parent")
+        ));
     }
 
     #[test]
     fn semantic_candidate_then_real_gate_never_grants_pointer_or_keyboard() {
-        use cua_driver_core::background_input::{decide_background_input,BackgroundAction,
-            BackgroundTargetFacts,ElementAncestry,ExactWindowTarget,WindowServerOwnership};
-        let tree=UnmappedLeafTree::new();
-        let candidate=semantic_popover_candidate(false,Some("AXTextField"),700,|| {
-            control_physical_window(tree.physical.0,tree.physical.1)==ControlPhysicalWindow::IllegalArgumentZero
-                && control_window_kind(tree.inner.raw.0,tree.inner.raw.1,tree.inner.raw.2)==ControlWindowKind::NoValue
-        },||Some(900));
+        use cua_driver_core::background_input::{
+            decide_background_input, BackgroundAction, BackgroundTargetFacts, ElementAncestry,
+            ExactWindowTarget, WindowServerOwnership,
+        };
+        let tree = UnmappedLeafTree::new();
+        let candidate = semantic_popover_candidate(
+            false,
+            Some("AXTextField"),
+            700,
+            || {
+                control_physical_window(tree.physical.0, tree.physical.1)
+                    == ControlPhysicalWindow::IllegalArgumentZero
+                    && control_window_kind(tree.inner.raw.0, tree.inner.raw.1, tree.inner.raw.2)
+                        == ControlWindowKind::NoValue
+            },
+            || Some(900),
+        );
         // The same boolean selects the gate in both public element callers.
-        let selected=if candidate {BackgroundAction::AttachedPopoverSemantic} else {BackgroundAction::AxSemantic};
-        let target=ExactWindowTarget{pid:42,window_id:700};
-        let mut facts=BackgroundTargetFacts{window_server:WindowServerOwnership::SamePid,
-            ax_window_present:true,target_minimized:Some(false),target_on_screen:Some(true),
-            app_hidden:Some(false),competing_keyboard_destinations:1,element:ElementAncestry::Unproven};
+        let selected = if candidate {
+            BackgroundAction::AttachedPopoverSemantic
+        } else {
+            BackgroundAction::AxSemantic
+        };
+        let target = ExactWindowTarget {
+            pid: 42,
+            window_id: 700,
+        };
+        let mut facts = BackgroundTargetFacts {
+            window_server: WindowServerOwnership::SamePid,
+            ax_window_present: true,
+            target_minimized: Some(false),
+            target_on_screen: Some(true),
+            app_hidden: Some(false),
+            competing_keyboard_destinations: 1,
+            element: ElementAncestry::Unproven,
+        };
         assert!(candidate);
-        assert!(!decide_background_input(target,&facts,selected).is_execute(),"candidate alone is not authority");
-        assert!(prove(&tree,42,700,&0)); facts.element=ElementAncestry::ProvenAttachedPopover;
-        assert!(decide_background_input(target,&facts,selected).is_execute());
-        for action in [BackgroundAction::AxSemantic,BackgroundAction::ApplicationMenuSemantic,
-            BackgroundAction::WindowPointer,BackgroundAction::InsertText,BackgroundAction::GenericKey] {
-            assert!(!decide_background_input(target,&facts,action).is_execute(),"route {action:?}");
+        assert!(
+            !decide_background_input(target, &facts, selected).is_execute(),
+            "candidate alone is not authority"
+        );
+        assert!(prove(&tree, 42, 700, &0));
+        facts.element = ElementAncestry::ProvenAttachedPopover;
+        assert!(decide_background_input(target, &facts, selected).is_execute());
+        for action in [
+            BackgroundAction::AxSemantic,
+            BackgroundAction::ApplicationMenuSemantic,
+            BackgroundAction::WindowPointer,
+            BackgroundAction::InsertText,
+            BackgroundAction::GenericKey,
+        ] {
+            assert!(
+                !decide_background_input(target, &facts, action).is_execute(),
+                "route {action:?}"
+            );
         }
-        let mut broken=UnmappedLeafTree::new(); broken.inner.tree.nodes.get_mut(&2).unwrap().children.clear();
-        facts.element=if prove(&broken,42,700,&0) {ElementAncestry::ProvenAttachedPopover} else {ElementAncestry::Unproven};
-        assert!(!decide_background_input(target,&facts,selected).is_execute(),"raw candidate with broken chain is refused");
+        let mut broken = UnmappedLeafTree::new();
+        broken
+            .inner
+            .tree
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .children
+            .clear();
+        facts.element = if prove(&broken, 42, 700, &0) {
+            ElementAncestry::ProvenAttachedPopover
+        } else {
+            ElementAncestry::Unproven
+        };
+        assert!(
+            !decide_background_input(target, &facts, selected).is_execute(),
+            "raw candidate with broken chain is refused"
+        );
     }
-
 
     #[test]
     fn unmapped_ordinary_host_control_keeps_its_original_semantic_gate() {
-        use cua_driver_core::background_input::{decide_background_input,BackgroundAction,
-            BackgroundTargetFacts,ElementAncestry,ExactWindowTarget,WindowServerOwnership};
-        for nearest in [None,Some(0),Some(700)] {
-            assert!(!semantic_popover_candidate(false,Some("AXTextField"),700,||true,||nearest));
+        use cua_driver_core::background_input::{
+            decide_background_input, BackgroundAction, BackgroundTargetFacts, ElementAncestry,
+            ExactWindowTarget, WindowServerOwnership,
+        };
+        for nearest in [None, Some(0), Some(700)] {
+            assert!(!semantic_popover_candidate(
+                false,
+                Some("AXTextField"),
+                700,
+                || true,
+                || nearest
+            ));
         }
-        let attached=semantic_popover_candidate(false,Some("AXTextField"),700,||true,||Some(700));
-        let action=if attached {BackgroundAction::AttachedPopoverSemantic} else {BackgroundAction::AxSemantic};
-        let facts=BackgroundTargetFacts{window_server:WindowServerOwnership::SamePid,
-            ax_window_present:true,target_minimized:Some(false),target_on_screen:Some(true),
-            app_hidden:Some(false),competing_keyboard_destinations:1,element:ElementAncestry::ProvenDescendant};
-        assert_eq!(action,BackgroundAction::AxSemantic);
-        assert!(decide_background_input(ExactWindowTarget{pid:42,window_id:700},&facts,action).is_execute());
+        let attached =
+            semantic_popover_candidate(false, Some("AXTextField"), 700, || true, || Some(700));
+        let action = if attached {
+            BackgroundAction::AttachedPopoverSemantic
+        } else {
+            BackgroundAction::AxSemantic
+        };
+        let facts = BackgroundTargetFacts {
+            window_server: WindowServerOwnership::SamePid,
+            ax_window_present: true,
+            target_minimized: Some(false),
+            target_on_screen: Some(true),
+            app_hidden: Some(false),
+            competing_keyboard_destinations: 1,
+            element: ElementAncestry::ProvenDescendant,
+        };
+        assert_eq!(action, BackgroundAction::AxSemantic);
+        assert!(decide_background_input(
+            ExactWindowTarget {
+                pid: 42,
+                window_id: 700
+            },
+            &facts,
+            action
+        )
+        .is_execute());
     }
-
 }

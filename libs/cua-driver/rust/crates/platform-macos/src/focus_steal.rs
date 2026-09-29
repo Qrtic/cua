@@ -287,7 +287,8 @@ impl SuppressionLease {
     }
 
     pub(crate) fn targeted_deadline(&self) -> Option<Instant> {
-        self.dispatcher.with_current_targeted(self.handle, |deadline| deadline)
+        self.dispatcher
+            .with_current_targeted(self.handle, |deadline| deadline)
     }
 
     /// Keep a returned action's target-only protection off its response path.
@@ -314,10 +315,16 @@ impl SuppressionLease {
     /// not stop a spawn_blocking callback which had already begun.
     pub(crate) fn start_polling(
         &mut self,
-        mut poll: impl FnMut(Instant, crate::order_diagnostics::PollDiagnostics) -> bool + Send + 'static,
+        mut poll: impl FnMut(Instant, crate::order_diagnostics::PollDiagnostics) -> bool
+            + Send
+            + 'static,
     ) -> bool {
-        if self.poll_task.is_some() { return false; }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return false };
+        if self.poll_task.is_some() {
+            return false;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
         let Some(mut deadline) = self.targeted_deadline() else {
             return false;
         };
@@ -331,22 +338,38 @@ impl SuppressionLease {
                 let wait_started = Instant::now();
                 let next = (wait_started + ORDERING_POLL_INTERVAL).min(deadline);
                 tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
-                if Instant::now() >= deadline { break; }
+                if Instant::now() >= deadline {
+                    break;
+                }
                 let timing = crate::order_diagnostics::PollTiming {
-                    wait_started, scheduled_wake: next, woke: Instant::now(),
+                    wait_started,
+                    scheduled_wake: next,
+                    woke: Instant::now(),
                 };
                 let result = tokio::task::spawn_blocking(move || {
-                    let keep_polling = dispatcher.with_current_targeted_state(handle, |current_deadline, returned_tail| {
-                        let source = if returned_tail {
-                            crate::order_diagnostics::CheckSource::DeferredPoll
-                        } else {
-                            crate::order_diagnostics::CheckSource::ActivePoll
-                        };
-                        (poll(current_deadline, crate::order_diagnostics::PollDiagnostics { source, timing }), current_deadline)
-                    });
+                    let keep_polling = dispatcher.with_current_targeted_state(
+                        handle,
+                        |current_deadline, returned_tail| {
+                            let source = if returned_tail {
+                                crate::order_diagnostics::CheckSource::DeferredPoll
+                            } else {
+                                crate::order_diagnostics::CheckSource::ActivePoll
+                            };
+                            (
+                                poll(
+                                    current_deadline,
+                                    crate::order_diagnostics::PollDiagnostics { source, timing },
+                                ),
+                                current_deadline,
+                            )
+                        },
+                    );
                     (dispatcher, poll, keep_polling)
-                }).await;
-                let Ok((returned_dispatcher, returned_poll, keep_polling)) = result else { return };
+                })
+                .await;
+                let Ok((returned_dispatcher, returned_poll, keep_polling)) = result else {
+                    return;
+                };
                 dispatcher = returned_dispatcher;
                 poll = returned_poll;
                 match keep_polling {
@@ -400,11 +423,19 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
-    fn with_current_targeted<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant) -> T) -> Option<T> {
+    fn with_current_targeted<T>(
+        &self,
+        handle: SuppressionHandle,
+        poll: impl FnOnce(Instant) -> T,
+    ) -> Option<T> {
         self.with_current_targeted_state(handle, |deadline, _| poll(deadline))
     }
 
-    fn with_current_targeted_state<T>(&self, handle: SuppressionHandle, poll: impl FnOnce(Instant, bool) -> T) -> Option<T> {
+    fn with_current_targeted_state<T>(
+        &self,
+        handle: SuppressionHandle,
+        poll: impl FnOnce(Instant, bool) -> T,
+    ) -> Option<T> {
         let entries = self.entries.lock().unwrap();
         let entry = entries.get(&handle.0)?;
         if entry.target_pid.is_none() || entry.deadline <= Instant::now() {
@@ -635,21 +666,24 @@ impl Dispatcher {
     ) -> Vec<RestoreCandidate> {
         let entries = self.entries.lock().unwrap();
         let now = Instant::now();
-        entries.iter().filter_map(|(id, entry)| {
-            // Only a known target and the exact prior foreground may wait.
-            // Unknown/newer foreground, wildcard launch scopes and intentional
-            // activations do not acquire delayed restoration authority.
-            (entry.deadline > now
-                && entry.target_pid == Some(activated_pid)
-                && entry.allowed_pid != Some(activated_pid)
-                && entry.restore_to != activated_pid
-                && current_front == Some(entry.restore_to))
+        entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                // Only a known target and the exact prior foreground may wait.
+                // Unknown/newer foreground, wildcard launch scopes and intentional
+                // activations do not acquire delayed restoration authority.
+                (entry.deadline > now
+                    && entry.target_pid == Some(activated_pid)
+                    && entry.allowed_pid != Some(activated_pid)
+                    && entry.restore_to != activated_pid
+                    && current_front == Some(entry.restore_to))
                 .then_some(RestoreCandidate {
                     handle: SuppressionHandle(*id),
                     activated_pid,
                     restore_to: entry.restore_to,
                 })
-        }).collect()
+            })
+            .collect()
     }
 
     fn recheck_activation_candidate(
@@ -716,12 +750,16 @@ impl Dispatcher {
     ) -> bool {
         let candidate = completion.candidate;
         let entries = self.entries.lock().unwrap();
-        let Some(entry) = entries.get(&candidate.handle.0) else { return false; };
+        let Some(entry) = entries.get(&candidate.handle.0) else {
+            return false;
+        };
         entry.deadline > Instant::now()
             && entry.restore_to == candidate.restore_to
             && entry.restore_to != candidate.activated_pid
             && entry.allowed_pid != Some(candidate.activated_pid)
-            && entry.target_pid.is_none_or(|pid| pid == candidate.activated_pid)
+            && entry
+                .target_pid
+                .is_none_or(|pid| pid == candidate.activated_pid)
             && entry.activity_restore == Some(completion.evidence)
             && current_front() == Some(candidate.restore_to)
     }
@@ -939,15 +977,21 @@ fn reconcile_activation(
     // entries while that query still reports their prior foreground. A newer
     // application or unavailable identity ends the recheck immediately.
     let mut pending = dispatcher.early_activation_candidates(activated_pid, current_front);
-    if pending.is_empty() { return; }
+    if pending.is_empty() {
+        return;
+    }
     tracing::debug!(target: "cua_focus_restore", activated_pid,
         pending_count=pending.len(), "Rechecking activation notification ahead of foreground state");
     let until = Instant::now() + ACTIVATION_RECHECK_INTERVAL * ACTIVATION_RECHECK_LIMIT as u32;
     for iteration in 0..ACTIVATION_RECHECK_LIMIT {
         let remaining = until.saturating_duration_since(Instant::now());
-        if pending.is_empty() || remaining.is_zero() { break; }
+        if pending.is_empty() || remaining.is_zero() {
+            break;
+        }
         pause(ACTIVATION_RECHECK_INTERVAL.min(remaining));
-        if Instant::now() >= until { break; }
+        if Instant::now() >= until {
+            break;
+        }
         let current_front = read_front();
         pending.retain(|candidate| {
             let decision = dispatcher.recheck_activation_candidate(*candidate, current_front);
@@ -955,15 +999,15 @@ fn reconcile_activation(
                 activated_pid, iteration, current_front = ?current_front, decision = ?decision,
                 "Rechecked activation restoration authority");
             match decision {
-            ActivationRecheck::Waiting => true,
-            ActivationRecheck::Ready => {
-                // Submission still revalidates this exact entry, foreground,
-                // original activity generation and prior window ownership.
-                // A refused submission is never replayed by this recheck.
-                restore(*candidate);
-                false
-            }
-            ActivationRecheck::Revoked => false,
+                ActivationRecheck::Waiting => true,
+                ActivationRecheck::Ready => {
+                    // Submission still revalidates this exact entry, foreground,
+                    // original activity generation and prior window ownership.
+                    // A refused submission is never replayed by this recheck.
+                    restore(*candidate);
+                    false
+                }
+                ActivationRecheck::Revoked => false,
             }
         });
     }
@@ -988,18 +1032,27 @@ fn restore_activation_candidate(dispatcher: &Arc<Dispatcher>, candidate: Restore
         .and_then(|entry| entry.activity_restore);
     if let Some(evidence) = evidence {
         let mut submitted = false;
-        let admitted = dispatcher.submit_restore_if_current(candidate, || observed_activation_front(activated_pid), |pid| {
-            submitted = crate::foreground_activity::restore_background_focus(evidence, pid);
-        });
+        let admitted = dispatcher.submit_restore_if_current(
+            candidate,
+            || observed_activation_front(activated_pid),
+            |pid| {
+                submitted = crate::foreground_activity::restore_background_focus(evidence, pid);
+            },
+        );
         tracing::debug!(target: "cua_focus_restore", lease = %candidate.handle.0,
             activated_pid, restore_pid = candidate.restore_to, admitted, submitted,
             "Evaluated activation restoration candidate");
         if admitted && submitted {
-            let completion = RestoreCompletion { candidate, evidence };
+            let completion = RestoreCompletion {
+                candidate,
+                evidence,
+            };
             // AX calls and readiness reads must not hold entries.lock():
             // cancellation needs to invalidate this same ticket between steps.
             let result = crate::foreground_activity::complete_background_focus(
-                evidence, candidate.restore_to, || {
+                evidence,
+                candidate.restore_to,
+                || {
                     if !dispatcher.restoration_completion_is_current(completion, || {
                         crate::input::skylight::front_process_pid()
                     }) {
@@ -1117,12 +1170,25 @@ mod tests {
         let original_deadline = d.entries.lock().unwrap()[&handle.0].deadline;
         let mut reads = [Some(7), Some(7), Some(42)].into_iter();
         let mut submitted = Vec::new();
-        reconcile_activation(&d, 42, || reads.next().expect("bounded recheck"), |_| {}, |candidate| {
-            assert_eq!(candidate.handle, handle);
-            d.submit_restore_if_current(candidate, || Some(42), |pid| submitted.push(pid));
-        });
-        assert_eq!(submitted, vec![7], "an early notification must not strand the target in front");
-        assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, original_deadline);
+        reconcile_activation(
+            &d,
+            42,
+            || reads.next().expect("bounded recheck"),
+            |_| {},
+            |candidate| {
+                assert_eq!(candidate.handle, handle);
+                d.submit_restore_if_current(candidate, || Some(42), |pid| submitted.push(pid));
+            },
+        );
+        assert_eq!(
+            submitted,
+            vec![7],
+            "an early notification must not strand the target in front"
+        );
+        assert_eq!(
+            d.entries.lock().unwrap()[&handle.0].deadline,
+            original_deadline
+        );
     }
 
     #[test]
@@ -1132,8 +1198,13 @@ mod tests {
             let _handle = d.add(Some(42), 7, "test.early_newer_front");
             let mut reads = [Some(7), newer].into_iter();
             let mut pauses = 0;
-            reconcile_activation(&d, 42, || reads.next().expect("stop after newer foreground"),
-                |_| pauses += 1, |_| panic!("newer foreground must be preserved"));
+            reconcile_activation(
+                &d,
+                42,
+                || reads.next().expect("stop after newer foreground"),
+                |_| pauses += 1,
+                |_| panic!("newer foreground must be preserved"),
+            );
             assert_eq!(pauses, 1);
         }
     }
@@ -1145,12 +1216,22 @@ mod tests {
         d.mark_deferred(old, Instant::now() + Duration::from_secs(1));
         let mut replacement = None;
         let mut reads = [Some(7), Some(42)].into_iter();
-        reconcile_activation(&d, 42, || reads.next().expect("cancelled notification"), |_| {
-            d.cancel_deferred(42);
-            replacement = Some(d.add(Some(42), 7, "test.early_new"));
-        }, |_| panic!("a new lease must not inherit an old notification"));
+        reconcile_activation(
+            &d,
+            42,
+            || reads.next().expect("cancelled notification"),
+            |_| {
+                d.cancel_deferred(42);
+                replacement = Some(d.add(Some(42), 7, "test.early_new"));
+            },
+            |_| panic!("a new lease must not inherit an old notification"),
+        );
         assert!(!d.entries.lock().unwrap().contains_key(&old.0));
-        assert!(d.entries.lock().unwrap().contains_key(&replacement.unwrap().0));
+        assert!(d
+            .entries
+            .lock()
+            .unwrap()
+            .contains_key(&replacement.unwrap().0));
     }
 
     #[test]
@@ -1158,9 +1239,20 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let handle = d.add(Some(42), 7, "test.early_expires");
         let mut reads = [Some(7), Some(42)].into_iter();
-        reconcile_activation(&d, 42, || reads.next().expect("expired notification"), |_| {
-            d.entries.lock().unwrap().get_mut(&handle.0).unwrap().deadline = Instant::now();
-        }, |_| panic!("expired authority must not be renewed"));
+        reconcile_activation(
+            &d,
+            42,
+            || reads.next().expect("expired notification"),
+            |_| {
+                d.entries
+                    .lock()
+                    .unwrap()
+                    .get_mut(&handle.0)
+                    .unwrap()
+                    .deadline = Instant::now();
+            },
+            |_| panic!("expired authority must not be renewed"),
+        );
     }
 
     #[test]
@@ -1168,12 +1260,26 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let handle = d.add(Some(42), 7, "test.early_anchor");
         let pending = d.early_activation_candidates(42, Some(7))[0];
-        assert_eq!(d.recheck_activation_candidate(pending, Some(7)), ActivationRecheck::Waiting);
+        assert_eq!(
+            d.recheck_activation_candidate(pending, Some(7)),
+            ActivationRecheck::Waiting
+        );
         assert!(d.snapshot_restore_candidates(99, Some(99)).is_empty());
-        assert_eq!(d.recheck_activation_candidate(pending, Some(42)), ActivationRecheck::Revoked);
+        assert_eq!(
+            d.recheck_activation_candidate(pending, Some(42)),
+            ActivationRecheck::Revoked
+        );
         let fresh = d.early_activation_candidates(42, Some(99))[0];
-        d.entries.lock().unwrap().get_mut(&handle.0).unwrap().target_pid = Some(123);
-        assert_eq!(d.recheck_activation_candidate(fresh, Some(42)), ActivationRecheck::Revoked);
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&handle.0)
+            .unwrap()
+            .target_pid = Some(123);
+        assert_eq!(
+            d.recheck_activation_candidate(fresh, Some(42)),
+            ActivationRecheck::Revoked
+        );
     }
 
     #[test]
@@ -1181,13 +1287,23 @@ mod tests {
         for target in [None, Some(7), Some(99)] {
             let d = Arc::new(Dispatcher::new());
             let _handle = d.add(target, 7, "test.early_scope");
-            reconcile_activation(&d, 42, || Some(7), |_| panic!("no matching target scope"),
-                |_| panic!("no matching target scope"));
+            reconcile_activation(
+                &d,
+                42,
+                || Some(7),
+                |_| panic!("no matching target scope"),
+                |_| panic!("no matching target scope"),
+            );
         }
         let d = Arc::new(Dispatcher::new());
         let _allowed = d.add_allowing(42, 7, "test.early_allowed");
-        reconcile_activation(&d, 42, || Some(7), |_| panic!("intentional activation"),
-            |_| panic!("intentional activation"));
+        reconcile_activation(
+            &d,
+            42,
+            || Some(7),
+            |_| panic!("intentional activation"),
+            |_| panic!("intentional activation"),
+        );
     }
 
     #[test]
@@ -1196,8 +1312,13 @@ mod tests {
         let handle = d.add(Some(42), 7, "test.early_no_activation");
         let deadline = d.entries.lock().unwrap()[&handle.0].deadline;
         let mut pauses = Vec::new();
-        reconcile_activation(&d, 42, || Some(7), |duration| pauses.push(duration),
-            |_| panic!("no target activation occurred"));
+        reconcile_activation(
+            &d,
+            42,
+            || Some(7),
+            |duration| pauses.push(duration),
+            |_| panic!("no target activation occurred"),
+        );
         assert!(!pauses.is_empty() && pauses.len() <= ACTIVATION_RECHECK_LIMIT);
         assert!(pauses.iter().all(|&d| d <= ACTIVATION_RECHECK_INTERVAL));
         assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, deadline);
@@ -1208,8 +1329,15 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _handle = d.add(Some(42), 7, "test.already_settled");
         let mut submitted = Vec::new();
-        reconcile_activation(&d, 42, || Some(42), |_| panic!("settled event must not wait"),
-            |candidate| { d.submit_restore_if_current(candidate, || Some(42), |pid| submitted.push(pid)); });
+        reconcile_activation(
+            &d,
+            42,
+            || Some(42),
+            |_| panic!("settled event must not wait"),
+            |candidate| {
+                d.submit_restore_if_current(candidate, || Some(42), |pid| submitted.push(pid));
+            },
+        );
         assert_eq!(submitted, vec![7]);
     }
 
@@ -1538,16 +1666,31 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.exact_completion");
         let evidence = crate::foreground_activity::RestoreEvidence::for_test(7, 70, 3);
-        d.entries.lock().unwrap().get_mut(&h.0).unwrap().activity_restore = Some(evidence);
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&h.0)
+            .unwrap()
+            .activity_restore = Some(evidence);
         let candidate = d.snapshot_restore_candidates(42, Some(42))[0];
         assert!(d.submit_restore_if_current(candidate, || Some(42), |_| {}));
-        (d, h, RestoreCompletion { candidate, evidence })
+        (
+            d,
+            h,
+            RestoreCompletion {
+                candidate,
+                evidence,
+            },
+        )
     }
 
     #[test]
     fn restoration_completion_uses_original_entry_after_submission_lock_is_released() {
         let (d, _, completion) = submitted_completion_fixture();
-        assert!(d.entries.try_lock().is_ok(), "AX completion must be able to reacquire the lease");
+        assert!(
+            d.entries.try_lock().is_ok(),
+            "AX completion must be able to reacquire the lease"
+        );
         assert!(d.restoration_completion_is_current(completion, || Some(7)));
         for newer_or_unresolved_front in [Some(42), Some(99), None] {
             assert!(!d.restoration_completion_is_current(completion, || newer_or_unresolved_front));
@@ -1561,13 +1704,25 @@ mod tests {
         assert!(d.restoration_completion_is_current(completion, || Some(7)));
         d.cancel_deferred(42);
         let replacement = d.add(Some(42), 7, "test.replacement");
-        d.entries.lock().unwrap().get_mut(&replacement.0).unwrap().activity_restore = Some(completion.evidence);
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&replacement.0)
+            .unwrap()
+            .activity_restore = Some(completion.evidence);
         assert!(!d.restoration_completion_is_current(completion, || Some(7)));
     }
 
     #[test]
     fn restoration_completion_rechecks_deadline_destination_target_and_activity_identity() {
-        for change in ["expired", "destination", "target", "allowed", "evidence", "missing_evidence"] {
+        for change in [
+            "expired",
+            "destination",
+            "target",
+            "allowed",
+            "evidence",
+            "missing_evidence",
+        ] {
             let (d, h, completion) = submitted_completion_fixture();
             {
                 let mut entries = d.entries.lock().unwrap();
@@ -1577,12 +1732,19 @@ mod tests {
                     "destination" => entry.restore_to = 99,
                     "target" => entry.target_pid = Some(99),
                     "allowed" => entry.allowed_pid = Some(42),
-                    "evidence" => entry.activity_restore = Some(crate::foreground_activity::RestoreEvidence::for_test(7, 70, 4)),
+                    "evidence" => {
+                        entry.activity_restore = Some(
+                            crate::foreground_activity::RestoreEvidence::for_test(7, 70, 4),
+                        )
+                    }
                     "missing_evidence" => entry.activity_restore = None,
                     _ => unreachable!(),
                 }
             }
-            assert!(!d.restoration_completion_is_current(completion, || Some(7)), "{change}");
+            assert!(
+                !d.restoration_completion_is_current(completion, || Some(7)),
+                "{change}"
+            );
         }
     }
 
@@ -1591,7 +1753,9 @@ mod tests {
         let (d, h, completion) = submitted_completion_fixture();
         let mut completed_operations = Vec::new();
         for operation in ["AXRaise", "AXMain", "AXFocused"] {
-            if !d.restoration_completion_is_current(completion, || Some(7)) { break; }
+            if !d.restoration_completion_is_current(completion, || Some(7)) {
+                break;
+            }
             completed_operations.push(operation);
             d.remove(h); // e.g. user starts an intentional foreground segment.
         }
@@ -1652,18 +1816,35 @@ mod tests {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut sender = Some(sender);
         private_lease(&d, h).defer_release_with_poll(
-            Instant::now() + Duration::from_secs(3), move |_, _diagnostics| {
-                assert!(dispatcher.entries.try_lock().is_err(), "poll must serialize with cancellation");
+            Instant::now() + Duration::from_secs(3),
+            move |_, _diagnostics| {
+                assert!(
+                    dispatcher.entries.try_lock().is_err(),
+                    "poll must serialize with cancellation"
+                );
                 let count = called.fetch_add(1, Ordering::SeqCst) + 1;
-                if count < 3 { return true; }
+                if count < 3 {
+                    return true;
+                }
                 sender.take().unwrap().send(()).unwrap();
                 false
-            });
+            },
+        );
         assert!(d.entries.lock().unwrap()[&h.0].returned_tail);
-        assert_eq!(polls.load(Ordering::SeqCst), 0, "cleanup must not block the response");
-        tokio::time::timeout(Duration::from_secs(2), receiver).await.unwrap().unwrap();
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "cleanup must not block the response"
+        );
+        tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(polls.load(Ordering::SeqCst), 3);
-        assert!(d.entries.lock().unwrap().contains_key(&h.0), "completed cleanup must retain focus protection");
+        assert!(
+            d.entries.lock().unwrap().contains_key(&h.0),
+            "completed cleanup must retain focus protection"
+        );
         d.cancel_deferred(42);
     }
 
@@ -1675,10 +1856,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let submitted = Arc::clone(&calls);
         private_lease(&d, h).defer_release_with_poll(
-            Instant::now() + Duration::from_secs(1), move |_, _diagnostics| {
+            Instant::now() + Duration::from_secs(1),
+            move |_, _diagnostics| {
                 submitted.fetch_add(1, Ordering::SeqCst);
                 true
-            });
+            },
+        );
         d.cancel_deferred(42);
         tokio::time::sleep(Duration::from_millis(180)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1690,8 +1873,11 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.active_ordering");
         let original = d.entries.lock().unwrap()[&h.0].deadline;
-        assert_eq!(d.with_current_targeted(h, |deadline| deadline), Some(original),
-            "an in-flight background action needs ordering protection before its response");
+        assert_eq!(
+            d.with_current_targeted(h, |deadline| deadline),
+            Some(original),
+            "an in-flight background action needs ordering protection before its response"
+        );
     }
 
     #[tokio::test]
@@ -1719,26 +1905,47 @@ mod tests {
                     true
                 }
                 2 => {
-                    assert!(second_tx.take().unwrap()
-                        .send((diagnostics, first_completed.unwrap())).is_ok());
+                    assert!(second_tx
+                        .take()
+                        .unwrap()
+                        .send((diagnostics, first_completed.unwrap()))
+                        .is_ok());
                     false
                 }
                 _ => panic!("false callback must end the single polling task"),
             }
         }));
-        let first = tokio::time::timeout(Duration::from_secs(2), first_rx).await.unwrap().unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), first_rx)
+            .await
+            .unwrap()
+            .unwrap();
         // Make one check span several polling intervals. The next wait must
         // begin after it returns, rather than replaying any missed ticks.
         tokio::time::sleep(Duration::from_millis(80)).await;
         release_tx.send(()).unwrap();
-        let (second, completed) = tokio::time::timeout(Duration::from_secs(2), second_rx).await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(2), lease.poll_task.take().unwrap()).await.unwrap().unwrap();
+        let (second, completed) = tokio::time::timeout(Duration::from_secs(2), second_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), lease.poll_task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         for diagnostics in [first, second] {
-            assert_eq!(diagnostics.source, crate::order_diagnostics::CheckSource::ActivePoll);
-            assert_eq!(diagnostics.timing.scheduled_wake - diagnostics.timing.wait_started,
-                Duration::from_millis(25), "inspect the actual timer plan, not the constant");
+            assert_eq!(
+                diagnostics.source,
+                crate::order_diagnostics::CheckSource::ActivePoll
+            );
+            assert_eq!(
+                diagnostics.timing.scheduled_wake - diagnostics.timing.wait_started,
+                Duration::from_millis(25),
+                "inspect the actual timer plan, not the constant"
+            );
         }
-        assert!(second.timing.wait_started >= completed, "no catch-up after a slow check");
+        assert!(
+            second.timing.wait_started >= completed,
+            "no catch-up after a slow check"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(d.entries.lock().unwrap()[&h.0].deadline, deadline);
         drop(lease);
@@ -1760,16 +1967,28 @@ mod tests {
         let mut entered_tx = Some(entered_tx);
         assert!(lease.start_polling(move |observed_deadline, _| {
             assert_eq!(observed_deadline, deadline);
-            assert_eq!(submitted.fetch_add(1, Ordering::SeqCst), 0,
-                "expired lease cannot authorize another callback");
+            assert_eq!(
+                submitted.fetch_add(1, Ordering::SeqCst),
+                0,
+                "expired lease cannot authorize another callback"
+            );
             entered_tx.take().unwrap().send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             true
         }));
-        tokio::time::timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
-        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline + Duration::from_millis(10))).await;
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            deadline + Duration::from_millis(10),
+        ))
+        .await;
         release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), lease.poll_task.take().unwrap()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), lease.poll_task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(lease.targeted_deadline().is_none());
         drop(lease);
@@ -1793,24 +2012,39 @@ mod tests {
             assert_eq!(observed_deadline, deadline);
             match submitted.fetch_add(1, Ordering::SeqCst) + 1 {
                 1 => {
-                    assert_eq!(diagnostics.source, crate::order_diagnostics::CheckSource::ActivePoll);
+                    assert_eq!(
+                        diagnostics.source,
+                        crate::order_diagnostics::CheckSource::ActivePoll
+                    );
                     first_tx.take().unwrap().send(()).unwrap();
-                },
+                }
                 3 => {
-                    assert_eq!(diagnostics.source, crate::order_diagnostics::CheckSource::DeferredPoll);
-                    third_tx.take().unwrap().send(()).unwrap(); return false;
-                },
-                _ => {},
+                    assert_eq!(
+                        diagnostics.source,
+                        crate::order_diagnostics::CheckSource::DeferredPoll
+                    );
+                    third_tx.take().unwrap().send(()).unwrap();
+                    return false;
+                }
+                _ => {}
             }
             true
         }));
-        tokio::time::timeout(Duration::from_secs(2), first_rx).await.unwrap().unwrap();
-        assert!(!d.entries.lock().unwrap()[&h.0].returned_tail,
-            "the first ordering check must precede the response handoff");
+        tokio::time::timeout(Duration::from_secs(2), first_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !d.entries.lock().unwrap()[&h.0].returned_tail,
+            "the first ordering check must precede the response handoff"
+        );
         lease.defer_release_with_poll(deadline + Duration::from_secs(30), |_, _| {
             panic!("handoff must not replace or duplicate the existing guard")
         });
-        tokio::time::timeout(Duration::from_secs(2), third_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), third_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(d.entries.lock().unwrap()[&h.0].deadline, deadline);
         assert!(d.entries.lock().unwrap()[&h.0].returned_tail);
@@ -1822,13 +2056,23 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.diagnostic_handoff");
         let deadline = d.entries.lock().unwrap()[&h.0].deadline;
-        assert_eq!(d.with_current_targeted_state(h, |deadline, tail| (deadline, tail)),
-            Some((deadline, false)));
-        assert_eq!(d.mark_deferred(h, deadline + Duration::from_secs(30)), Some(deadline));
-        assert_eq!(d.with_current_targeted_state(h, |deadline, tail| (deadline, tail)),
-            Some((deadline, true)));
+        assert_eq!(
+            d.with_current_targeted_state(h, |deadline, tail| (deadline, tail)),
+            Some((deadline, false))
+        );
+        assert_eq!(
+            d.mark_deferred(h, deadline + Duration::from_secs(30)),
+            Some(deadline)
+        );
+        assert_eq!(
+            d.with_current_targeted_state(h, |deadline, tail| (deadline, tail)),
+            Some((deadline, true))
+        );
         d.cancel_deferred(42);
-        assert_eq!(d.with_current_targeted_state(h, |_, _| panic!("cancelled lease")), None::<()>);
+        assert_eq!(
+            d.with_current_targeted_state(h, |_, _| panic!("cancelled lease")),
+            None::<()>
+        );
     }
 
     #[tokio::test]
@@ -1864,19 +2108,32 @@ mod tests {
             release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             false
         }));
-        tokio::time::timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
         let (dropping_tx, dropping_rx) = tokio::sync::oneshot::channel();
         let mut dropping = tokio::task::spawn_blocking(move || {
             dropping_tx.send(()).unwrap();
             drop(lease);
         });
         dropping_rx.await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(30), &mut dropping).await.is_err(),
-            "Drop must not return while an authorized callback can still act");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut dropping)
+                .await
+                .is_err(),
+            "Drop must not return while an authorized callback can still act"
+        );
         release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), dropping).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dropping)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(d.len(), 0);
-        assert_eq!(d.with_current_targeted(h, |_| panic!("removed lease")), None::<()>);
+        assert_eq!(
+            d.with_current_targeted(h, |_| panic!("removed lease")),
+            None::<()>
+        );
     }
 
     #[tokio::test]
@@ -1911,16 +2168,28 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.poll_lifecycle");
         let wildcard = d.add(None, 7, "test.wildcard_poll");
-        assert_eq!(d.with_current_targeted(wildcard, |_| panic!("wildcard has no ordering authority")), None::<()>);
+        assert_eq!(
+            d.with_current_targeted(wildcard, |_| panic!("wildcard has no ordering authority")),
+            None::<()>
+        );
         d.mark_deferred(h, Instant::now() + Duration::from_secs(1));
-        assert_eq!(d.with_current_targeted(h, |deadline| {
-            assert!(deadline > Instant::now());
-            9
-        }), Some(9));
+        assert_eq!(
+            d.with_current_targeted(h, |deadline| {
+                assert!(deadline > Instant::now());
+                9
+            }),
+            Some(9)
+        );
         d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline = Instant::now();
-        assert_eq!(d.with_current_targeted(h, |_| panic!("expired tail")), None::<()>);
+        assert_eq!(
+            d.with_current_targeted(h, |_| panic!("expired tail")),
+            None::<()>
+        );
         d.cancel_deferred(42);
-        assert_eq!(d.with_current_targeted(h, |_| panic!("cancelled tail")), None::<()>);
+        assert_eq!(
+            d.with_current_targeted(h, |_| panic!("cancelled tail")),
+            None::<()>
+        );
     }
 
     #[test]

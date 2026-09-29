@@ -5,7 +5,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -23,7 +26,13 @@ pub(crate) struct MenuContextLease<T = SyntheticTargetFocusContext> {
 
 impl<T> MenuContextLease<T> {
     pub(crate) fn new(context: T, owner: String, pid: i32, window_id: u32) -> Self {
-        Self { context, started: Instant::now(), owner, pid, window_id }
+        Self {
+            context,
+            started: Instant::now(),
+            owner,
+            pid,
+            window_id,
+        }
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -36,20 +45,43 @@ struct ContextEntries<T> {
 }
 
 impl<T> Default for ContextEntries<T> {
-    fn default() -> Self { Self { by_pid: HashMap::new() } }
+    fn default() -> Self {
+        Self {
+            by_pid: HashMap::new(),
+        }
+    }
 }
 
 impl<T> ContextEntries<T> {
-    fn take(&mut self, owner: &str, pid: i32, window_id: u32) -> Result<Option<MenuContextLease<T>>, ()> {
-        if self.by_pid.get(&pid).is_some_and(|entry| entry.owner != owner || entry.window_id != window_id) {
+    fn take(
+        &mut self,
+        owner: &str,
+        pid: i32,
+        window_id: u32,
+    ) -> Result<Option<MenuContextLease<T>>, ()> {
+        if self
+            .by_pid
+            .get(&pid)
+            .is_some_and(|entry| entry.owner != owner || entry.window_id != window_id)
+        {
             return Err(());
         }
         Ok(self.by_pid.remove(&pid))
     }
 
-    fn remove_where(&mut self, predicate: impl Fn(&MenuContextLease<T>) -> bool) -> Vec<MenuContextLease<T>> {
-        let pids: Vec<_> = self.by_pid.iter().filter(|(_, e)| predicate(e)).map(|(pid, _)| *pid).collect();
-        pids.into_iter().filter_map(|pid| self.by_pid.remove(&pid)).collect()
+    fn remove_where(
+        &mut self,
+        predicate: impl Fn(&MenuContextLease<T>) -> bool,
+    ) -> Vec<MenuContextLease<T>> {
+        let pids: Vec<_> = self
+            .by_pid
+            .iter()
+            .filter(|(_, e)| predicate(e))
+            .map(|(pid, _)| *pid)
+            .collect();
+        pids.into_iter()
+            .filter_map(|pid| self.by_pid.remove(&pid))
+            .collect()
     }
 }
 
@@ -60,11 +92,18 @@ pub(crate) struct MenuContextRegistry {
 
 impl MenuContextRegistry {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self { entries: Mutex::new(ContextEntries::default()), reaper_started: AtomicBool::new(false) })
+        Arc::new(Self {
+            entries: Mutex::new(ContextEntries::default()),
+            reaper_started: AtomicBool::new(false),
+        })
     }
 
     fn remove_where(&self, predicate: impl Fn(&MenuContextLease) -> bool) {
-        let removed = self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove_where(predicate);
+        let removed = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_where(predicate);
         // Drop posts only the retained target's synthetic deactivation. Never
         // hold the registry lock during native cleanup or address the real front.
         drop(removed);
@@ -72,10 +111,17 @@ impl MenuContextRegistry {
 
     fn expire(&self) {
         let now = Instant::now();
-        self.remove_where(|entry| entry.expired(now) || cua_driver_core::session::is_session_ended(&entry.owner));
+        self.remove_where(|entry| {
+            entry.expired(now) || cua_driver_core::session::is_session_ended(&entry.owner)
+        });
     }
 
-    pub(crate) fn take(&self, owner: Option<&str>, pid: i32, window_id: u32) -> anyhow::Result<Option<MenuContextLease>> {
+    pub(crate) fn take(
+        &self,
+        owner: Option<&str>,
+        pid: i32,
+        window_id: u32,
+    ) -> anyhow::Result<Option<MenuContextLease>> {
         self.expire();
         let owner = owner.filter(|owner| !owner.is_empty());
         // Anonymous one-shot calls cannot acquire another transport's lease.
@@ -87,26 +133,32 @@ impl MenuContextRegistry {
         if cua_driver_core::session::is_session_ended(owner) {
             anyhow::bail!("application-menu session ended; no input was sent");
         }
-        entries.take(owner, pid, window_id).map_err(|()| anyhow::anyhow!(
+        entries.take(owner, pid, window_id).map_err(|()| {
+            anyhow::anyhow!(
             "application-menu context belongs to another session or exact window; no input was sent"
-        ))
+        )
+        })
     }
 
     /// Retain only after a fresh, exact visible-menu proof in the caller. The
     /// original deadline survives transfers across actions and cannot be renewed.
     pub(crate) fn park(self: &Arc<Self>, lease: MenuContextLease) -> anyhow::Result<()> {
-        if lease.expired(Instant::now()) || cua_driver_core::session::is_session_ended(&lease.owner) {
+        if lease.expired(Instant::now()) || cua_driver_core::session::is_session_ended(&lease.owner)
+        {
             return Ok(()); // RAII ends this context without sending further input.
         }
         if !self.reaper_started.swap(true, Ordering::AcqRel) {
             let weak = Arc::downgrade(self);
-            if let Err(error) = std::thread::Builder::new().name("cua-menu-cleanup".into()).spawn(move || {
-                loop {
+            if let Err(error) = std::thread::Builder::new()
+                .name("cua-menu-cleanup".into())
+                .spawn(move || loop {
                     std::thread::sleep(Duration::from_millis(250));
-                    let Some(registry) = weak.upgrade() else { break };
+                    let Some(registry) = weak.upgrade() else {
+                        break;
+                    };
                     registry.expire();
-                }
-            }) {
+                })
+            {
                 self.reaper_started.store(false, Ordering::Release);
                 return Err(error.into());
             }
@@ -114,7 +166,8 @@ impl MenuContextRegistry {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         // The action retains the native per-PID mutation lease through this
         // insertion. A concurrent session end still wins at the final check.
-        if cua_driver_core::session::is_session_ended(&lease.owner) || lease.expired(Instant::now()) {
+        if cua_driver_core::session::is_session_ended(&lease.owner) || lease.expired(Instant::now())
+        {
             drop(entries);
             return Ok(());
         }
@@ -126,8 +179,12 @@ impl MenuContextRegistry {
         Ok(())
     }
 
-    pub(crate) fn clear_session(&self, session: &str) { self.remove_where(|entry| entry.owner == session); }
-    pub(crate) fn clear_all(&self) { self.remove_where(|_| true); }
+    pub(crate) fn clear_session(&self, session: &str) {
+        self.remove_where(|entry| entry.owner == session);
+    }
+    pub(crate) fn clear_all(&self) {
+        self.remove_where(|_| true);
+    }
 }
 
 #[cfg(test)]
@@ -136,9 +193,18 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     struct Cleanup(Arc<AtomicUsize>);
-    impl Drop for Cleanup { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
-    fn entry(owner: &str, pid: i32, window: u32, count: &Arc<AtomicUsize>) -> MenuContextLease<Cleanup> {
+    fn entry(
+        owner: &str,
+        pid: i32,
+        window: u32,
+        count: &Arc<AtomicUsize>,
+    ) -> MenuContextLease<Cleanup> {
         MenuContextLease::new(Cleanup(count.clone()), owner.into(), pid, window)
     }
 

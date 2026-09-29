@@ -183,10 +183,21 @@ mod tests {
         let tool = PrepareObservationTool;
         let def = tool.def();
         assert!(!def.read_only && !def.idempotent && !def.open_world);
-        assert_eq!(def.input_schema["required"],
-            json!(["pid", "window_id", "foreground_segment_id", "delivery_mode"]));
+        assert_eq!(
+            def.input_schema["required"],
+            json!(["pid", "window_id", "foreground_segment_id", "delivery_mode"])
+        );
         assert_eq!(def.input_schema["additionalProperties"], false);
-        for forbidden in ["host_pid", "host_window_id", "text", "key", "x", "y", "duration", "session_id"] {
+        for forbidden in [
+            "host_pid",
+            "host_window_id",
+            "text",
+            "key",
+            "x",
+            "y",
+            "duration",
+            "session_id",
+        ] {
             assert!(def.input_schema["properties"].get(forbidden).is_none());
         }
     }

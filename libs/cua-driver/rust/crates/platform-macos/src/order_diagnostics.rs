@@ -335,7 +335,10 @@ mod tests {
         for _ in 0..16 {
             assert_eq!(site.sequence_if_enabled(true), None);
         }
-        assert_eq!(site.count.load(Ordering::Relaxed), CALLSITE_RECORD_LIMIT + 1);
+        assert_eq!(
+            site.count.load(Ordering::Relaxed),
+            CALLSITE_RECORD_LIMIT + 1
+        );
     }
 
     #[test]

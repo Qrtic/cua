@@ -8,8 +8,7 @@ use super::bindings::{
     ax_get_window_id, copy_element_attr, copy_string_attr, kAXErrorAttributeUnsupported,
     kAXErrorSuccess, try_copy_ax_windows, try_copy_bool_attr, AXError,
     AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementGetPid,
-    AXUIElementGetTypeID, AXUIElementRef,
-    AXUIElementSetMessagingTimeout,
+    AXUIElementGetTypeID, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 use core_foundation::{
     array::CFArray,
@@ -82,7 +81,10 @@ fn prove_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Attac
 }
 
 fn prove_chain_with_dialog_probe<T: SheetTree>(
-    tree: &T, pid: i32, requested: u32, mut probe: Option<&mut StandardDialogProbe>,
+    tree: &T,
+    pid: i32,
+    requested: u32,
+    mut probe: Option<&mut StandardDialogProbe>,
 ) -> Option<Attachment<T::Node>> {
     let (focused, sheet) = selected_sheet(tree)?;
     if tree.window_id(&sheet) != Some(requested) {
@@ -172,8 +174,10 @@ fn prove_chain_with_dialog_probe<T: SheetTree>(
     // sheet invalidates a host-focused proof even when AXFocusedWindow stays
     // unchanged throughout the operation.
     let (current_focus, current_sheet) = selected_sheet(tree)?;
-    (tree.same(&current_focus, &focused) && tree.same(&current_sheet, &sheet)
-        && tree.within_budget()).then_some(chain)
+    (tree.same(&current_focus, &focused)
+        && tree.same(&current_sheet, &sheet)
+        && tree.within_budget())
+    .then_some(chain)
 }
 
 fn prove<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::Node> {
@@ -198,18 +202,30 @@ fn dialog_chain<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<Atta
 }
 
 fn dialog_chain_with_probe<T: SheetTree>(
-    tree: &T, pid: i32, requested: u32, mut probe: Option<&mut StandardDialogProbe>,
+    tree: &T,
+    pid: i32,
+    requested: u32,
+    mut probe: Option<&mut StandardDialogProbe>,
 ) -> Option<Attachment<T::Node>> {
     let chain = prove_chain_with_dialog_probe(tree, pid, requested, probe.as_deref_mut())?;
-    let direct_standard = probe.as_ref().is_some_and(|probe| probe.direct_standard_identifier);
+    let direct_standard = probe
+        .as_ref()
+        .is_some_and(|probe| probe.direct_standard_identifier);
     // A nested dialog is eligible only through a proven standard Open/Save
     // panel ancestor. An arbitrary AXSheet or same-PID sibling is insufficient.
-    if !chain.nodes.iter().take(chain.nodes.len() - 1).enumerate().any(|(index, node)| {
-        (index == 0 && direct_standard) || matches!(
-            tree.identifier(node).as_deref(),
-            Some("save-panel" | "open-panel")
-        )
-    }) || !visible_chain(tree, pid, &chain)
+    if !chain
+        .nodes
+        .iter()
+        .take(chain.nodes.len() - 1)
+        .enumerate()
+        .any(|(index, node)| {
+            (index == 0 && direct_standard)
+                || matches!(
+                    tree.identifier(node).as_deref(),
+                    Some("save-panel" | "open-panel")
+                )
+        })
+        || !visible_chain(tree, pid, &chain)
     {
         return None;
     }
@@ -236,15 +252,16 @@ fn dialog_host<T: SheetTree>(tree: &T, pid: i32, requested: u32) -> Option<T::No
 // standard panel, or an unreadable panel identifier, must not gain a second
 // admission path after the existing file-dialog proof refuses it.
 fn ordinary_keyboard_leaf<T: SheetTree>(tree: &T, chain: &Attachment<T::Node>) -> Option<()> {
-    if chain.nodes.len() < 2
-        || tree.role(chain.nodes.last()?).as_deref() != Some("AXWindow")
-    {
+    if chain.nodes.len() < 2 || tree.role(chain.nodes.last()?).as_deref() != Some("AXWindow") {
         return None;
     }
     for sheet in chain.nodes.iter().take(chain.nodes.len().checked_sub(1)?) {
         if !tree.within_budget()
             || tree.role(sheet).as_deref() != Some("AXSheet")
-            || matches!(tree.identifier(sheet)?.as_str(), "save-panel" | "open-panel")
+            || matches!(
+                tree.identifier(sheet)?.as_str(),
+                "save-panel" | "open-panel"
+            )
         {
             return None;
         }
@@ -252,8 +269,7 @@ fn ordinary_keyboard_leaf<T: SheetTree>(tree: &T, chain: &Attachment<T::Node>) -
     // AXFocusedWindow can lag behind a newly attached child. The old
     // discovery API intentionally accepts a focused sheet directly; that
     // alone is insufficient authority for a new global keyboard route.
-    (tree.within_budget() && tree.child_sheets(chain.nodes.first()?)?.is_empty())
-        .then_some(())
+    (tree.within_budget() && tree.child_sheets(chain.nodes.first()?)?.is_empty()).then_some(())
 }
 
 fn keyboard_activation_chain<T: SheetTree>(
@@ -274,7 +290,7 @@ fn keyboard_activation_chain<T: SheetTree>(
     (same_attachment(tree, &chain, &current)
         && visible_chain(tree, pid, &current)
         && tree.within_budget())
-        .then_some(chain)
+    .then_some(chain)
 }
 
 fn same_attachment<T: SheetTree>(
@@ -284,7 +300,11 @@ fn same_attachment<T: SheetTree>(
 ) -> bool {
     expected.window_ids == current.window_ids
         && expected.nodes.len() == current.nodes.len()
-        && expected.nodes.iter().zip(&current.nodes).all(|(a, b)| tree.same(a, b))
+        && expected
+            .nodes
+            .iter()
+            .zip(&current.nodes)
+            .all(|(a, b)| tree.same(a, b))
 }
 
 fn keyboard_activation_matches<T: SheetTree>(
@@ -352,7 +372,11 @@ impl KeyboardSheetActivation {
     }
 
     pub(crate) fn host_id(&self) -> u32 {
-        *self.chain.window_ids.last().expect("proven attachment host ID")
+        *self
+            .chain
+            .window_ids
+            .last()
+            .expect("proven attachment host ID")
     }
 
     /// Re-read every reciprocal edge and compare retained native identities.
@@ -363,7 +387,10 @@ impl KeyboardSheetActivation {
             false
         } else if let Some(app) = unsafe { Node::owned(AXUIElementCreateApplication(self.pid)) } {
             keyboard_activation_matches(
-                &NativeTree { app, deadline: self.deadline },
+                &NativeTree {
+                    app,
+                    deadline: self.deadline,
+                },
                 self.pid,
                 self.window_id,
                 &self.chain,
@@ -405,7 +432,12 @@ pub(crate) fn copy_keyboard_sheet_activation(
         deadline,
     };
     let chain = keyboard_activation_chain(&tree, pid, window_id)?;
-    Some(KeyboardSheetActivation { pid, window_id, chain, deadline })
+    Some(KeyboardSheetActivation {
+        pid,
+        window_id,
+        chain,
+        deadline,
+    })
 }
 
 fn prove_with_visibility<T: SheetTree>(
@@ -507,7 +539,8 @@ impl SheetTree for NativeTree {
             let attr = CFString::new("AXChildren");
             let mut value: CFTypeRef = std::ptr::null();
             if AXUIElementCopyAttributeValue(node.0, attr.as_concrete_TypeRef(), &mut value)
-                != kAXErrorSuccess || value.is_null()
+                != kAXErrorSuccess
+                || value.is_null()
             {
                 return None;
             }
@@ -516,16 +549,24 @@ impl SheetTree for NativeTree {
                 return None;
             }
             let children = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
-            if children.len() > 1024 { return None; }
+            if children.len() > 1024 {
+                return None;
+            }
             let mut sheets = Vec::new();
             for index in 0..children.len() {
-                if !self.within_budget() { return None; }
+                if !self.within_budget() {
+                    return None;
+                }
                 let ptr = *children.get(index)?;
-                if CFGetTypeID(ptr) != AXUIElementGetTypeID() { return None; }
+                if CFGetTypeID(ptr) != AXUIElementGetTypeID() {
+                    return None;
+                }
                 CFRetain(ptr);
                 let child = Node::owned(ptr as AXUIElementRef)?;
                 let role = self.role(&child)?;
-                if role == "AXSheet" { sheets.push(child); }
+                if role == "AXSheet" {
+                    sheets.push(child);
+                }
             }
             Some(sheets)
         }
@@ -602,21 +643,28 @@ pub(crate) struct AttachedSheetSuccessor {
     pub path: Vec<u32>,
 }
 
-fn prove_successor<T: SheetTree>(tree: &T, pid: i32, source: u32) -> Option<AttachedSheetSuccessor> {
+fn prove_successor<T: SheetTree>(
+    tree: &T,
+    pid: i32,
+    source: u32,
+) -> Option<AttachedSheetSuccessor> {
     let (_, selected) = selected_sheet(tree)?;
     let requested = tree.window_id(&selected)?;
     if requested == source {
         return None;
     }
     let chain = prove_chain(tree, pid, requested)?;
-    if !chain.window_ids.iter().skip(1).any(|id| *id == source)
-        || !visible_chain(tree, pid, &chain)
+    if !chain.window_ids.iter().skip(1).any(|id| *id == source) || !visible_chain(tree, pid, &chain)
     {
         return None;
     }
     let current = prove_chain(tree, pid, requested)?;
     if chain.window_ids != current.window_ids
-        || !chain.nodes.iter().zip(&current.nodes).all(|(a, b)| tree.same(a, b))
+        || !chain
+            .nodes
+            .iter()
+            .zip(&current.nodes)
+            .all(|(a, b)| tree.same(a, b))
         || !tree.within_budget()
     {
         return None;
@@ -638,12 +686,9 @@ pub(crate) enum FocusedSheetContext {
 // Its ancestors are not siblings taking over input. This proof is only for
 // excluding those exact ancestors from the generic geometry suspicion; it
 // grants no foreground lease, input alias or authority over another window.
-fn prove_focused_leaf_ancestors<T: SheetTree>(
-    tree: &T, pid: i32, source: u32,
-) -> Option<Vec<u32>> {
+fn prove_focused_leaf_ancestors<T: SheetTree>(tree: &T, pid: i32, source: u32) -> Option<Vec<u32>> {
     let focused = tree.focused()?;
-    if tree.role(&focused).as_deref() != Some("AXSheet")
-        || tree.window_id(&focused) != Some(source)
+    if tree.role(&focused).as_deref() != Some("AXSheet") || tree.window_id(&focused) != Some(source)
     {
         return None;
     }
@@ -668,22 +713,31 @@ fn prove_focused_leaf_ancestors<T: SheetTree>(
 }
 
 fn prove_focused_sheet_context<T: SheetTree>(
-    tree: &T, pid: i32, source: u32, inspect_exact_leaf: bool,
+    tree: &T,
+    pid: i32,
+    source: u32,
+    inspect_exact_leaf: bool,
 ) -> Option<FocusedSheetContext> {
     // Preserve the original positive successor path and its priority. Both
     // proofs share one tree/deadline; an exhausted read cannot start a new one.
     if let Some(proof) = prove_successor(tree, pid, source) {
         return Some(FocusedSheetContext::Successor(proof));
     }
-    if !inspect_exact_leaf || !tree.within_budget() { return None; }
-    prove_focused_leaf_ancestors(tree, pid, source)
-        .map(FocusedSheetContext::ExactLeafAncestors)
+    if !inspect_exact_leaf || !tree.within_budget() {
+        return None;
+    }
+    prove_focused_leaf_ancestors(tree, pid, source).map(FocusedSheetContext::ExactLeafAncestors)
 }
 
 pub(crate) fn focused_attached_sheet_context(
-    pid: i32, source: u32, inspect_exact_leaf: bool, deadline: Instant,
+    pid: i32,
+    source: u32,
+    inspect_exact_leaf: bool,
+    deadline: Instant,
 ) -> Option<FocusedSheetContext> {
-    if Instant::now() >= deadline { return None; }
+    if Instant::now() >= deadline {
+        return None;
+    }
     unsafe {
         let tree = NativeTree {
             app: Node::owned(AXUIElementCreateApplication(pid))?,
@@ -707,14 +761,14 @@ pub(crate) struct DialogAttachment {
 // reread after dialog_chain's two structural reads. A still-attached surface
 // whose standard-panel identifier disappears must not select the reduced
 // foreground preparation path.
-fn dialog_attachment<T: SheetTree>(
-    tree: &T, pid: i32, window_id: u32,
-) -> Option<DialogAttachment> {
+fn dialog_attachment<T: SheetTree>(tree: &T, pid: i32, window_id: u32) -> Option<DialogAttachment> {
     finish_dialog_attachment(tree, window_id, dialog_chain(tree, pid, window_id)?)
 }
 
 fn finish_dialog_attachment<T: SheetTree>(
-    tree: &T, window_id: u32, chain: Attachment<T::Node>,
+    tree: &T,
+    window_id: u32,
+    chain: Attachment<T::Node>,
 ) -> Option<DialogAttachment> {
     let panel = chain
         .nodes
@@ -765,11 +819,18 @@ pub(crate) fn focused_dialog_host(pid: i32, window_id: u32) -> Option<u32> {
 /// The same standard Open/Save attachment proof under the caller's existing
 /// deadline. This grants no new sheet/window match or activation authority.
 pub(crate) fn focused_dialog_host_before(
-    pid: i32, window_id: u32, deadline: Instant,
+    pid: i32,
+    window_id: u32,
+    deadline: Instant,
 ) -> Option<u32> {
-    if Instant::now() >= deadline { return None; }
+    if Instant::now() >= deadline {
+        return None;
+    }
     unsafe {
-        let tree = NativeTree { app: Node::owned(AXUIElementCreateApplication(pid))?, deadline };
+        let tree = NativeTree {
+            app: Node::owned(AXUIElementCreateApplication(pid))?,
+            deadline,
+        };
         dialog_attachment(&tree, pid, window_id).map(|chain| chain.host_id)
     }
 }
@@ -794,9 +855,13 @@ fn probe_standard_dialog<T: SheetTree>(tree: &T, pid: i32, window_id: u32) -> St
 /// both complete chain proofs and the original final identifier reread.
 /// Subsequent selected-dialog revalidation uses focused_dialog_host_before.
 pub(crate) fn probe_standard_dialog_before(
-    pid: i32, window_id: u32, deadline: Instant,
+    pid: i32,
+    window_id: u32,
+    deadline: Instant,
 ) -> StandardDialogProbe {
-    if Instant::now() >= deadline { return StandardDialogProbe::default(); }
+    if Instant::now() >= deadline {
+        return StandardDialogProbe::default();
+    }
     unsafe {
         let Some(app) = Node::owned(AXUIElementCreateApplication(pid)) else {
             return StandardDialogProbe::default();
@@ -849,9 +914,7 @@ fn result_sheet_windows_agree(
         && !successor.path.contains(&panel_id)
         && dialog_windows_allow_host_return(snapshot, pid, panel_id, host_id)
         && snapshot.windows.iter().any(|window| {
-            window.pid == pid
-                && window.window_id == successor.window_id
-                && window.is_on_screen
+            window.pid == pid && window.window_id == successor.window_id && window.is_on_screen
         })
 }
 
@@ -1061,7 +1124,9 @@ mod tests {
         fn child_sheets(&self, node: &FakeNode) -> Option<Vec<FakeNode>> {
             Some(if self.attached && node.identity == self.host.identity {
                 vec![self.sheet.clone()]
-            } else { Vec::new() })
+            } else {
+                Vec::new()
+            })
         }
         fn contains_child(&self, _parent: &FakeNode, child: &FakeNode) -> bool {
             self.attached && child.identity == self.sheet.identity
@@ -1136,8 +1201,10 @@ mod tests {
             } else {
                 tree.sheet.identity += 10;
             }
-            assert!(!keyboard_activation_matches(&tree, 42, 900, &proof),
-                "a reused native ID cannot replace the retained AX object");
+            assert!(
+                !keyboard_activation_matches(&tree, 42, 900, &proof),
+                "a reused native ID cannot replace the retained AX object"
+            );
         }
     }
 
@@ -1332,14 +1399,27 @@ mod tests {
     fn completed_save_result_sheet_requires_closed_panel_and_exact_original_host() {
         use crate::windows::{WindowBounds, WindowEnumeration, WindowInfo};
         let window = |id, pid, visible| WindowInfo {
-            window_id: id, pid, app_name: String::new(), title: String::new(),
-            bounds: WindowBounds { x: 0.0, y: 0.0, width: 100.0, height: 100.0 },
-            layer: 0, z_index: 0, is_on_screen: visible,
-            current_space_id: None, on_current_space: None, space_ids: None,
+            window_id: id,
+            pid,
+            app_name: String::new(),
+            title: String::new(),
+            bounds: WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            layer: 0,
+            z_index: 0,
+            is_on_screen: visible,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
         };
         let make_snapshot = || WindowEnumeration {
             windows: vec![window(700, 42, true), window(900, 42, true)],
-            current_space_id: None, succeeded: true,
+            current_space_id: None,
+            succeeded: true,
         };
         let make_tree = || pages_with_identifier("operation-progress");
         let successor = prove_dialog_result_sheet(&make_tree(), &make_snapshot(), 42, 800, 700)
@@ -1349,14 +1429,19 @@ mod tests {
         // This is NOT a new standard file-dialog input authority.
         assert!(dialog_host(&make_tree(), 42, 900).is_none());
         for (panel, host) in [(0, 700), (800, 0), (900, 700), (800, 701), (700, 700)] {
-            assert!(prove_dialog_result_sheet(&make_tree(), &make_snapshot(), 42, panel, host).is_none());
+            assert!(
+                prove_dialog_result_sheet(&make_tree(), &make_snapshot(), 42, panel, host)
+                    .is_none()
+            );
         }
         for old in [window(800, 42, true), window(800, 99, false)] {
             let mut changed = make_snapshot();
             changed.windows.push(old);
             assert!(prove_dialog_result_sheet(&make_tree(), &changed, 42, 800, 700).is_none());
-            assert!(!result_sheet_windows_agree(&changed, 42, 800, 700, &successor),
-                "Reappearing or reused panels invalidate a proof after AX reads too");
+            assert!(
+                !result_sheet_windows_agree(&changed, 42, 800, 700, &successor),
+                "Reappearing or reused panels invalidate a proof after AX reads too"
+            );
         }
         for row in 0..2 {
             let mut hidden = make_snapshot();

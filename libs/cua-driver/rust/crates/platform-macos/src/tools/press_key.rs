@@ -285,7 +285,9 @@ impl Tool for PressKeyTool {
             let key_for_input = key.clone();
             let result = crate::foreground_activity::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::foreground_activity::desktop::run(|| crate::input::keyboard::press_key_bare_global(&key_for_input, &modifier_refs))
+                crate::foreground_activity::desktop::run(|| {
+                    crate::input::keyboard::press_key_bare_global(&key_for_input, &modifier_refs)
+                })
             })
             .await;
             return match result {

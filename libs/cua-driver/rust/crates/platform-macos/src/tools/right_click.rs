@@ -225,7 +225,8 @@ impl Tool for RightClickTool {
 
             return match result {
                 Ok(Ok(msg)) => ToolResult::text(msg),
-                Ok(Err(e)) => match e.downcast_ref::<crate::ax::embedded_menu::StaleEmbeddedMenu>() {
+                Ok(Err(e)) => match e.downcast_ref::<crate::ax::embedded_menu::StaleEmbeddedMenu>()
+                {
                     Some(stale) => stale.result(pid, wid),
                     None => ToolResult::error(format!("Right-click failed: {e}")),
                 },

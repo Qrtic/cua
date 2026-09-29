@@ -47,7 +47,10 @@ impl RetainedElement {
         if ptr != 0 {
             CFRetain(ptr as AXUIElementRef as CFTypeRef);
         }
-        Self { ptr, embedded_menu: None }
+        Self {
+            ptr,
+            embedded_menu: None,
+        }
     }
 
     /// The raw pointer, valid for as long as this guard is held.
@@ -58,7 +61,11 @@ impl RetainedElement {
     /// The proof travels with the retained pointer, so a concurrent cache
     /// replacement cannot substitute a different menu's visibility evidence.
     pub(crate) fn validate_observation_scope(&self) -> anyhow::Result<()> {
-        if self.embedded_menu.as_ref().is_some_and(|menu| !menu.is_live()) {
+        if self
+            .embedded_menu
+            .as_ref()
+            .is_some_and(|menu| !menu.is_live())
+        {
             return Err(super::embedded_menu::StaleEmbeddedMenu.into());
         }
         Ok(())
@@ -130,7 +137,11 @@ impl ElementCache {
     }
 
     pub(crate) fn update_with_embedded_menu(
-        &self, pid: i32, window_id: u32, snapshot_id: Option<u32>, nodes: &[AXNode],
+        &self,
+        pid: i32,
+        window_id: u32,
+        snapshot_id: Option<u32>,
+        nodes: &[AXNode],
         embedded_menu: Option<std::sync::Arc<super::embedded_menu::EmbeddedMenuProof>>,
     ) {
         let elements: Vec<usize> = nodes
@@ -141,7 +152,10 @@ impl ElementCache {
         self.core.insert_for_snapshot(
             CacheKey { pid, window_id },
             snapshot_id,
-            CachedSnapshot { elements, embedded_menu },
+            CachedSnapshot {
+                elements,
+                embedded_menu,
+            },
         );
     }
 
@@ -166,7 +180,10 @@ impl ElementCache {
                     // snapshot (and thus this CFTypeRef) is alive right now.
                     unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
                 }
-                Some(RetainedElement { ptr, embedded_menu: s.embedded_menu.clone() })
+                Some(RetainedElement {
+                    ptr,
+                    embedded_menu: s.embedded_menu.clone(),
+                })
             })
             .flatten()
             .filter(|element| element.validate_observation_scope().is_ok())
@@ -187,7 +204,10 @@ impl ElementCache {
                 if ptr != 0 {
                     unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
                 }
-                Some(RetainedElement { ptr, embedded_menu: s.embedded_menu.clone() })
+                Some(RetainedElement {
+                    ptr,
+                    embedded_menu: s.embedded_menu.clone(),
+                })
             })
             .flatten()
             .filter(|element| element.validate_observation_scope().is_ok())
@@ -219,10 +239,19 @@ mod tests {
         let ptr = value.as_concrete_TypeRef() as usize;
         let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
         let cache = ElementCache::new();
-        unsafe { CFRetain(ptr as CFTypeRef); }
-        cache.update_with_embedded_menu(1, 2, Some(7), &[node_with_ptr(ptr)],
-            Some(super::super::embedded_menu::expired_test_proof()));
-        assert!(cache.get_element_retained_for_snapshot(1, 2, 7, 0).is_none());
+        unsafe {
+            CFRetain(ptr as CFTypeRef);
+        }
+        cache.update_with_embedded_menu(
+            1,
+            2,
+            Some(7),
+            &[node_with_ptr(ptr)],
+            Some(super::super::embedded_menu::expired_test_proof()),
+        );
+        assert!(cache
+            .get_element_retained_for_snapshot(1, 2, 7, 0)
+            .is_none());
         assert!(cache.get_element_retained(1, 2, 0).is_none());
         assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
         cache.update(1, 2, Some(8), &[]);
@@ -236,7 +265,9 @@ mod tests {
         guard.embedded_menu = Some(super::super::embedded_menu::expired_test_proof());
         let copied = guard.clone();
         drop(guard);
-        assert!(copied.validate_observation_scope().unwrap_err()
+        assert!(copied
+            .validate_observation_scope()
+            .unwrap_err()
             .is::<super::super::embedded_menu::StaleEmbeddedMenu>());
     }
 

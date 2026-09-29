@@ -342,7 +342,9 @@ impl ForegroundKeyboardPointerBackend for QuartzForegroundKeyboardPointer {
         &mut self,
         point: ForegroundKeyboardAnchor,
     ) -> anyhow::Result<()> {
-        crate::foreground_activity::restore_cursor_if_target_unchanged(|| Self::warp_admitted(point))
+        crate::foreground_activity::restore_cursor_if_target_unchanged(|| {
+            Self::warp_admitted(point)
+        })
     }
 
     fn post_mouse_moved(&mut self, point: ForegroundKeyboardAnchor) -> anyhow::Result<()> {
@@ -1359,7 +1361,15 @@ fn right_click_at_xy_inner(
     // button_number = 1 (right). Stamping 0 here routes the event as a left
     // button-number on the receiving side even though the type is rightMouseDown.
     post_mouse_event_with_mode(
-        pid, &down, window_local, wid, click_group_id, 1, 1, 3, post_mode,
+        pid,
+        &down,
+        window_local,
+        wid,
+        click_group_id,
+        1,
+        1,
+        3,
+        post_mode,
     );
     std::thread::sleep(std::time::Duration::from_millis(28));
 
@@ -1374,7 +1384,15 @@ fn right_click_at_xy_inner(
         up.set_flags(flags);
     }
     post_mouse_event_with_mode(
-        pid, &up, window_local, wid, click_group_id, 1, 1, 3, post_mode,
+        pid,
+        &up,
+        window_local,
+        wid,
+        click_group_id,
+        1,
+        1,
+        3,
+        post_mode,
     );
 
     Ok(())
@@ -1480,7 +1498,8 @@ fn post_mouse_event_with_mode(
         mode,
         || {
             private_closure_called = true;
-            let attempted = crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+            let attempted =
+                crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
             private_post_attempted = Some(attempted);
             attempted
         },

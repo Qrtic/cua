@@ -337,9 +337,15 @@ fn commit_transient_observation(
     app_context: Option<crate::transient_ui::AppContextHelperProof>,
 ) {
     if !observation_only {
-        registry.record_route(session, source, Some(crate::transient_ui::TransientRoute {
-            source, target, app_context,
-        }));
+        registry.record_route(
+            session,
+            source,
+            Some(crate::transient_ui::TransientRoute {
+                source,
+                target,
+                app_context,
+            }),
+        );
     }
 }
 
@@ -679,7 +685,10 @@ struct OwnedTreeWalk {
 
 impl OwnedTreeWalk {
     fn new(tree: crate::ax::tree::TreeWalkResult) -> Self {
-        Self { tree, handles_published: false }
+        Self {
+            tree,
+            handles_published: false,
+        }
     }
 
     fn publish_handles(
@@ -689,8 +698,13 @@ impl OwnedTreeWalk {
         window_id: u32,
         snapshot_id: Option<u32>,
     ) {
-        cache.update_with_embedded_menu(pid, window_id, snapshot_id, &self.tree.nodes,
-            self.tree.embedded_menu.clone());
+        cache.update_with_embedded_menu(
+            pid,
+            window_id,
+            snapshot_id,
+            &self.tree.nodes,
+            self.tree.embedded_menu.clone(),
+        );
         self.handles_published = true;
     }
 }
@@ -710,7 +724,12 @@ impl Drop for OwnedTreeWalk {
         if self.handles_published {
             return;
         }
-        for node in self.tree.nodes.iter().filter(|node| node.element_index.is_some()) {
+        for node in self
+            .tree
+            .nodes
+            .iter()
+            .filter(|node| node.element_index.is_some())
+        {
             if node.element_ptr != 0 {
                 unsafe { CFRelease(node.element_ptr as CFTypeRef) };
             }
@@ -1081,16 +1100,19 @@ impl Tool for GetWindowStateTool {
                 Ok(Ok((detection, app_context))) => match transient_target_from_detection(
                     detection,
                     source_target,
-                    cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(),
+                    cua_driver_core::tool::current_dispatch_allows_trusted_transient_target_rewrite(
+                    ),
                 ) {
                     Ok(target) => target.map(|target| crate::transient_ui::TransientRoute {
-                        source: source_target, target, app_context,
+                        source: source_target,
+                        target,
+                        app_context,
                     }),
                     Err(refusal) => return refusal,
                 },
                 _ => {
                     return ToolResult::error(
-                        "Could not prove the current transient UI for the requested host context."
+                        "Could not prove the current transient UI for the requested host context.",
                     )
                     .with_structured(serde_json::json!({
                         "code": "transient_ui_resolution_failed",
@@ -1198,7 +1220,11 @@ impl Tool for GetWindowStateTool {
                     )
                 } else if delegated_panel {
                     crate::ax::tree::walk_tree_bounded_strict_window(
-                        pid, window_id, q.as_deref(), max_elements, max_depth,
+                        pid,
+                        window_id,
+                        q.as_deref(),
+                        max_elements,
+                        max_depth,
                     )
                 } else if !observation_only {
                     crate::ax::tree::walk_tree_bounded_with_visible_menu(
@@ -1222,10 +1248,18 @@ impl Tool for GetWindowStateTool {
             match tokio::time::timeout(AX_TREE_TIMEOUT, walk_future).await {
                 Ok(Ok(result)) => Ok(Some(result)),
                 Ok(Err(error)) => Err(ax_tree_failure(
-                    pid, window_id, max_elements, max_depth, Some(&error.to_string()),
+                    pid,
+                    window_id,
+                    max_elements,
+                    max_depth,
+                    Some(&error.to_string()),
                 )),
                 Err(_elapsed) => Err(ax_tree_failure(
-                    pid, window_id, max_elements, max_depth, None,
+                    pid,
+                    window_id,
+                    max_elements,
+                    max_depth,
+                    None,
                 )),
             }
         };
@@ -1237,8 +1271,11 @@ impl Tool for GetWindowStateTool {
             match crate::foreground_activity::spawn_blocking(move || {
                 let menu = if !observation_only {
                     crate::ax::application_menu::active_open_menu_projection(
-                        pid, window_id, transient_target.is_none() && !delegated_panel,
-                    ).map(|menu| menu.image)
+                        pid,
+                        window_id,
+                        transient_target.is_none() && !delegated_panel,
+                    )
+                    .map(|menu| menu.image)
                 } else {
                     None
                 };
@@ -1332,10 +1369,8 @@ impl Tool for GetWindowStateTool {
             // route, or response state is committed. The capture itself is
             // side-effect free; everything after this point can safely use the
             // same validated physical surface.
-            let final_detection = crate::foreground_activity::spawn_blocking(move || {
-                route.is_live()
-            })
-            .await;
+            let final_detection =
+                crate::foreground_activity::spawn_blocking(move || route.is_live()).await;
             if !matches!(final_detection, Ok(true)) {
                 return ToolResult::error(
                     "The transient helper changed or closed while it was being observed. Re-observe the host app; no foreground input route was retained.",
@@ -1351,9 +1386,15 @@ impl Tool for GetWindowStateTool {
             }
         }
 
-        if let Some(menu) = tree_result.as_ref().and_then(|tree| tree.embedded_menu.as_ref()) {
+        if let Some(menu) = tree_result
+            .as_ref()
+            .and_then(|tree| tree.embedded_menu.as_ref())
+        {
             let proof = menu.clone();
-            if !crate::foreground_activity::spawn_blocking(move || proof.is_live()).await.unwrap_or(false) {
+            if !crate::foreground_activity::spawn_blocking(move || proof.is_live())
+                .await
+                .unwrap_or(false)
+            {
                 return ToolResult::error(
                     "The embedded context menu changed during observation. Re-observe the exact window; no new AX binding was published.",
                 ).with_structured(serde_json::json!({
@@ -1602,7 +1643,10 @@ impl Tool for GetWindowStateTool {
                 match tree_result.as_mut() {
                     Some(result) if scope_matched => {
                         result.publish_handles(
-                            &self.state.element_cache, pid, window_id, snapshot_id,
+                            &self.state.element_cache,
+                            pid,
+                            window_id,
+                            snapshot_id,
                         );
                     }
                     _ => {
@@ -1770,8 +1814,12 @@ impl Tool for GetWindowStateTool {
             }
         }
         if let Some(target) = transient_target {
-            apply_transient_observation_contract(&mut structured, source_target, target,
-                transient_route.is_some_and(|route| route.app_context.is_some()));
+            apply_transient_observation_contract(
+                &mut structured,
+                source_target,
+                target,
+                transient_route.is_some_and(|route| route.app_context.is_some()),
+            );
         }
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
@@ -1956,10 +2004,8 @@ impl Tool for GetWindowStateTool {
             // well as before state publication above. If the modal disappears
             // during response construction, never leave a route that the
             // caller could consume on its next foreground keyboard action.
-            let commit_detection = crate::foreground_activity::spawn_blocking(move || {
-                route.is_live()
-            })
-            .await;
+            let commit_detection =
+                crate::foreground_activity::spawn_blocking(move || route.is_live()).await;
             if !matches!(commit_detection, Ok(true)) {
                 return ToolResult::error(
                     "The transient helper changed or closed before its observation could be committed. Re-observe the host app; no foreground input route was retained.",
@@ -2458,27 +2504,58 @@ mod window_scope_contract_tests {
     }
 
     #[test]
-    fn app_context_helper_contract_has_no_parent_or_action_binding_and_no_observation_only_commit() {
-        use crate::transient_ui::{AppContextHelperProof, TransientSessionKey, TransientUiRegistry, WindowTarget};
-        let source = WindowTarget { pid: 10, window_id: 100 };
-        let target = WindowTarget { pid: 20, window_id: 200 };
-        let proof = Some(AppContextHelperProof { host_birth: (1, 2), helper_birth: (3, 4) });
+    fn app_context_helper_contract_has_no_parent_or_action_binding_and_no_observation_only_commit()
+    {
+        use crate::transient_ui::{
+            AppContextHelperProof, TransientSessionKey, TransientUiRegistry, WindowTarget,
+        };
+        let source = WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let proof = Some(AppContextHelperProof {
+            host_birth: (1, 2),
+            helper_birth: (3, 4),
+        });
         let registry = TransientUiRegistry::new();
         let session = TransientSessionKey::Anonymous;
         commit_transient_observation(&registry, &session, source, target, true, proof);
         assert_eq!(registry.recorded_target(&session, source), None);
         commit_transient_observation(&registry, &session, source, target, false, proof);
         assert_eq!(registry.recorded_target(&session, source), Some(target));
-        assert_eq!(begin_transient_observation(&registry, &session, source, false), Some(target));
-        assert_eq!(registry.recorded_target(&session, source), None, "exact refresh revokes app route first");
+        assert_eq!(
+            begin_transient_observation(&registry, &session, source, false),
+            Some(target)
+        );
+        assert_eq!(
+            registry.recorded_target(&session, source),
+            None,
+            "exact refresh revokes app route first"
+        );
         let mut output = serde_json::json!({"elements": []});
         apply_transient_observation_contract(&mut output, source, target, true);
         assert_eq!(output["pid"], 10);
         assert_eq!(output["window_id"], 100);
-        assert_eq!(output["transient_ui"]["visual_target"]["ax_actions_supported"], false);
-        assert_eq!(output["transient_ui"]["visual_target"]["pixel_actions_supported"], false);
-        assert_eq!(output["transient_ui"]["input_policy"], "foreground_keyboard_only");
-        assert!(output["transient_ui"]["reason"].as_str().unwrap().contains("no editor-parent association"));
+        assert_eq!(
+            output["transient_ui"]["visual_target"]["ax_actions_supported"],
+            false
+        );
+        assert_eq!(
+            output["transient_ui"]["visual_target"]["pixel_actions_supported"],
+            false
+        );
+        assert_eq!(
+            output["transient_ui"]["input_policy"],
+            "foreground_keyboard_only"
+        );
+        assert!(output["transient_ui"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no editor-parent association"));
         assert_eq!(output["elements"], serde_json::json!([]));
     }
 
@@ -3073,20 +3150,28 @@ mod tests {
             let walk = owned_tree_fixture(ptr, 0);
             ready_tx.send(()).unwrap();
             resume_rx.recv().unwrap();
-            NotifyOnDrop { walk: Some(walk), dropped: Some(dropped_tx) }
+            NotifyOnDrop {
+                walk: Some(walk),
+                dropped: Some(dropped_tx),
+            }
         });
         ready_rx.await.unwrap();
         // This is what timeout/drop does to a running blocking JoinHandle.
         drop(worker);
         resume_tx.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
     }
 
     #[test]
     fn ax_walk_failures_identify_the_phase_without_guessing_the_app_cause() {
-        for (error, code) in [(None, "ax_tree_timeout"), (Some("worker cancelled"), "ax_tree_worker_failed")] {
+        for (error, code) in [
+            (None, "ax_tree_timeout"),
+            (Some("worker cancelled"), "ax_tree_worker_failed"),
+        ] {
             let result = ax_tree_failure(701, 702, 120, 8, error);
             assert_eq!(result.is_error, Some(true));
             let detail = result.structured_content.unwrap();

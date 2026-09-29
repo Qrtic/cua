@@ -1,7 +1,6 @@
 //! MCP tool implementations for macOS.
 
 mod bring_to_front;
-mod present_window;
 mod click;
 mod clipboard;
 mod double_click;
@@ -13,6 +12,7 @@ mod kill_app;
 mod launch_app;
 mod list_apps;
 mod list_windows;
+mod present_window;
 mod press_key;
 mod right_click;
 mod scroll;
@@ -2751,24 +2751,85 @@ mod transient_keyboard_routing_tests {
 
     #[test]
     fn app_context_helper_stale_then_unobserved_never_authorizes_host_or_pointer() {
-        use crate::transient_ui::{AppContextHelperProof, RouteResolution, TransientHelperDetection, TransientRoute, WindowTarget};
-        let source = WindowTarget { pid: 10, window_id: 100 };
-        let target = WindowTarget { pid: 20, window_id: 200 };
-        let route = TransientRoute { source, target, app_context: Some(AppContextHelperProof {
-            host_birth: (1, 2), helper_birth: (3, 4),
-        }) };
-        let first = foreground_keyboard_target_from_evidence(10, 100, RouteResolution::Stale(route), None, false, true).unwrap_err();
+        use crate::transient_ui::{
+            AppContextHelperProof, RouteResolution, TransientHelperDetection, TransientRoute,
+            WindowTarget,
+        };
+        let source = WindowTarget {
+            pid: 10,
+            window_id: 100,
+        };
+        let target = WindowTarget {
+            pid: 20,
+            window_id: 200,
+        };
+        let route = TransientRoute {
+            source,
+            target,
+            app_context: Some(AppContextHelperProof {
+                host_birth: (1, 2),
+                helper_birth: (3, 4),
+            }),
+        };
+        let first = foreground_keyboard_target_from_evidence(
+            10,
+            100,
+            RouteResolution::Stale(route),
+            None,
+            false,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(error_code(first), "transient_ui_stale");
         let visible = TransientHelperDetection::Unique(target);
-        let second = foreground_keyboard_target_from_evidence(10, 100, RouteResolution::None, Some(visible), false, true).unwrap_err();
+        let second = foreground_keyboard_target_from_evidence(
+            10,
+            100,
+            RouteResolution::None,
+            Some(visible),
+            false,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(error_code(second), "transient_ui_unobserved");
-        assert_eq!(error_code(transient_ui_unobserved_refusal(10, 0, visible)), "transient_ui_unobserved");
-        assert!(transient_pointer_target_from_evidence(10, None, RouteResolution::None, Some(visible)).is_err());
-        assert!(transient_pointer_target_from_evidence(10, Some(100), RouteResolution::Live(route), None).is_err());
+        assert_eq!(
+            error_code(transient_ui_unobserved_refusal(10, 0, visible)),
+            "transient_ui_unobserved"
+        );
+        assert!(transient_pointer_target_from_evidence(
+            10,
+            None,
+            RouteResolution::None,
+            Some(visible)
+        )
+        .is_err());
+        assert!(transient_pointer_target_from_evidence(
+            10,
+            Some(100),
+            RouteResolution::Live(route),
+            None
+        )
+        .is_err());
         for (addressed, rewrite_allowed) in [(true, true), (false, false)] {
-            assert!(foreground_keyboard_target_from_evidence(10, 100, RouteResolution::Live(route), None, addressed, rewrite_allowed).is_err());
+            assert!(foreground_keyboard_target_from_evidence(
+                10,
+                100,
+                RouteResolution::Live(route),
+                None,
+                addressed,
+                rewrite_allowed
+            )
+            .is_err());
         }
-        let keyboard = foreground_keyboard_target_from_evidence(10, 100, RouteResolution::Live(route), None, false, true).unwrap();
+        let keyboard = foreground_keyboard_target_from_evidence(
+            10,
+            100,
+            RouteResolution::Live(route),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!((keyboard.pid, keyboard.window_id), (20, Some(200)));
         assert_eq!(keyboard.transient_route, Some(route));
     }

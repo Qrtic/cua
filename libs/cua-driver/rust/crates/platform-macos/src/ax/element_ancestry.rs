@@ -190,7 +190,12 @@ fn resolve_accessory_surface<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u
         }
         let owner = tree.owner(&current)?;
         let role = tree.role(&current)?;
-        if owner <= 0 || matches!(role.as_str(), "" | "AXWebArea" | "AXApplication" | "AXPopover") {
+        if owner <= 0
+            || matches!(
+                role.as_str(),
+                "" | "AXWebArea" | "AXApplication" | "AXPopover"
+            )
+        {
             return None;
         }
         if owner == host {
@@ -204,27 +209,35 @@ fn resolve_accessory_surface<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u
         nodes.push((current.clone(), owner, role.clone()));
         if matches!(role.as_str(), "AXWindow" | "AXSheet") {
             let id = tree.window_id(&current)?;
-            if remote.is_none() || !returned_to_host || owner != host || id == 0
+            if remote.is_none()
+                || !returned_to_host
+                || owner != host
+                || id == 0
                 || !tree.owns_window(host, id)
             {
                 return None;
             }
             for (index, (node, observed_owner, observed_role)) in nodes.iter().enumerate() {
-                if !tree.within_budget() || tree.owner(node) != Some(*observed_owner)
+                if !tree.within_budget()
+                    || tree.owner(node) != Some(*observed_owner)
                     || tree.role(node).as_deref() != Some(observed_role.as_str())
                 {
                     return None;
                 }
                 if let Some((parent, _, _)) = nodes.get(index + 1) {
-                    if !tree.relation(node, "AXParent").is_some_and(|live| tree.same(&live, parent))
+                    if !tree
+                        .relation(node, "AXParent")
+                        .is_some_and(|live| tree.same(&live, parent))
                         || !tree.contains_child(parent, node)
                     {
                         return None;
                     }
                 }
             }
-            return (tree.within_budget() && tree.window_id(&current) == Some(id)
-                && tree.owns_window(host, id)).then_some(id);
+            return (tree.within_budget()
+                && tree.window_id(&current) == Some(id)
+                && tree.owns_window(host, id))
+            .then_some(id);
         }
         let parent = tree.relation(&current, "AXParent")?;
         if !tree.contains_child(&parent, &current) {
@@ -241,16 +254,17 @@ fn resolve_accessory_surface<T: Ancestry>(tree: &T, start: &T::Node) -> Option<u
 /// proof authorizes editor focus preparation, not a new pointer/keyboard route.
 fn prove_native_text<T: Ancestry>(tree: &T, start: &T::Node, pid: i32, window_id: u32) -> bool {
     if tree.owner(start) != Some(pid)
-        || !matches!(tree.role(start).as_deref(), Some("AXTextField" | "AXTextArea"))
+        || !matches!(
+            tree.role(start).as_deref(),
+            Some("AXTextField" | "AXTextArea")
+        )
     {
         return false;
     }
     let mut node = start.clone();
     let mut visited: Vec<(T::Node, String)> = Vec::new();
     for _ in 0..MAX_DEPTH {
-        if !tree.within_budget()
-            || visited.iter().any(|(prior, _)| tree.same(prior, &node))
-        {
+        if !tree.within_budget() || visited.iter().any(|(prior, _)| tree.same(prior, &node)) {
             return false;
         }
         if tree.owner(&node) != Some(pid) {
@@ -276,7 +290,9 @@ fn prove_native_text<T: Ancestry>(tree: &T, start: &T::Node, pid: i32, window_id
                     if !tree.within_budget()
                         || tree.owner(child) != Some(pid)
                         || tree.role(child).as_deref() != Some(observed_role.as_str())
-                        || !tree.relation(child, "AXParent").is_some_and(|live| tree.same(&live, parent))
+                        || !tree
+                            .relation(child, "AXParent")
+                            .is_some_and(|live| tree.same(&live, parent))
                         || !tree.contains_child(parent, child)
                     {
                         return false;
@@ -511,10 +527,14 @@ mod tests {
                 2 => t.nodes.get_mut(&1).unwrap().0 = "AXApplication",
                 3 => t.nodes.get_mut(&1).unwrap().0 = "",
                 4 => t.nodes.get_mut(&1).unwrap().4 = 99,
-                5 => { t.children.insert(1, Vec::new()); }
+                5 => {
+                    t.children.insert(1, Vec::new());
+                }
                 6 => t.nodes.get_mut(&0).unwrap().1 = Some(0),
                 7 => t.expired = true,
-                8 => { t.window_owners.insert(8, 99); }
+                8 => {
+                    t.window_owners.insert(8, 99);
+                }
                 _ => t.fail_child_check_after = Some(1),
             }
             assert!(!prove_native_text(&t, &0, 42, 8), "case {kind}");
@@ -616,8 +636,10 @@ mod tests {
         // AppKit vends the app-owned accessory through the remote file-panel
         // service's split group, then returns to the app-owned AXSheet. The
         // field itself has no native window or AXWindow attribute.
-        tree.nodes.insert(0, ("AXTextField", Some(4), None, None, 42));
-        tree.nodes.insert(4, ("AXSplitGroup", Some(1), None, Some(9), 99));
+        tree.nodes
+            .insert(0, ("AXTextField", Some(4), None, None, 42));
+        tree.nodes
+            .insert(4, ("AXSplitGroup", Some(1), None, Some(9), 99));
         tree.children.insert(4, vec![0]);
         tree.children.insert(1, vec![4]);
         tree.window_owners.insert(9, 42);
@@ -640,15 +662,21 @@ mod tests {
         for kind in 0..10 {
             let mut tree = save_panel_accessory();
             match kind {
-                0 => { tree.children.insert(4, vec![]); }
-                1 => { tree.children.insert(1, vec![]); }
+                0 => {
+                    tree.children.insert(4, vec![]);
+                }
+                1 => {
+                    tree.children.insert(1, vec![]);
+                }
                 2 => tree.nodes.get_mut(&1).unwrap().3 = None,
                 3 => tree.nodes.get_mut(&1).unwrap().0 = "AXPopover",
                 4 => tree.nodes.get_mut(&1).unwrap().0 = "AXApplication",
                 5 => tree.nodes.get_mut(&4).unwrap().0 = "AXWebArea",
                 6 => tree.nodes.get_mut(&4).unwrap().1 = Some(0),
                 7 => tree.expired = true,
-                8 => { tree.window_owners.insert(8, 99); }
+                8 => {
+                    tree.window_owners.insert(8, 99);
+                }
                 _ => tree.nodes.get_mut(&0).unwrap().1 = None,
             }
             assert_eq!(resolve(&tree, &0), None, "case {kind}");
@@ -716,12 +744,20 @@ mod tests {
         for kind in 0..9 {
             let mut tree = standalone_panel_accessory();
             match kind {
-                0 => { tree.children.insert(4, vec![]); }
-                1 => { tree.children.insert(1, vec![]); }
+                0 => {
+                    tree.children.insert(4, vec![]);
+                }
+                1 => {
+                    tree.children.insert(1, vec![]);
+                }
                 2 => tree.nodes.get_mut(&1).unwrap().3 = None,
                 3 => tree.nodes.get_mut(&1).unwrap().3 = Some(0),
-                4 => { tree.window_owners.insert(8, 99); }
-                5 => { tree.window_owners.remove(&8); }
+                4 => {
+                    tree.window_owners.insert(8, 99);
+                }
+                5 => {
+                    tree.window_owners.remove(&8);
+                }
                 6 => tree.nodes.get_mut(&0).unwrap().1 = None,
                 7 => tree.nodes.get_mut(&4).unwrap().0 = "AXWebArea",
                 _ => tree.expired = true,

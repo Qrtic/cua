@@ -492,11 +492,15 @@ impl Tool for ClickTool {
             };
             let sx_shot = input.x;
             let sy_shot = input.y;
-            let (sx, sy) = match crate::foreground_activity::desktop::screenshot_point(sx_shot, sy_shot) {
-                Ok(point) => point,
-                Err(error) => return ToolResult::error(error.to_string()).with_structured(
-                    serde_json::json!({"code":"invalid_arguments", "effect":"refused"})),
-            };
+            let (sx, sy) =
+                match crate::foreground_activity::desktop::screenshot_point(sx_shot, sy_shot) {
+                    Ok(point) => point,
+                    Err(error) => {
+                        return ToolResult::error(error.to_string()).with_structured(
+                            serde_json::json!({"code":"invalid_arguments", "effect":"refused"}),
+                        )
+                    }
+                };
             let button = match input.button.unwrap_or(ClickButton::Left) {
                 ClickButton::Left => "left",
                 ClickButton::Right => "right",
@@ -528,7 +532,11 @@ impl Tool for ClickTool {
                         desktop_modifiers.iter().map(String::as_str).collect();
                     crate::foreground_activity::desktop::run(|| {
                         crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                            sx, sy, count, &btn, &modifier_refs,
+                            sx,
+                            sy,
+                            count,
+                            &btn,
+                            &modifier_refs,
                         )
                     })
                 })
@@ -732,7 +740,9 @@ impl Tool for ClickTool {
                     let popover = inspect_background_surface
                         && !menu
                         && crate::ax::attached_popover::has_semantic_popover_candidate(
-                            element, wid, Some(role.as_str()),
+                            element,
+                            wid,
+                            Some(role.as_str()),
                         );
                     let pointer_candidate = primary_press
                         && matches!(
@@ -1021,9 +1031,18 @@ impl Tool for ClickTool {
             } else {
                 WindowChangeDetector::snapshot_targeted(prior_front, pid)
             };
-            let order_trace = snapshot.diagnostic_trace().unwrap_or_else(crate::order_diagnostics::Trace::new);
-            let native_tab = native_tab_action_is_plain(&effective_action, &button_str, count, foreground, &modifiers)
-                .then(|| snapshot.native_tab_handoff()).flatten();
+            let order_trace = snapshot
+                .diagnostic_trace()
+                .unwrap_or_else(crate::order_diagnostics::Trace::new);
+            let native_tab = native_tab_action_is_plain(
+                &effective_action,
+                &button_str,
+                count,
+                foreground,
+                &modifiers,
+            )
+            .then(|| snapshot.native_tab_handoff())
+            .flatten();
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -1218,9 +1237,13 @@ impl Tool for ClickTool {
                     ToolResult::text(msg).with_structured(structured)
                 }
                 Ok(Err(e)) => {
-                    if let Some(stale) = e.downcast_ref::<crate::ax::embedded_menu::StaleEmbeddedMenu>() {
+                    if let Some(stale) =
+                        e.downcast_ref::<crate::ax::embedded_menu::StaleEmbeddedMenu>()
+                    {
                         stale.result(pid, wid)
-                    } else if let Some(unconfirmed) = e.downcast_ref::<AxActionResponseUnconfirmed>() {
+                    } else if let Some(unconfirmed) =
+                        e.downcast_ref::<AxActionResponseUnconfirmed>()
+                    {
                         unconfirmed.result()
                     } else if let Some(disabled) =
                         e.downcast_ref::<crate::input::ax_actions::AxActionDisabled>()
@@ -2275,8 +2298,18 @@ fn perform_attached_popover_action(
     Ok(native)
 }
 
-fn native_tab_action_is_plain(action: &str, button: &str, count: usize, foreground: bool, modifiers: &[String]) -> bool {
-    !foreground && count == 1 && button == "left" && modifiers.is_empty() && matches!(action, "press" | "click")
+fn native_tab_action_is_plain(
+    action: &str,
+    button: &str,
+    count: usize,
+    foreground: bool,
+    modifiers: &[String],
+) -> bool {
+    !foreground
+        && count == 1
+        && button == "left"
+        && modifiers.is_empty()
+        && matches!(action, "press" | "click")
 }
 
 /// Returns `(summary_text, needs_text_input_settle, suspected_noop,
@@ -2320,9 +2353,8 @@ fn perform_ax_click(
     if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
         if modifiers.is_empty() {
             if role == "AXMenuItem" && advertised.iter().all(|action| action.trim().is_empty()) {
-                let committed = unsafe {
-                    crate::ax::menu_selection::select(element, pid, window_id)?
-                };
+                let committed =
+                    unsafe { crate::ax::menu_selection::select(element, pid, window_id)? };
                 return Ok((
                     if committed {
                         format!("Selected native popup option [{idx}] through AXSelectedChildren; dismissed its menu and confirmed the control value.")
@@ -2447,17 +2479,27 @@ fn perform_ax_click(
         }
     }
 
-    let tab_proof = if !foreground && modifiers.is_empty() && ax_action == "AXPress"
-        && role == "AXRadioButton" && advertised.iter().any(|a| a == "AXPress") {
+    let tab_proof = if !foreground
+        && modifiers.is_empty()
+        && ax_action == "AXPress"
+        && role == "AXRadioButton"
+        && advertised.iter().any(|a| a == "AXPress")
+    {
         let proof = native_tab.and_then(|handoff| handoff.capture(element, pid, window_id));
         // Extra read-only proof work never exempts a consumed observation.
-        if native_tab.is_some() { revalidate_observation()?; }
+        if native_tab.is_some() {
+            revalidate_observation()?;
+        }
         proof
-    } else { None };
+    } else {
+        None
+    };
     crate::foreground_activity::check_request()?;
-    let err = order_trace.measure(crate::order_diagnostics::Phase::AxDispatch, None, || unsafe {
-        crate::ax::bindings::perform_action(element, ax_action)
-    });
+    let err = order_trace.measure(
+        crate::order_diagnostics::Phase::AxDispatch,
+        None,
+        || unsafe { crate::ax::bindings::perform_action(element, ax_action) },
+    );
     check_ax_action_response(err)?;
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Preserve the existing selection path for other dispatch errors, but
@@ -2482,7 +2524,9 @@ fn perform_ax_click(
     }
 
     if let (Some(handoff), Some(proof)) = (native_tab, tab_proof) {
-        if let Some(destination) = proof.confirm(err) { handoff.confirm(destination); }
+        if let Some(destination) = proof.confirm(err) {
+            handoff.confirm(destination);
+        }
     }
 
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
@@ -2545,9 +2589,11 @@ fn perform_ax_click(
     let needs_text_input_settle = needs_text_input_focus_settle(&role, ax_action);
 
     // Show focus-rect highlight around the element (matches Swift showFocusRect).
-    if let Some(rect) = order_trace.measure(crate::order_diagnostics::Phase::CosmeticGeometry, None, || unsafe {
-        element_screen_rect(element)
-    }) {
+    if let Some(rect) = order_trace.measure(
+        crate::order_diagnostics::Phase::CosmeticGeometry,
+        None,
+        || unsafe { element_screen_rect(element) },
+    ) {
         crate::cursor::overlay::send_command(
             cursor_key.to_owned(),
             cursor_overlay::OverlayCommand::ShowFocusRect(Some(rect)),
@@ -2575,18 +2621,36 @@ fn perform_ax_click(
 
 #[cfg(test)]
 mod selection_fallback_tests {
-    use super::{selection_readback_confirms, native_tab_action_is_plain};
+    use super::{native_tab_action_is_plain, selection_readback_confirms};
 
     #[test]
     fn native_tab_handoff_excludes_foreground_pointer_button_modified_and_other_actions() {
         assert!(native_tab_action_is_plain("press", "left", 1, false, &[]));
         assert!(native_tab_action_is_plain("click", "left", 1, false, &[]));
         for (action, button, count, foreground) in [
-            ("press", "left", 1, true), ("press", "right", 1, false), ("press", "middle", 1, false),
-            ("press", "left", 2, false), ("show_menu", "left", 1, false),
-            ("select", "left", 1, false), ("unknown", "left", 1, false),
-        ] { assert!(!native_tab_action_is_plain(action, button, count, foreground, &[])); }
-        assert!(!native_tab_action_is_plain("press", "left", 1, false, &["shift".into()]));
+            ("press", "left", 1, true),
+            ("press", "right", 1, false),
+            ("press", "middle", 1, false),
+            ("press", "left", 2, false),
+            ("show_menu", "left", 1, false),
+            ("select", "left", 1, false),
+            ("unknown", "left", 1, false),
+        ] {
+            assert!(!native_tab_action_is_plain(
+                action,
+                button,
+                count,
+                foreground,
+                &[]
+            ));
+        }
+        assert!(!native_tab_action_is_plain(
+            "press",
+            "left",
+            1,
+            false,
+            &["shift".into()]
+        ));
     }
 
     #[test]
@@ -3231,7 +3295,11 @@ mod tests {
             background_pixel_ax_press_eligible(
                 true,
                 "AXMenuItem",
-                &["AXCancel".to_owned(), "AXPress".to_owned(), "AXPick".to_owned()],
+                &[
+                    "AXCancel".to_owned(),
+                    "AXPress".to_owned(),
+                    "AXPick".to_owned()
+                ],
                 Some(true),
             ),
             "enabled native menu command was excluded from the background AX bridge"
@@ -3243,19 +3311,35 @@ mod tests {
         let press = ["AXPress".to_owned()];
         for enabled in [None, Some(false)] {
             assert!(!background_pixel_ax_press_eligible(
-                true, "AXMenuItem", &press, enabled,
+                true,
+                "AXMenuItem",
+                &press,
+                enabled,
             ));
         }
         assert!(!background_pixel_ax_press_eligible(
-            false, "AXMenuItem", &press, Some(true),
+            false,
+            "AXMenuItem",
+            &press,
+            Some(true),
         ));
-        for actions in [vec![], vec!["AXPick".to_owned()], vec!["AXShowMenu".to_owned()]] {
+        for actions in [
+            vec![],
+            vec!["AXPick".to_owned()],
+            vec!["AXShowMenu".to_owned()],
+        ] {
             assert!(!background_pixel_ax_press_eligible(
-                true, "AXMenuItem", &actions, Some(true),
+                true,
+                "AXMenuItem",
+                &actions,
+                Some(true),
             ));
         }
         assert!(!background_pixel_ax_press_eligible(
-            true, "AXMenu", &press, Some(true),
+            true,
+            "AXMenu",
+            &press,
+            Some(true),
         ));
     }
 

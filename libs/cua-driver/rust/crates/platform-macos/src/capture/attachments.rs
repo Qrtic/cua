@@ -282,7 +282,12 @@ fn menu_path_members<T: Tree>(
         let is_menu = terminal_menu && index + 1 == path.len();
         if owner <= 0
             || (index == 0 && (owner != pid || role != "AXWindow"))
-            || (index > 0 && !(if is_menu { role == "AXMenu" } else { container(&role) }))
+            || (index > 0
+                && !(if is_menu {
+                    role == "AXMenu"
+                } else {
+                    container(&role)
+                }))
             || (is_menu && owner != pid)
         {
             return Ok(None);
@@ -297,7 +302,10 @@ fn menu_path_members<T: Tree>(
         }
         if index > 0 {
             let parent = &path[index - 1];
-            if !tree.parent(node).is_some_and(|live| tree.same(&live, parent)) {
+            if !tree
+                .parent(node)
+                .is_some_and(|live| tree.same(&live, parent))
+            {
                 budget(tree)?;
                 return Ok(None);
             }
@@ -305,7 +313,12 @@ fn menu_path_members<T: Tree>(
             if children.len() > MAX_CHILDREN {
                 return Err(DiscoveryStop::ChildLimit);
             }
-            if children.iter().filter(|child| tree.same(child, node)).count() != 1 {
+            if children
+                .iter()
+                .filter(|child| tree.same(child, node))
+                .count()
+                != 1
+            {
                 return Ok(None);
             }
         }
@@ -346,20 +359,30 @@ fn prove_menu_path<T: Tree>(
     // proof below; being a same-PID ordinary window is never sufficient.
     let candidate = |window: &WindowInfo| {
         let b = &window.bounds;
-        window.pid == pid && window.window_id != host.window_id && window.window_id != 0
-            && window.is_on_screen && window.on_current_space != Some(false)
-            && frame.iter().zip([b.x, b.y, b.width, b.height])
+        window.pid == pid
+            && window.window_id != host.window_id
+            && window.window_id != 0
+            && window.is_on_screen
+            && window.on_current_space != Some(false)
+            && frame
+                .iter()
+                .zip([b.x, b.y, b.width, b.height])
                 .all(|(ax, cg)| cg.is_finite() && (ax - cg).abs() <= 0.5)
     };
     let mut layer_zero_proven = false;
     if members.iter().all(|(owner, _)| *owner == pid)
-        && windows.iter().any(|window| window.layer == 0 && candidate(window))
+        && windows
+            .iter()
+            .any(|window| window.layer == 0 && candidate(window))
     {
         layer_zero_proven = true;
         for (index, node) in path.iter().enumerate() {
             budget(tree)?;
             if tree.id(node) != Some(host.window_id)
-                || (index > 0 && !tree.window(node).is_some_and(|root| tree.same(&root, &path[0])))
+                || (index > 0
+                    && !tree
+                        .window(node)
+                        .is_some_and(|root| tree.same(&root, &path[0])))
             {
                 budget(tree)?;
                 layer_zero_proven = false;
@@ -373,15 +396,22 @@ fn prove_menu_path<T: Tree>(
     let mut matches = windows.iter().filter(|window| {
         candidate(window) && (window.layer == 101 || (window.layer == 0 && layer_zero_proven))
     });
-    let Some(menu) = matches.next() else { return Ok(None) };
-    if matches.next().is_some() || exact_window(windows, pid, menu.window_id).is_none()
+    let Some(menu) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some()
+        || exact_window(windows, pid, menu.window_id).is_none()
         || !tree.current_space(menu.window_id)
     {
         budget(tree)?;
         return Ok(None);
     }
     budget(tree)?;
-    Ok(Some(MenuProof { id: menu.window_id, members, frame: frame.map(f64::to_bits) }))
+    Ok(Some(MenuProof {
+        id: menu.window_id,
+        members,
+        frame: frame.map(f64::to_bits),
+    }))
 }
 
 // Collection roles are local to this focused-popover route, never the shared
@@ -469,7 +499,8 @@ fn prove_collection_popover<T: Tree>(
         let Some(role) = tree.role(node) else {
             return Ok(None);
         };
-        let collection_role = host_collection_role(&role) || (allow_tabgroup && role == "AXTabGroup");
+        let collection_role =
+            host_collection_role(&role) || (allow_tabgroup && role == "AXTabGroup");
         collection |= collection_role;
         if !(container(&role) || collection_role)
             || tree.owner(node) != Some(pid)
@@ -533,7 +564,11 @@ fn collect_focused_collection_popover<T: Tree>(
             let phase_depth = popover_index.map_or(upward.len(), |index| upward.len() - index);
             if phase_depth >= MAX_DEPTH {
                 return Err(depth_limit(
-                    if popover_index.is_some() { "popover_host_attachment" } else { "focused_popover_locator" },
+                    if popover_index.is_some() {
+                        "popover_host_attachment"
+                    } else {
+                        "focused_popover_locator"
+                    },
                     phase_depth + 1,
                 ));
             }
@@ -598,7 +633,10 @@ fn collect_focused_collection_popover<T: Tree>(
 }
 
 fn outline_structure(role: &str) -> bool {
-    matches!(role, "AXGroup" | "AXSplitGroup" | "AXLayoutArea" | "AXScrollArea")
+    matches!(
+        role,
+        "AXGroup" | "AXSplitGroup" | "AXLayoutArea" | "AXScrollArea"
+    )
 }
 
 fn charge_outline_node<T: Tree>(
@@ -635,16 +673,23 @@ fn outline_path_members<T: Tree>(
         if path[..index].iter().any(|prior| tree.same(prior, node)) {
             return Err(DiscoveryStop::Cycle);
         }
-        let Some(role) = tree.role(node) else { return Err(DiscoveryStop::AxUnavailable) };
-        let allowed = if index == 0 { role == "AXWindow" } else {
+        let Some(role) = tree.role(node) else {
+            return Err(DiscoveryStop::AxUnavailable);
+        };
+        let allowed = if index == 0 {
+            role == "AXWindow"
+        } else {
             outline_structure(&role) || (index + 1 == path.len() && role == "AXOutline")
         };
         if !allowed || tree.owner(node) != Some(pid) || tree.id(node) != Some(host.window_id) {
             budget(tree)?;
             return Ok(None);
         }
-        if index > 0 && (!tree.window(node).is_some_and(|root| tree.same(&root, &path[0]))
-            || !reciprocal_edge(tree, &path[index - 1], node)?)
+        if index > 0
+            && (!tree
+                .window(node)
+                .is_some_and(|root| tree.same(&root, &path[0]))
+                || !reciprocal_edge(tree, &path[index - 1], node)?)
         {
             budget(tree)?;
             return Ok(None);
@@ -669,12 +714,19 @@ fn prove_outline_menu<T: Tree>(
     windows: &[WindowInfo],
 ) -> Result<Option<OutlineMenuProof>, DiscoveryStop> {
     budget(tree)?;
-    if path.len() < 3 || path.len() > MAX_DEPTH { return Ok(None) }
+    if path.len() < 3 || path.len() > MAX_DEPTH {
+        return Ok(None);
+    }
     let prefix = &path[..path.len() - 1];
-    let Some(mut members) = outline_path_members(tree, pid, host, prefix)? else { return Ok(None) };
-    if members.last().map(|(_, role)| role.as_str()) != Some("AXOutline") { return Ok(None) }
+    let Some(mut members) = outline_path_members(tree, pid, host, prefix)? else {
+        return Ok(None);
+    };
+    if members.last().map(|(_, role)| role.as_str()) != Some("AXOutline") {
+        return Ok(None);
+    }
     let leaf = path.last().expect("nonempty Outline menu path");
-    if tree.role(leaf).as_deref() != Some("AXMenu") || tree.owner(leaf) != Some(pid)
+    if tree.role(leaf).as_deref() != Some("AXMenu")
+        || tree.owner(leaf) != Some(pid)
         || tree.id(leaf) != Some(host.window_id)
         || prefix.iter().any(|node| tree.same(node, leaf))
         || !reciprocal_edge(tree, prefix.last().expect("Outline anchor"), leaf)?
@@ -683,19 +735,38 @@ fn prove_outline_menu<T: Tree>(
         return Ok(None);
     }
     let logical = tree.menu_window(leaf)?;
-    if logical.as_ref().is_some_and(|root| !tree.same(root, &path[0])) { return Ok(None) }
-    let Some(frame) = tree.frame(leaf) else { budget(tree)?; return Ok(None) };
-    if !frame.iter().all(|v| v.is_finite()) || frame[2] <= 0.0 || frame[3] <= 0.0 { return Ok(None) }
+    if logical
+        .as_ref()
+        .is_some_and(|root| !tree.same(root, &path[0]))
+    {
+        return Ok(None);
+    }
+    let Some(frame) = tree.frame(leaf) else {
+        budget(tree)?;
+        return Ok(None);
+    };
+    if !frame.iter().all(|v| v.is_finite()) || frame[2] <= 0.0 || frame[3] <= 0.0 {
+        return Ok(None);
+    }
     let mut matches = windows.iter().filter(|window| {
         let b = &window.bounds;
-        window.pid == pid && window.window_id != 0 && window.window_id != host.window_id
-            && matches!(window.layer, 0 | 101) && window.is_on_screen
+        window.pid == pid
+            && window.window_id != 0
+            && window.window_id != host.window_id
+            && matches!(window.layer, 0 | 101)
+            && window.is_on_screen
             && window.on_current_space != Some(false)
-            && frame.iter().zip([b.x, b.y, b.width, b.height])
+            && frame
+                .iter()
+                .zip([b.x, b.y, b.width, b.height])
                 .all(|(ax, cg)| cg.is_finite() && (ax - cg).abs() <= 0.5)
     });
-    let Some(menu) = matches.next() else { budget(tree)?; return Ok(None) };
-    if menu.layer != 101 || matches.next().is_some()
+    let Some(menu) = matches.next() else {
+        budget(tree)?;
+        return Ok(None);
+    };
+    if menu.layer != 101
+        || matches.next().is_some()
         || exact_window(windows, pid, menu.window_id).is_none()
         || !tree.current_space(menu.window_id)
     {
@@ -705,7 +776,11 @@ fn prove_outline_menu<T: Tree>(
     members.push((pid, "AXMenu".into()));
     budget(tree)?;
     Ok(Some(OutlineMenuProof {
-        menu: MenuProof { id: menu.window_id, members, frame: frame.map(f64::to_bits) },
+        menu: MenuProof {
+            id: menu.window_id,
+            members,
+            frame: frame.map(f64::to_bits),
+        },
         leaf_window_present: logical.is_some(),
     }))
 }
@@ -719,9 +794,15 @@ fn collect_outline_menus<T: Tree>(
     visited: &mut Vec<T::Node>,
     seeds: &[Vec<T::Node>],
 ) -> Result<Vec<u32>, DiscoveryStop> {
-    if seeds.is_empty() || !windows.iter().any(|window| window.pid == pid
-        && window.window_id != 0 && window.window_id != host.window_id && window.layer == 101
-        && window.is_on_screen && window.on_current_space != Some(false))
+    if seeds.is_empty()
+        || !windows.iter().any(|window| {
+            window.pid == pid
+                && window.window_id != 0
+                && window.window_id != host.window_id
+                && window.layer == 101
+                && window.is_on_screen
+                && window.on_current_space != Some(false)
+        })
     {
         return Ok(Vec::new());
     }
@@ -730,10 +811,14 @@ fn collect_outline_menus<T: Tree>(
     let mut admitted: Vec<(Vec<T::Node>, OutlineMenuProof)> = Vec::new();
     while let Some(path) = queue.pop_front() {
         budget(tree)?;
-        if path.len() > MAX_DEPTH { return Err(depth_limit("outline_search", path.len())) }
+        if path.len() > MAX_DEPTH {
+            return Err(depth_limit("outline_search", path.len()));
+        }
         let node = path.last().ok_or(DiscoveryStop::Changed)?;
         charge_outline_node(tree, visited, node)?;
-        if entered.iter().any(|prior| tree.same(prior, node)) { return Err(DiscoveryStop::Cycle) }
+        if entered.iter().any(|prior| tree.same(prior, node)) {
+            return Err(DiscoveryStop::Cycle);
+        }
         entered.push(node.clone());
         let Some(members) = outline_path_members(tree, pid, host, &path)? else {
             // An unproven retained prefix never becomes a search authority.
@@ -741,31 +826,53 @@ fn collect_outline_menus<T: Tree>(
         };
         let is_outline = members.last().map(|(_, role)| role.as_str()) == Some("AXOutline");
         let children = tree.children(node)?;
-        if children.len() > MAX_CHILDREN { return Err(DiscoveryStop::ChildLimit) }
+        if children.len() > MAX_CHILDREN {
+            return Err(DiscoveryStop::ChildLimit);
+        }
         for child in children {
             charge_outline_node(tree, visited, &child)?;
             let role = tree.role(&child).ok_or(DiscoveryStop::AxUnavailable)?;
-            if role.is_empty() || role == "AXUnknown" { return Err(DiscoveryStop::AxUnavailable) }
+            if role.is_empty() || role == "AXUnknown" {
+                return Err(DiscoveryStop::AxUnavailable);
+            }
             if is_outline {
-                if role != "AXMenu" { continue } // Never read rows/cells or submenu contents.
-                if path.len() == MAX_DEPTH { return Err(depth_limit("outline_menu_leaf", path.len() + 1)) }
-                let mut candidate = path.clone(); candidate.push(child);
+                if role != "AXMenu" {
+                    continue;
+                } // Never read rows/cells or submenu contents.
+                if path.len() == MAX_DEPTH {
+                    return Err(depth_limit("outline_menu_leaf", path.len() + 1));
+                }
+                let mut candidate = path.clone();
+                candidate.push(child);
                 if let Some(proof) = prove_outline_menu(tree, pid, host, &candidate, windows)? {
-                    if admitted.len() >= MAX_ATTACHMENTS { return Err(DiscoveryStop::AttachmentLimit) }
-                    if admitted.iter().any(|(_, prior)| prior.menu.id == proof.menu.id) {
+                    if admitted.len() >= MAX_ATTACHMENTS {
+                        return Err(DiscoveryStop::AttachmentLimit);
+                    }
+                    if admitted
+                        .iter()
+                        .any(|(_, prior)| prior.menu.id == proof.menu.id)
+                    {
                         return Err(DiscoveryStop::Changed);
                     }
                     admitted.push((candidate, proof));
                 }
             } else if outline_structure(&role) || role == "AXOutline" {
-                if path.len() == MAX_DEPTH { return Err(depth_limit("outline_child", path.len() + 1)) }
-                if !reciprocal_edge(tree, node, &child)? { return Err(DiscoveryStop::Changed) }
-                let mut next = path.clone(); next.push(child); queue.push_back(next);
+                if path.len() == MAX_DEPTH {
+                    return Err(depth_limit("outline_child", path.len() + 1));
+                }
+                if !reciprocal_edge(tree, node, &child)? {
+                    return Err(DiscoveryStop::Changed);
+                }
+                let mut next = path.clone();
+                next.push(child);
+                queue.push_back(next);
             }
         }
     }
     budget(tree)?;
-    if admitted.is_empty() { return Ok(Vec::new()) }
+    if admitted.is_empty() {
+        return Ok(Vec::new());
+    }
     let fresh = tree.fresh_windows().ok_or(DiscoveryStop::Changed)?;
     let live_host = exact_window(&fresh, pid, host.window_id).ok_or(DiscoveryStop::Changed)?;
     if !same_identity(host, live_host) || !tree.same(root, &exact_root(tree, live_host)?) {
@@ -784,7 +891,8 @@ fn collect_outline_menus<T: Tree>(
         ids.push(id);
     }
     budget(tree)?;
-    ids.sort_unstable(); ids.dedup();
+    ids.sort_unstable();
+    ids.dedup();
     Ok(ids)
 }
 
@@ -792,74 +900,134 @@ fn collect_outline_menus<T: Tree>(
 // prove its complete retained prefix against the exact physical/logical host.
 // This does not widen container(), menu traversal, or the focused locator.
 fn tabgroup_prefix<T: Tree>(
-    tree: &T, pid: i32, host: &WindowInfo, path: &[T::Node],
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    path: &[T::Node],
 ) -> Result<Option<Vec<String>>, DiscoveryStop> {
     budget(tree)?;
     if path.len() < 2 || path.len() > MAX_DEPTH || !surface_matches(tree, &path[0], host) {
-        budget(tree)?; return Ok(None);
+        budget(tree)?;
+        return Ok(None);
     }
     let mut roles = Vec::new();
     for (index, node) in path.iter().enumerate() {
         budget(tree)?;
-        if path[..index].iter().any(|prior| tree.same(prior, node)) { return Err(DiscoveryStop::Cycle) }
+        if path[..index].iter().any(|prior| tree.same(prior, node)) {
+            return Err(DiscoveryStop::Cycle);
+        }
         let role = tree.role(node).ok_or(DiscoveryStop::AxUnavailable)?;
-        if (if index == 0 { role != "AXWindow" } else { !container(&role) && role != "AXTabGroup" })
-            || tree.owner(node) != Some(pid) || tree.id(node) != Some(host.window_id)
-        { budget(tree)?; return Ok(None) }
-        if index > 0 && (!tree.window(node).is_some_and(|root| tree.same(&root, &path[0]))
-            || !reciprocal_edge(tree, &path[index - 1], node)?)
-        { budget(tree)?; return Ok(None) }
+        if (if index == 0 {
+            role != "AXWindow"
+        } else {
+            !container(&role) && role != "AXTabGroup"
+        }) || tree.owner(node) != Some(pid)
+            || tree.id(node) != Some(host.window_id)
+        {
+            budget(tree)?;
+            return Ok(None);
+        }
+        if index > 0
+            && (!tree
+                .window(node)
+                .is_some_and(|root| tree.same(&root, &path[0]))
+                || !reciprocal_edge(tree, &path[index - 1], node)?)
+        {
+            budget(tree)?;
+            return Ok(None);
+        }
         roles.push(role);
     }
     budget(tree)?;
-    Ok(roles.iter().any(|role| role == "AXTabGroup").then_some(roles))
+    Ok(roles
+        .iter()
+        .any(|role| role == "AXTabGroup")
+        .then_some(roles))
 }
 
 fn collect_tabgroup_popovers<T: Tree>(
-    tree: &T, pid: i32, host: &WindowInfo, root: &T::Node, windows: &[WindowInfo],
-    visited: &mut Vec<T::Node>, seeds: &[Vec<T::Node>],
+    tree: &T,
+    pid: i32,
+    host: &WindowInfo,
+    root: &T::Node,
+    windows: &[WindowInfo],
+    visited: &mut Vec<T::Node>,
+    seeds: &[Vec<T::Node>],
 ) -> Result<Vec<u32>, DiscoveryStop> {
-    if seeds.is_empty() || !windows.iter().any(|w| w.pid == pid && w.window_id != 0
-        && w.window_id != host.window_id && w.is_on_screen && w.on_current_space != Some(false))
-    { return Ok(Vec::new()) }
+    if seeds.is_empty()
+        || !windows.iter().any(|w| {
+            w.pid == pid
+                && w.window_id != 0
+                && w.window_id != host.window_id
+                && w.is_on_screen
+                && w.on_current_space != Some(false)
+        })
+    {
+        return Ok(Vec::new());
+    }
     let mut queue = VecDeque::from(seeds.to_vec());
     let mut entered = Vec::new();
     let mut admitted = Vec::new();
     while let Some(path) = queue.pop_front() {
         budget(tree)?;
-        if path.len() > MAX_DEPTH { return Err(depth_limit("tabgroup_search", path.len())) }
+        if path.len() > MAX_DEPTH {
+            return Err(depth_limit("tabgroup_search", path.len()));
+        }
         let node = path.last().ok_or(DiscoveryStop::Changed)?;
         charge_outline_node(tree, visited, node)?;
-        if entered.iter().any(|prior| tree.same(prior, node)) { return Err(DiscoveryStop::Cycle) }
+        if entered.iter().any(|prior| tree.same(prior, node)) {
+            return Err(DiscoveryStop::Cycle);
+        }
         entered.push(node.clone());
-        let Some(roles) = tabgroup_prefix(tree, pid, host, &path)? else { return Ok(Vec::new()) };
+        let Some(roles) = tabgroup_prefix(tree, pid, host, &path)? else {
+            return Ok(Vec::new());
+        };
         let children = tree.children(node)?;
-        if children.len() > MAX_CHILDREN { return Err(DiscoveryStop::ChildLimit) }
+        if children.len() > MAX_CHILDREN {
+            return Err(DiscoveryStop::ChildLimit);
+        }
         for child in children {
             charge_outline_node(tree, visited, &child)?;
             let role = tree.role(&child).ok_or(DiscoveryStop::AxUnavailable)?;
-            if role.is_empty() || role == "AXUnknown" { return Err(DiscoveryStop::AxUnavailable) }
+            if role.is_empty() || role == "AXUnknown" {
+                return Err(DiscoveryStop::AxUnavailable);
+            }
             if role == "AXPopover" {
-                if path.len() == MAX_DEPTH { return Err(depth_limit("tabgroup_popover_leaf", path.len() + 1)) }
-                let mut candidate = path.clone(); candidate.push(child);
+                if path.len() == MAX_DEPTH {
+                    return Err(depth_limit("tabgroup_popover_leaf", path.len() + 1));
+                }
+                let mut candidate = path.clone();
+                candidate.push(child);
                 // This retains the existing native popover proof dependency.
                 // Input's exact-host TabGroup proof must also be present in a
                 // combined release; false never becomes capture authorization.
-                if let Some(id) = prove_collection_popover(tree, pid, host, &candidate, windows, true)? {
-                    if admitted.len() >= MAX_ATTACHMENTS { return Err(DiscoveryStop::AttachmentLimit) }
-                    if admitted.iter().any(|(_, prior, _)| *prior == id) { return Err(DiscoveryStop::Changed) }
+                if let Some(id) =
+                    prove_collection_popover(tree, pid, host, &candidate, windows, true)?
+                {
+                    if admitted.len() >= MAX_ATTACHMENTS {
+                        return Err(DiscoveryStop::AttachmentLimit);
+                    }
+                    if admitted.iter().any(|(_, prior, _)| *prior == id) {
+                        return Err(DiscoveryStop::Changed);
+                    }
                     admitted.push((candidate, id, roles.clone()));
                 }
             } else if container(&role) || role == "AXTabGroup" {
-                if path.len() == MAX_DEPTH { return Err(depth_limit("tabgroup_child", path.len() + 1)) }
-                let mut next = path.clone(); next.push(child); queue.push_back(next);
+                if path.len() == MAX_DEPTH {
+                    return Err(depth_limit("tabgroup_child", path.len() + 1));
+                }
+                let mut next = path.clone();
+                next.push(child);
+                queue.push_back(next);
             }
             // Never enter AXList/WebArea/Outline/content, Sheet or Menu, and
             // never descend through the admitted popover's internal controls.
         }
     }
     budget(tree)?;
-    if admitted.is_empty() { return Ok(Vec::new()) }
+    if admitted.is_empty() {
+        return Ok(Vec::new());
+    }
     let fresh = tree.fresh_windows().ok_or(DiscoveryStop::Changed)?;
     let live_host = exact_window(&fresh, pid, host.window_id).ok_or(DiscoveryStop::Changed)?;
     if !same_identity(host, live_host) || !tree.same(root, &exact_root(tree, live_host)?) {
@@ -872,11 +1040,14 @@ fn collect_tabgroup_popovers<T: Tree>(
         if !same_identity(before, after)
             || tabgroup_prefix(tree, pid, live_host, &path[..path.len() - 1])? != Some(roles)
             || prove_collection_popover(tree, pid, live_host, &path, &fresh, true)? != Some(id)
-        { return Err(DiscoveryStop::Changed) }
+        {
+            return Err(DiscoveryStop::Changed);
+        }
         ids.push(id);
     }
     budget(tree)?;
-    ids.sort_unstable(); ids.dedup();
+    ids.sort_unstable();
+    ids.dedup();
     Ok(ids)
 }
 
@@ -891,11 +1062,15 @@ fn collect_after_legacy_empty<T: Tree>(
     tabgroup_seeds: &[Vec<T::Node>],
 ) -> Result<Vec<u32>, DiscoveryStop> {
     let ids = collect_focused_collection_popover(tree, pid, host, root, windows, visited)?;
-    if !ids.is_empty() { return Ok(ids) }
+    if !ids.is_empty() {
+        return Ok(ids);
+    }
     let result = collect_outline_menus(tree, pid, host, root, windows, visited, seeds);
     budget(tree)?;
     let ids = result?;
-    if !ids.is_empty() { return Ok(ids) }
+    if !ids.is_empty() {
+        return Ok(ids);
+    }
     let result = collect_tabgroup_popovers(tree, pid, host, root, windows, visited, tabgroup_seeds);
     budget(tree)?;
     result
@@ -929,7 +1104,10 @@ fn collect<T: Tree>(
                 return Err(depth_limit("legacy_path", path.len()));
             }
             let node = path.last().expect("nonempty path");
-            if path[..path.len() - 1].iter().any(|prior| tree.same(prior, node)) {
+            if path[..path.len() - 1]
+                .iter()
+                .any(|prior| tree.same(prior, node))
+            {
                 return Err(DiscoveryStop::Cycle);
             }
             // A deferred seed was already charged to the original visited set.
@@ -1041,13 +1219,29 @@ fn collect<T: Tree>(
         budget(tree)?;
         ids.sort_unstable();
         ids.dedup();
-        if menu_phase || !ids.is_empty() || deferred.is_empty()
-            || !windows.iter().any(|window| window.pid == pid && window.window_id != 0
-                && window.window_id != host_id && matches!(window.layer, 0 | 101)
-                && window.is_on_screen && window.on_current_space != Some(false))
+        if menu_phase
+            || !ids.is_empty()
+            || deferred.is_empty()
+            || !windows.iter().any(|window| {
+                window.pid == pid
+                    && window.window_id != 0
+                    && window.window_id != host_id
+                    && matches!(window.layer, 0 | 101)
+                    && window.is_on_screen
+                    && window.on_current_space != Some(false)
+            })
         {
             return if ids.is_empty() {
-                collect_after_legacy_empty(tree, pid, host, &root, windows, &mut visited, &outline_seeds, &tabgroup_seeds)
+                collect_after_legacy_empty(
+                    tree,
+                    pid,
+                    host,
+                    &root,
+                    windows,
+                    &mut visited,
+                    &outline_seeds,
+                    &tabgroup_seeds,
+                )
             } else {
                 Ok(ids)
             };
@@ -1055,17 +1249,33 @@ fn collect<T: Tree>(
         // Only an empty original result may use the remaining shared time and
         // node budget. Mixed popover/sheet+menu cases retain the original set.
         menu_phase = true;
-        provider_menu_phase = windows.iter().any(|window| window.pid == pid
-            && window.window_id != 0 && window.window_id != host_id && window.layer == 101
-            && window.is_on_screen && window.on_current_space != Some(false));
+        provider_menu_phase = windows.iter().any(|window| {
+            window.pid == pid
+                && window.window_id != 0
+                && window.window_id != host_id
+                && window.layer == 101
+                && window.is_on_screen
+                && window.on_current_space != Some(false)
+        });
         // Original discovery already identified foreign seeds. A layer-zero
         // menu cannot use them, so do not reread them or perform an empty extra
         // validation pass. Provider search remains available for layer101.
-        queue = deferred.drain(..)
+        queue = deferred
+            .drain(..)
             .filter(|(_, foreign)| provider_menu_phase || !foreign)
-            .map(|(path, _)| (path, true)).collect();
+            .map(|(path, _)| (path, true))
+            .collect();
         if queue.is_empty() {
-            return collect_after_legacy_empty(tree, pid, host, &root, windows, &mut visited, &outline_seeds, &tabgroup_seeds);
+            return collect_after_legacy_empty(
+                tree,
+                pid,
+                host,
+                &root,
+                windows,
+                &mut visited,
+                &outline_seeds,
+                &tabgroup_seeds,
+            );
         }
     }
 }
@@ -1107,7 +1317,11 @@ struct Native {
     spaces: crate::input::skylight::SpaceQuery,
 }
 
-fn menu_window_value_kind(status: AXError, has_value: bool, is_element: bool) -> Result<bool, DiscoveryStop> {
+fn menu_window_value_kind(
+    status: AXError,
+    has_value: bool,
+    is_element: bool,
+) -> Result<bool, DiscoveryStop> {
     match (status, has_value, is_element) {
         (kAXErrorSuccess, true, true) => Ok(true),
         (kAXErrorNoValue, false, _) => Ok(false),
@@ -1242,18 +1456,27 @@ impl Tree for Native {
         self.relation(node, "AXWindow")
     }
     fn menu_window(&self, node: &Node) -> Result<Option<Node>, DiscoveryStop> {
-        if !self.ready(node) { return Err(DiscoveryStop::Deadline) }
+        if !self.ready(node) {
+            return Err(DiscoveryStop::Deadline);
+        }
         let attribute = CFString::new("AXWindow");
         let mut raw: CFTypeRef = std::ptr::null();
-        let status = unsafe { AXUIElementCopyAttributeValue(node.0, attribute.as_concrete_TypeRef(), &mut raw) };
-        let kind = menu_window_value_kind(status, !raw.is_null(), !raw.is_null()
-            && unsafe { CFGetTypeID(raw) == AXUIElementGetTypeID() });
+        let status = unsafe {
+            AXUIElementCopyAttributeValue(node.0, attribute.as_concrete_TypeRef(), &mut raw)
+        };
+        let kind = menu_window_value_kind(
+            status,
+            !raw.is_null(),
+            !raw.is_null() && unsafe { CFGetTypeID(raw) == AXUIElementGetTypeID() },
+        );
         if kind == Ok(true) {
             let retained = Node(raw as AXUIElementRef);
             budget(self)?;
             return Ok(Some(retained));
         }
-        if !raw.is_null() { unsafe { CFRelease(raw) }; }
+        if !raw.is_null() {
+            unsafe { CFRelease(raw) };
+        }
         budget(self)?;
         kind.map(|_| None)
     }
@@ -1526,7 +1749,12 @@ mod tests {
                     }
                 }
             }
-            self.fact(n).map(|_| self.frames.get(n).copied().unwrap_or([100.0, 120.0, 400.0, 300.0]))
+            self.fact(n).map(|_| {
+                self.frames
+                    .get(n)
+                    .copied()
+                    .unwrap_or([100.0, 120.0, 400.0, 300.0])
+            })
         }
         fn parent(&self, n: &u32) -> Option<u32> {
             if self.detach_after_proof && *n == 4 && self.proof_calls.get() > 0 {
@@ -1539,7 +1767,9 @@ mod tests {
         }
         fn menu_window(&self, n: &u32) -> Result<Option<u32>, DiscoveryStop> {
             self.menu_window_calls.set(self.menu_window_calls.get() + 1);
-            if self.menu_window_errors.contains(n) { return Err(DiscoveryStop::AxUnavailable) }
+            if self.menu_window_errors.contains(n) {
+                return Err(DiscoveryStop::AxUnavailable);
+            }
             Ok(self.fact(n).ok_or(DiscoveryStop::AxUnavailable)?.window)
         }
         fn children(&self, n: &u32) -> Result<Vec<u32>, DiscoveryStop> {
@@ -1732,7 +1962,11 @@ mod tests {
     fn native_menu_without_spi_or_window_attribute_has_a_reciprocal_host_proof() {
         let t = native_menu();
         assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
-        assert_eq!(t.proof_calls.get(), 0, "menu proof cannot use the popover shortcut");
+        assert_eq!(
+            t.proof_calls.get(),
+            0,
+            "menu proof cannot use the popover shortcut"
+        );
         assert!(t.refreshed.get());
         assert_eq!(t.refresh_count.get(), 2);
         let mut same_pid = native_menu();
@@ -1749,7 +1983,9 @@ mod tests {
                 1 => t.windows[1].layer = 3,
                 2 => t.windows[1].is_on_screen = false,
                 3 => t.windows[1].on_current_space = Some(false),
-                4 => { t.current.remove(&20); }
+                4 => {
+                    t.current.remove(&20);
+                }
                 5 => t.windows[1].bounds.width += 2.0,
                 6 => {
                     let mut duplicate = t.windows[1].clone();
@@ -1757,8 +1993,12 @@ mod tests {
                     t.windows.push(duplicate);
                 }
                 7 => t.windows.push(t.windows[1].clone()),
-                8 => { t.frames.insert(4, [415.0, 294.0, f64::NAN, 232.0]); }
-                _ => { t.frames.insert(4, [415.0, 294.0, 150.0, 0.0]); }
+                8 => {
+                    t.frames.insert(4, [415.0, 294.0, f64::NAN, 232.0]);
+                }
+                _ => {
+                    t.frames.insert(4, [415.0, 294.0, 150.0, 0.0]);
+                }
             }
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
         }
@@ -1816,7 +2056,11 @@ mod tests {
                 4 => t.changed_frame = Some((4, [415.25, 294.0, 150.0, 232.0])),
                 _ => t.windows[1].bounds.x += 0.25,
             }
-            assert_eq!(collect(&t, 42, 10, &initial), Err(DiscoveryStop::Changed), "case {case}");
+            assert_eq!(
+                collect(&t, 42, 10, &initial),
+                Err(DiscoveryStop::Changed),
+                "case {case}"
+            );
         }
     }
 
@@ -1824,10 +2068,16 @@ mod tests {
     fn menu_search_keeps_structural_and_shared_deadline_bounds() {
         let mut t = native_menu();
         t.expire_after_refresh = true;
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Deadline));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Deadline)
+        );
         let mut t = native_menu();
         t.nodes.get_mut(&2).unwrap().children = vec![3; MAX_CHILDREN + 1];
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::ChildLimit));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::ChildLimit)
+        );
         let mut t = native_menu();
         t.nodes.get_mut(&3).unwrap().children.push(2);
         assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Cycle));
@@ -1848,10 +2098,17 @@ mod tests {
 
     fn with_deferred_provider(mut t: Fake) -> Fake {
         t.nodes.get_mut(&1).unwrap().children.push(5);
-        t.nodes.insert(5, Fact {
-            role: "AXGroup", owner: 77, id: 999, parent: Some(1), window: None,
-            children: vec![6; MAX_CHILDREN + 1],
-        });
+        t.nodes.insert(
+            5,
+            Fact {
+                role: "AXGroup",
+                owner: 77,
+                id: 999,
+                parent: Some(1),
+                window: None,
+                children: vec![6; MAX_CHILDREN + 1],
+            },
+        );
         let mut unrelated = window(30);
         unrelated.layer = 101;
         t.windows.push(unrelated);
@@ -1875,7 +2132,10 @@ mod tests {
                 }
                 assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
                 assert_eq!(t.refresh_count.get(), 1);
-                assert!(!t.children_calls.borrow().contains(&5), "new remote work must never run");
+                assert!(
+                    !t.children_calls.borrow().contains(&5),
+                    "new remote work must never run"
+                );
             }
         }
     }
@@ -1896,13 +2156,23 @@ mod tests {
         // root + deferred provider +126 ordinary leaves exhaust the same128
         // visited nodes. The provider's first new child must not get a new cap.
         for id in 100..226 {
-            t.nodes.insert(id, Fact {
-                role: "AXStaticText", owner: 42, id: 10, parent: Some(1),
-                window: Some(1), children: vec![],
-            });
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXStaticText",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(1),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
             t.nodes.get_mut(&1).unwrap().children.push(id);
         }
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::NodeLimit));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::NodeLimit)
+        );
         assert_eq!(t.refresh_count.get(), 1);
     }
 
@@ -1910,14 +2180,28 @@ mod tests {
     fn mixed_valid_popover_and_menu_keeps_the_original_attachment_set() {
         let mut t = with_deferred_provider(popover());
         t.nodes.get_mut(&5).unwrap().children = vec![6];
-        t.nodes.insert(6, Fact {
-            role: "AXPopUpButton", owner: 42, id: 0, parent: Some(5),
-            window: None, children: vec![7],
-        });
-        t.nodes.insert(7, Fact {
-            role: "AXMenu", owner: 42, id: 0, parent: Some(6),
-            window: None, children: vec![],
-        });
+        t.nodes.insert(
+            6,
+            Fact {
+                role: "AXPopUpButton",
+                owner: 42,
+                id: 0,
+                parent: Some(5),
+                window: None,
+                children: vec![7],
+            },
+        );
+        t.nodes.insert(
+            7,
+            Fact {
+                role: "AXMenu",
+                owner: 42,
+                id: 0,
+                parent: Some(6),
+                window: None,
+                children: vec![],
+            },
+        );
         t.current.insert(30);
         assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
         assert!(!t.children_calls.borrow().contains(&5));
@@ -1937,20 +2221,33 @@ mod tests {
         let mut parent = 2;
         for id in 5..9 {
             t.nodes.get_mut(&parent).unwrap().children = vec![id];
-            t.nodes.insert(id, Fact {
-                role: "AXGroup", owner: 42, id: 10, parent: Some(parent),
-                window: Some(1), children: vec![3],
-            });
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXGroup",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(parent),
+                    window: Some(1),
+                    children: vec![3],
+                },
+            );
             parent = id;
         }
         t.nodes.get_mut(&3).unwrap().parent = Some(parent);
         t.windows[0].bounds = crate::windows::WindowBounds {
-            x: 562.0, y: 276.0, width: 602.0, height: 511.0,
+            x: 562.0,
+            y: 276.0,
+            width: 602.0,
+            height: 511.0,
         };
         t.frames.insert(1, [562.0, 276.0, 602.0, 511.0]);
         t.windows[1].layer = 0;
         t.windows[1].bounds = crate::windows::WindowBounds {
-            x: 818.0, y: 378.0, width: 217.0, height: 104.0,
+            x: 818.0,
+            y: 378.0,
+            width: 217.0,
+            height: 104.0,
         };
         t.frames.insert(4, [818.0, 378.0, 217.0, 104.0]);
         t
@@ -1961,7 +2258,11 @@ mod tests {
         let t = layer_zero_menu();
         assert!(t.windows.iter().all(|window| window.layer == 0));
         assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
-        assert_eq!(t.refresh_count.get(), 2, "original and menu proofs both settle");
+        assert_eq!(
+            t.refresh_count.get(),
+            2,
+            "original and menu proofs both settle"
+        );
         assert_eq!(t.proof_calls.get(), 0, "no popover authority shortcut");
     }
 
@@ -2014,7 +2315,9 @@ mod tests {
                 0 => t.windows[1].pid = 99,
                 1 => t.windows[1].is_on_screen = false,
                 2 => t.windows[1].on_current_space = Some(false),
-                3 => { t.current.remove(&20); }
+                3 => {
+                    t.current.remove(&20);
+                }
                 4 => t.windows[1].bounds.x += 1.0,
                 5 => t.windows[1].window_id = 10,
                 6 => t.windows.push(t.windows[1].clone()),
@@ -2025,7 +2328,11 @@ mod tests {
                     t.windows.push(duplicate);
                 }
             }
-            let expected = if case == 5 { Err(DiscoveryStop::InvalidHost) } else { Ok(vec![]) };
+            let expected = if case == 5 {
+                Err(DiscoveryStop::InvalidHost)
+            } else {
+                Ok(vec![])
+            };
             assert_eq!(collect(&t, 42, 10, &t.windows), expected, "case {case}");
         }
     }
@@ -2037,14 +2344,30 @@ mod tests {
             let initial = t.windows.clone();
             let mut changed = t.nodes[&5].clone();
             match case {
-                0 => { changed.id = 999; t.changed_node = Some((5, changed)); }
-                1 => { changed.window = Some(2); t.changed_node = Some((5, changed)); }
-                2 => { changed.owner = 77; t.changed_node = Some((5, changed)); }
-                3 => { changed.parent = None; t.changed_node = Some((5, changed)); }
+                0 => {
+                    changed.id = 999;
+                    t.changed_node = Some((5, changed));
+                }
+                1 => {
+                    changed.window = Some(2);
+                    t.changed_node = Some((5, changed));
+                }
+                2 => {
+                    changed.owner = 77;
+                    t.changed_node = Some((5, changed));
+                }
+                3 => {
+                    changed.parent = None;
+                    t.changed_node = Some((5, changed));
+                }
                 4 => t.changed_frame = Some((4, [818.25, 378.0, 217.0, 104.0])),
                 _ => t.windows[1].layer = 101,
             }
-            assert_eq!(collect(&t, 42, 10, &initial), Err(DiscoveryStop::Changed), "case {case}");
+            assert_eq!(
+                collect(&t, 42, 10, &initial),
+                Err(DiscoveryStop::Changed),
+                "case {case}"
+            );
         }
     }
 
@@ -2052,19 +2375,35 @@ mod tests {
     fn layer_zero_additional_reads_keep_shared_deadline_and_node_limits() {
         let mut t = layer_zero_menu();
         t.expire_on_id = Some(4);
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Deadline));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Deadline)
+        );
         let mut t = layer_zero_menu();
         t.expire_after_refresh = true;
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Deadline));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Deadline)
+        );
         let mut t = layer_zero_menu();
         for id in 100..221 {
-            t.nodes.insert(id, Fact {
-                role: "AXStaticText", owner: 42, id: 10, parent: Some(1),
-                window: Some(1), children: vec![],
-            });
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXStaticText",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(1),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
             t.nodes.get_mut(&1).unwrap().children.push(id);
         }
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::NodeLimit));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::NodeLimit)
+        );
     }
 
     #[test]
@@ -2087,7 +2426,11 @@ mod tests {
                     changed.parent = Some(2);
                     t.changed_node = Some((4, changed));
                 }
-                let expected = if fails { Err(DiscoveryStop::Changed) } else { Ok(vec![20]) };
+                let expected = if fails {
+                    Err(DiscoveryStop::Changed)
+                } else {
+                    Ok(vec![20])
+                };
                 assert_eq!(collect(&t, 42, 10, &t.windows), expected);
                 assert_eq!(t.refresh_count.get(), 1);
                 assert!(!t.children_calls.borrow().contains(&5));
@@ -2117,13 +2460,19 @@ mod tests {
             }
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]));
             assert_eq!(t.refresh_count.get(), 1, "no extra empty validation pass");
-            assert!(!t.children_calls.borrow().contains(&2), "provider is ineligible for layer0");
+            assert!(
+                !t.children_calls.borrow().contains(&2),
+                "provider is ineligible for layer0"
+            );
         }
         // The old layer101 route still performs its provider search and keeps
         // its original read-error behavior rather than swallowing the error.
         let mut t = native_menu();
         t.children_errors.insert(2);
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
         assert!(t.children_calls.borrow().contains(&2));
     }
 
@@ -2379,10 +2728,7 @@ mod tests {
         }
         t.nodes.get_mut(&4).unwrap().children = vec![34];
         t.focused = Some(30);
-        assert_eq!(
-            collect(&t, 42, 10, &t.windows),
-            Ok(vec![20])
-        );
+        assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
     }
 
     // Extend only the already proven fixture. Both depths include the popup;
@@ -2393,20 +2739,34 @@ mod tests {
         let mut parent = 3;
         for id in 100..100 + (attachment_depth - 9) as u32 {
             t.nodes.get_mut(&parent).unwrap().children = vec![id];
-            t.nodes.insert(id, Fact {
-                role: "AXGroup", owner: 42, id: 10, parent: Some(parent),
-                window: Some(1), children: vec![4],
-            });
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXGroup",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(parent),
+                    window: Some(1),
+                    children: vec![4],
+                },
+            );
             t.nodes.get_mut(&4).unwrap().parent = Some(id);
             parent = id;
         }
         parent = 4;
         for id in 30..30 + (locator_depth - 1) as u32 {
             t.nodes.get_mut(&parent).unwrap().children = vec![id];
-            t.nodes.insert(id, Fact {
-                role: "AXGroup", owner: 42, id: 20, parent: Some(parent),
-                window: Some(1), children: vec![],
-            });
+            t.nodes.insert(
+                id,
+                Fact {
+                    role: "AXGroup",
+                    owner: 42,
+                    id: 20,
+                    parent: Some(parent),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
             parent = id;
         }
         t.focused = Some(parent);
@@ -2416,14 +2776,27 @@ mod tests {
     #[test]
     fn collection_popover_bounds_locator_and_attachment_independently() {
         for (locator, attachment, accepted) in [
-            (1, 9, true), (6, 9, true), (12, 9, true), (13, 9, false),
-            (1, 12, true), (1, 13, false), (12, 12, true),
-            (12, 13, false), (13, 12, false),
+            (1, 9, true),
+            (6, 9, true),
+            (12, 9, true),
+            (13, 9, false),
+            (1, 12, true),
+            (1, 13, false),
+            (12, 12, true),
+            (12, 13, false),
+            (13, 12, false),
         ] {
             let t = collection_depth_fixture(locator, attachment);
-            let expected = if accepted { Ok(vec![20]) } else { Err(DiscoveryStop::DepthLimit) };
-            assert_eq!(collect(&t, 42, 10, &t.windows), expected,
-                "locator {locator}, attachment {attachment}");
+            let expected = if accepted {
+                Ok(vec![20])
+            } else {
+                Err(DiscoveryStop::DepthLimit)
+            };
+            assert_eq!(
+                collect(&t, 42, 10, &t.windows),
+                expected,
+                "locator {locator}, attachment {attachment}"
+            );
             assert_eq!(t.proof_calls.get(), if accepted { 2 } else { 0 });
         }
     }
@@ -2434,13 +2807,24 @@ mod tests {
         for (extra, accepted) in [(MAX_NODES - 23, true), (MAX_NODES - 22, false)] {
             let mut t = collection_depth_fixture(12, 12);
             for id in 500..500 + extra as u32 {
-                t.nodes.insert(id, Fact {
-                    role: "AXStaticText", owner: 42, id: 10, parent: Some(1),
-                    window: Some(1), children: vec![],
-                });
+                t.nodes.insert(
+                    id,
+                    Fact {
+                        role: "AXStaticText",
+                        owner: 42,
+                        id: 10,
+                        parent: Some(1),
+                        window: Some(1),
+                        children: vec![],
+                    },
+                );
                 t.nodes.get_mut(&1).unwrap().children.push(id);
             }
-            let expected = if accepted { Ok(vec![20]) } else { Err(DiscoveryStop::NodeLimit) };
+            let expected = if accepted {
+                Ok(vec![20])
+            } else {
+                Err(DiscoveryStop::NodeLimit)
+            };
             assert_eq!(collect(&t, 42, 10, &t.windows), expected, "extra {extra}");
         }
     }
@@ -2451,26 +2835,52 @@ mod tests {
             let mut t = collection_depth_fixture(12, 12);
             let focused = t.focused.unwrap();
             let expected = match case {
-                0 => { t.nodes.get_mut(&focused).unwrap().role = "AXIncrementor"; Ok(vec![]) }
-                1 => { t.nodes.get_mut(&focused).unwrap().parent = None; Ok(vec![]) }
-                2 => { t.nodes.get_mut(&5).unwrap().parent = Some(9); Err(DiscoveryStop::Cycle) }
-                3 => { t.children_errors.insert(9); Err(DiscoveryStop::AxUnavailable) }
-                4 => { t.nodes.get_mut(&9).unwrap().owner = 77; Ok(vec![]) }
-                5 => { t.current.remove(&20); Ok(vec![]) }
-                6 => { t.expire_on_proof = true; Err(DiscoveryStop::Deadline) }
+                0 => {
+                    t.nodes.get_mut(&focused).unwrap().role = "AXIncrementor";
+                    Ok(vec![])
+                }
+                1 => {
+                    t.nodes.get_mut(&focused).unwrap().parent = None;
+                    Ok(vec![])
+                }
+                2 => {
+                    t.nodes.get_mut(&5).unwrap().parent = Some(9);
+                    Err(DiscoveryStop::Cycle)
+                }
+                3 => {
+                    t.children_errors.insert(9);
+                    Err(DiscoveryStop::AxUnavailable)
+                }
+                4 => {
+                    t.nodes.get_mut(&9).unwrap().owner = 77;
+                    Ok(vec![])
+                }
+                5 => {
+                    t.current.remove(&20);
+                    Ok(vec![])
+                }
+                6 => {
+                    t.expire_on_proof = true;
+                    Err(DiscoveryStop::Deadline)
+                }
                 7 => {
                     t.change_on_refresh = 2;
-                    let mut changed = t.nodes[&102].clone(); changed.parent = None;
-                    t.changed_node = Some((102, changed)); Err(DiscoveryStop::Changed)
+                    let mut changed = t.nodes[&102].clone();
+                    changed.parent = None;
+                    t.changed_node = Some((102, changed));
+                    Err(DiscoveryStop::Changed)
                 }
                 8 => {
                     t.change_on_refresh = 2;
-                    let mut changed = t.windows.clone(); changed[1].bounds.x += 1.0;
-                    t.changed_windows = Some(changed); Err(DiscoveryStop::Changed)
+                    let mut changed = t.windows.clone();
+                    changed[1].bounds.x += 1.0;
+                    t.changed_windows = Some(changed);
+                    Err(DiscoveryStop::Changed)
                 }
                 _ => {
                     t.nodes.insert(9000, t.nodes[&1].clone());
-                    t.change_on_refresh = 2; t.changed_roots = Some(vec![9000]);
+                    t.change_on_refresh = 2;
+                    t.changed_roots = Some(vec![9000]);
                     Err(DiscoveryStop::Changed)
                 }
             };
@@ -2583,16 +2993,36 @@ mod tests {
             (9, "AXScrollArea", 6, vec![11]),
             (11, "AXOutline", 9, vec![]),
         ] {
-            t.nodes.insert(id, Fact { role, owner: 42, id: 10,
-                parent: Some(parent), window: Some(1), children });
+            t.nodes.insert(
+                id,
+                Fact {
+                    role,
+                    owner: 42,
+                    id: 10,
+                    parent: Some(parent),
+                    window: Some(1),
+                    children,
+                },
+            );
         }
-        t.nodes.insert(4, Fact { role: "AXMenu", owner: 42, id: 10,
-            parent: Some(7), window: None, children: vec![] });
+        t.nodes.insert(
+            4,
+            Fact {
+                role: "AXMenu",
+                owner: 42,
+                id: 10,
+                parent: Some(7),
+                window: None,
+                children: vec![],
+            },
+        );
         t.frames.insert(4, [130.0, 140.0, 90.0, 80.0]);
         let menu = &mut t.windows[1];
         menu.layer = 101;
-        menu.bounds.x = 130.0; menu.bounds.y = 140.0;
-        menu.bounds.width = 90.0; menu.bounds.height = 80.0;
+        menu.bounds.x = 130.0;
+        menu.bounds.y = 140.0;
+        menu.bounds.width = 90.0;
+        menu.bounds.height = 80.0;
         // Actual focus may remain in the other content Outline. It is no
         // authority for selecting the sidebar menu.
         t.focused = Some(11);
@@ -2606,9 +3036,17 @@ mod tests {
             t.nodes.get_mut(&4).unwrap().window = logical;
             t.children_errors.extend([8, 4]); // No row or menu-item traversal.
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
-            assert_eq!(t.menu_window_calls.get(), 2, "fresh leaf relationship each proof");
+            assert_eq!(
+                t.menu_window_calls.get(),
+                2,
+                "fresh leaf relationship each proof"
+            );
             assert_eq!(t.refresh_count.get(), 2);
-            assert!(!t.children_calls.borrow().iter().any(|node| [8, 4].contains(node)));
+            assert!(!t
+                .children_calls
+                .borrow()
+                .iter()
+                .any(|node| [8, 4].contains(node)));
         }
         assert!(!container("AXOutline"));
         assert!(!container("AXLayoutArea"));
@@ -2616,24 +3054,40 @@ mod tests {
 
     #[test]
     fn outline_menu_leaf_absence_never_swallows_ax_errors_or_malformed_values() {
-        assert_eq!(menu_window_value_kind(kAXErrorNoValue, false, false), Ok(false));
-        assert_eq!(menu_window_value_kind(kAXErrorSuccess, true, true), Ok(true));
+        assert_eq!(
+            menu_window_value_kind(kAXErrorNoValue, false, false),
+            Ok(false)
+        );
+        assert_eq!(
+            menu_window_value_kind(kAXErrorSuccess, true, true),
+            Ok(true)
+        );
         for (status, has_value, is_element) in [
-            (kAXErrorSuccess, false, false), (kAXErrorSuccess, true, false),
-            (kAXErrorNoValue, true, true), (kAXErrorAttributeUnsupported, false, false),
+            (kAXErrorSuccess, false, false),
+            (kAXErrorSuccess, true, false),
+            (kAXErrorNoValue, true, true),
+            (kAXErrorAttributeUnsupported, false, false),
             (-25204, false, false),
         ] {
-            assert_eq!(menu_window_value_kind(status, has_value, is_element), Err(DiscoveryStop::AxUnavailable));
+            assert_eq!(
+                menu_window_value_kind(status, has_value, is_element),
+                Err(DiscoveryStop::AxUnavailable)
+            );
         }
-        let mut t = outline_menu(); t.menu_window_errors.insert(4);
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
+        let mut t = outline_menu();
+        t.menu_window_errors.insert(4);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
     }
 
     #[test]
     fn outline_menu_requires_every_host_identity_and_reciprocal_edge() {
         for node in [2, 5, 7, 4] {
             for case in 0..5 {
-                let mut t = outline_menu(); let fact = t.nodes.get_mut(&node).unwrap();
+                let mut t = outline_menu();
+                let fact = t.nodes.get_mut(&node).unwrap();
                 match case {
                     0 => fact.owner = 77,
                     1 => fact.id = 20,
@@ -2642,15 +3096,33 @@ mod tests {
                     _ => fact.parent = Some(1),
                 }
                 // Node2 is already a direct host child; use a genuinely changed edge.
-                if case == 4 && node == 2 { t.nodes.get_mut(&node).unwrap().parent = Some(7); }
-                assert!(!matches!(collect(&t, 42, 10, &t.windows), Ok(ids) if !ids.is_empty()), "node {node} case {case}");
+                if case == 4 && node == 2 {
+                    t.nodes.get_mut(&node).unwrap().parent = Some(7);
+                }
+                assert!(
+                    !matches!(collect(&t, 42, 10, &t.windows), Ok(ids) if !ids.is_empty()),
+                    "node {node} case {case}"
+                );
             }
         }
-        for role in ["AXCell", "AXRow", "AXWebArea", "AXTable", "AXButton", "AXSheet", "AXWindow"] {
-            let mut t = outline_menu(); t.nodes.get_mut(&5).unwrap().role = role;
-            assert!(!matches!(collect(&t, 42, 10, &t.windows), Ok(ids) if !ids.is_empty()), "role {role}");
+        for role in [
+            "AXCell",
+            "AXRow",
+            "AXWebArea",
+            "AXTable",
+            "AXButton",
+            "AXSheet",
+            "AXWindow",
+        ] {
+            let mut t = outline_menu();
+            t.nodes.get_mut(&5).unwrap().role = role;
+            assert!(
+                !matches!(collect(&t, 42, 10, &t.windows), Ok(ids) if !ids.is_empty()),
+                "role {role}"
+            );
         }
-        let mut t = outline_menu(); t.nodes.get_mut(&7).unwrap().children.push(4);
+        let mut t = outline_menu();
+        t.nodes.get_mut(&7).unwrap().children.push(4);
         assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]));
     }
 
@@ -2663,37 +3135,92 @@ mod tests {
                 1 => t.windows[1].pid = 77,
                 2 => t.windows[1].is_on_screen = false,
                 3 => t.windows[1].on_current_space = Some(false),
-                4 => { t.current.remove(&20); }
+                4 => {
+                    t.current.remove(&20);
+                }
                 5 => t.windows[1].bounds.width += 1.0,
-                6 => { let mut duplicate = t.windows[1].clone(); duplicate.window_id = 30; t.windows.push(duplicate); }
-                _ => { let mut duplicate = t.windows[1].clone(); duplicate.window_id = 30; duplicate.layer = 0; t.windows.push(duplicate); }
+                6 => {
+                    let mut duplicate = t.windows[1].clone();
+                    duplicate.window_id = 30;
+                    t.windows.push(duplicate);
+                }
+                _ => {
+                    let mut duplicate = t.windows[1].clone();
+                    duplicate.window_id = 30;
+                    duplicate.layer = 0;
+                    t.windows.push(duplicate);
+                }
             }
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case {case}");
         }
-        let mut t = outline_menu(); let mut duplicate = t.nodes[&4].clone();
-        duplicate.parent = Some(7); t.nodes.insert(30, duplicate);
-        t.frames.insert(30, t.frames[&4]); t.nodes.get_mut(&7).unwrap().children.push(30);
+        let mut t = outline_menu();
+        let mut duplicate = t.nodes[&4].clone();
+        duplicate.parent = Some(7);
+        t.nodes.insert(30, duplicate);
+        t.frames.insert(30, t.frames[&4]);
+        t.nodes.get_mut(&7).unwrap().children.push(30);
         assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Changed));
     }
 
     #[test]
     fn outline_menu_shares_node_child_depth_and_deadline_limits() {
-        let t = outline_menu(); let mut visited = (100..100 + MAX_NODES as u32).collect();
-        assert_eq!(collect_outline_menus(&t, 42, &t.windows[0], &1, &t.windows,
-            &mut visited, &[vec![1, 2, 5, 7]]), Err(DiscoveryStop::NodeLimit));
-        assert_eq!(collect_outline_menus(&t, 42, &t.windows[0], &1, &t.windows,
-            &mut vec![1, 2], &[vec![1, 2, 2]]), Err(DiscoveryStop::Cycle));
-        let mut t = outline_menu(); t.nodes.get_mut(&7).unwrap().children = vec![4; MAX_CHILDREN + 1];
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::ChildLimit));
-        let mut t = outline_menu(); t.expire_on_id = Some(7);
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Deadline));
-        let mut t = outline_menu(); t.nodes.get_mut(&6).unwrap().children = vec![100];
+        let t = outline_menu();
+        let mut visited = (100..100 + MAX_NODES as u32).collect();
+        assert_eq!(
+            collect_outline_menus(
+                &t,
+                42,
+                &t.windows[0],
+                &1,
+                &t.windows,
+                &mut visited,
+                &[vec![1, 2, 5, 7]]
+            ),
+            Err(DiscoveryStop::NodeLimit)
+        );
+        assert_eq!(
+            collect_outline_menus(
+                &t,
+                42,
+                &t.windows[0],
+                &1,
+                &t.windows,
+                &mut vec![1, 2],
+                &[vec![1, 2, 2]]
+            ),
+            Err(DiscoveryStop::Cycle)
+        );
+        let mut t = outline_menu();
+        t.nodes.get_mut(&7).unwrap().children = vec![4; MAX_CHILDREN + 1];
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::ChildLimit)
+        );
+        let mut t = outline_menu();
+        t.expire_on_id = Some(7);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Deadline)
+        );
+        let mut t = outline_menu();
+        t.nodes.get_mut(&6).unwrap().children = vec![100];
         for n in 100..112 {
-            t.nodes.insert(n, Fact { role: "AXGroup", owner: 42, id: 10,
-                parent: Some(if n == 100 { 6 } else { n - 1 }), window: Some(1),
-                children: if n == 111 { vec![] } else { vec![n + 1] } });
+            t.nodes.insert(
+                n,
+                Fact {
+                    role: "AXGroup",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(if n == 100 { 6 } else { n - 1 }),
+                    window: Some(1),
+                    children: if n == 111 { vec![] } else { vec![n + 1] },
+                },
+            );
         }
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::DepthLimit));
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::DepthLimit)
+        );
     }
 
     #[test]
@@ -2709,8 +3236,18 @@ mod tests {
                 t.nodes.get_mut(&6).unwrap().window = Some(2);
                 Ok(vec![])
             };
-            assert_eq!(collect_outline_menus(&t, 42, &t.windows[0], &1, &t.windows,
-                &mut vec![1, 2, 5, 7, 6], &[vec![1, 2, 5, 7], vec![1, 2, 6]]), expected);
+            assert_eq!(
+                collect_outline_menus(
+                    &t,
+                    42,
+                    &t.windows[0],
+                    &1,
+                    &t.windows,
+                    &mut vec![1, 2, 5, 7, 6],
+                    &[vec![1, 2, 5, 7], vec![1, 2, 6]]
+                ),
+                expected
+            );
             assert_eq!(t.menu_window_calls.get(), 1);
         }
     }
@@ -2718,51 +3255,122 @@ mod tests {
     #[test]
     fn outline_menu_revalidates_leaf_edges_role_root_and_cg_after_discovery() {
         for case in 0..8 {
-            let mut t = outline_menu(); t.change_on_refresh = 2;
+            let mut t = outline_menu();
+            t.change_on_refresh = 2;
             match case {
-                0 => { let mut leaf = t.nodes[&4].clone(); leaf.parent = Some(1); t.changed_node = Some((4, leaf)); }
-                1 => { let mut leaf = t.nodes[&4].clone(); leaf.window = Some(1); t.changed_node = Some((4, leaf)); }
-                2 => { let mut anchor = t.nodes[&7].clone(); anchor.children.clear(); t.changed_node = Some((7, anchor)); }
-                3 => { let mut prefix = t.nodes[&5].clone(); prefix.role = "AXGroup"; t.changed_node = Some((5, prefix)); }
+                0 => {
+                    let mut leaf = t.nodes[&4].clone();
+                    leaf.parent = Some(1);
+                    t.changed_node = Some((4, leaf));
+                }
+                1 => {
+                    let mut leaf = t.nodes[&4].clone();
+                    leaf.window = Some(1);
+                    t.changed_node = Some((4, leaf));
+                }
+                2 => {
+                    let mut anchor = t.nodes[&7].clone();
+                    anchor.children.clear();
+                    t.changed_node = Some((7, anchor));
+                }
+                3 => {
+                    let mut prefix = t.nodes[&5].clone();
+                    prefix.role = "AXGroup";
+                    t.changed_node = Some((5, prefix));
+                }
                 4 => t.changed_frame = Some((4, [130.0, 140.0, 91.0, 80.0])),
-                5 => { let mut windows = t.windows.clone(); windows[1].bounds.x += 1.0; t.changed_windows = Some(windows); }
-                6 => { t.nodes.insert(31, t.nodes[&1].clone()); t.changed_roots = Some(vec![31]); }
+                5 => {
+                    let mut windows = t.windows.clone();
+                    windows[1].bounds.x += 1.0;
+                    t.changed_windows = Some(windows);
+                }
+                6 => {
+                    t.nodes.insert(31, t.nodes[&1].clone());
+                    t.changed_roots = Some(vec![31]);
+                }
                 _ => t.expire_after_refresh = true,
             }
             let result = collect(&t, 42, 10, &t.windows);
-            assert_eq!(result, Err(if case == 7 { DiscoveryStop::Deadline } else { DiscoveryStop::Changed }), "case {case}");
+            assert_eq!(
+                result,
+                Err(if case == 7 {
+                    DiscoveryStop::Deadline
+                } else {
+                    DiscoveryStop::Changed
+                }),
+                "case {case}"
+            );
         }
     }
 
     #[test]
     fn outline_fallback_adds_no_queries_after_existing_success_or_error() {
         for kind in 0..4 {
-            let mut t = match kind { 0 => popover(), 1 => native_menu(), 2 => collection_popover(), _ => layer_zero_menu() };
+            let mut t = match kind {
+                0 => popover(),
+                1 => native_menu(),
+                2 => collection_popover(),
+                _ => layer_zero_menu(),
+            };
             t.nodes.get_mut(&1).unwrap().children.push(50);
-            t.nodes.insert(50, Fact { role: "AXLayoutArea", owner: 42, id: 10,
-                parent: Some(1), window: Some(1), children: vec![51] });
-            t.children_errors.insert(50); t.expire_on_id = Some(50);
-            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]), "route {kind}");
+            t.nodes.insert(
+                50,
+                Fact {
+                    role: "AXLayoutArea",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(1),
+                    window: Some(1),
+                    children: vec![51],
+                },
+            );
+            t.children_errors.insert(50);
+            t.expire_on_id = Some(50);
+            assert_eq!(
+                collect(&t, 42, 10, &t.windows),
+                Ok(vec![20]),
+                "route {kind}"
+            );
             assert_eq!(t.menu_window_calls.get(), 0);
             assert!(!t.children_calls.borrow().contains(&50));
         }
-        let mut t = outline_menu(); t.children_errors.insert(1);
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
+        let mut t = outline_menu();
+        t.children_errors.insert(1);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
         assert_eq!(t.menu_window_calls.get(), 0);
         assert!(!t.children_calls.borrow().contains(&7));
         let mut t = collection_popover();
         t.windows[1].layer = 101;
         t.children_errors.insert(9);
-        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::AxUnavailable));
-        assert_eq!(t.menu_window_calls.get(), 0, "H141 errors also retain priority");
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
+        assert_eq!(
+            t.menu_window_calls.get(),
+            0,
+            "H141 errors also retain priority"
+        );
     }
 
     fn tabgroup_popover() -> Fake {
         let mut t = popover();
         t.nodes.get_mut(&2).unwrap().role = "AXSplitGroup";
         t.nodes.get_mut(&2).unwrap().children = vec![5];
-        t.nodes.insert(5, Fact { role: "AXTabGroup", owner: 42, id: 10,
-            parent: Some(2), window: Some(1), children: vec![3] });
+        t.nodes.insert(
+            5,
+            Fact {
+                role: "AXTabGroup",
+                owner: 42,
+                id: 10,
+                parent: Some(2),
+                window: Some(1),
+                children: vec![3],
+            },
+        );
         t.nodes.get_mut(&3).unwrap().parent = Some(5);
         // No focus hint: exact discovery must start from the retained root seed.
         t.focused = None;
@@ -2776,19 +3384,31 @@ mod tests {
         assert_eq!(t.proof_calls.get(), 2);
         assert!(t.children_calls.borrow().contains(&5));
         assert!(t.children_calls.borrow().contains(&3));
-        assert!(!t.children_calls.borrow().contains(&4), "popup contents are never traversed");
-        let mut refused = tabgroup_popover(); refused.proof = false;
+        assert!(
+            !t.children_calls.borrow().contains(&4),
+            "popup contents are never traversed"
+        );
+        let mut refused = tabgroup_popover();
+        refused.proof = false;
         assert_eq!(collect(&refused, 42, 10, &refused.windows), Ok(vec![]));
-        assert_eq!(refused.proof_calls.get(), 1, "standalone old input proof is not bypassed");
+        assert_eq!(
+            refused.proof_calls.get(),
+            1,
+            "standalone old input proof is not bypassed"
+        );
         assert!(!container("AXTabGroup"));
-        assert!(!host_collection_role("AXTabGroup"), "focused and menu boundaries remain unchanged");
+        assert!(
+            !host_collection_role("AXTabGroup"),
+            "focused and menu boundaries remain unchanged"
+        );
     }
 
     #[test]
     fn tabgroup_prefix_requires_exact_physical_logical_owner_and_edges() {
         for id in [2, 5, 3] {
             for case in 0..6 {
-                let mut t = tabgroup_popover(); let node = t.nodes.get_mut(&id).unwrap();
+                let mut t = tabgroup_popover();
+                let node = t.nodes.get_mut(&id).unwrap();
                 match case {
                     0 => node.owner = 77,
                     1 => node.id = 20,
@@ -2797,24 +3417,40 @@ mod tests {
                     4 => node.window = Some(2),
                     _ => node.parent = Some(999),
                 }
-                assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "node{id} case{case}");
+                assert_eq!(
+                    collect(&t, 42, 10, &t.windows),
+                    Ok(vec![]),
+                    "node{id} case{case}"
+                );
                 assert_eq!(t.proof_calls.get(), 0);
             }
         }
-        let mut t = tabgroup_popover(); t.nodes.get_mut(&5).unwrap().children.push(3);
+        let mut t = tabgroup_popover();
+        t.nodes.get_mut(&5).unwrap().children.push(3);
         assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]));
         assert_eq!(t.proof_calls.get(), 0);
     }
 
     #[test]
     fn tabgroup_does_not_descend_content_sheets_menus_or_popup_children() {
-        for role in ["AXWebArea", "AXList", "AXOutline", "AXCell", "AXRow", "AXSheet", "AXMenu", "AXApplication"] {
-            let mut t = tabgroup_popover(); t.nodes.get_mut(&3).unwrap().role = role;
+        for role in [
+            "AXWebArea",
+            "AXList",
+            "AXOutline",
+            "AXCell",
+            "AXRow",
+            "AXSheet",
+            "AXMenu",
+            "AXApplication",
+        ] {
+            let mut t = tabgroup_popover();
+            t.nodes.get_mut(&3).unwrap().role = role;
             t.children_errors.insert(3);
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "{role}");
             assert!(!t.children_calls.borrow().contains(&3), "{role}");
         }
-        let mut t = tabgroup_popover(); t.children_errors.insert(4);
+        let mut t = tabgroup_popover();
+        t.children_errors.insert(4);
         assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]));
         assert!(!t.children_calls.borrow().contains(&4));
     }
@@ -2830,9 +3466,13 @@ mod tests {
                 3 => t.nodes.get_mut(&4).unwrap().owner = 77,
                 4 => t.windows[1].is_on_screen = false,
                 5 => t.windows[1].on_current_space = Some(false),
-                6 => { t.current.remove(&20); },
+                6 => {
+                    t.current.remove(&20);
+                }
                 7 => t.windows.push(window(20)),
-                _ => { t.frames.insert(4, [101.0,120.0,400.0,300.0]); },
+                _ => {
+                    t.frames.insert(4, [101.0, 120.0, 400.0, 300.0]);
+                }
             }
             assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![]), "case{case}");
             assert_eq!(t.proof_calls.get(), 0);
@@ -2842,80 +3482,211 @@ mod tests {
     #[test]
     fn tabgroup_revalidation_discards_changed_edges_role_root_geometry_and_space() {
         for case in 0..10 {
-            let mut t = tabgroup_popover(); t.change_on_refresh = 2;
+            let mut t = tabgroup_popover();
+            t.change_on_refresh = 2;
             match case {
-                0 => { let mut n = t.nodes[&3].clone(); n.parent = Some(1); t.changed_node = Some((3,n)); },
-                1 => { let mut n = t.nodes[&3].clone(); n.role = "AXGroup"; t.changed_node = Some((3,n)); },
-                2 => { let mut n = t.nodes[&5].clone(); n.window = None; t.changed_node = Some((5,n)); },
-                3 => { let mut n = t.nodes[&5].clone(); n.children.clear(); t.changed_node = Some((5,n)); },
-                4 => { let mut n = t.nodes[&4].clone(); n.id = 10; t.changed_node = Some((4,n)); },
-                5 => t.changed_frame = Some((4,[101.0,120.0,400.0,300.0])),
-                6 => { let mut w = t.windows.clone(); w[1].bounds.x += 1.0; t.changed_windows = Some(w); },
-                7 => { let mut w = t.windows.clone(); w[1].on_current_space = Some(false); t.changed_windows = Some(w); },
-                8 => { t.nodes.insert(9000,t.nodes[&1].clone()); t.changed_roots = Some(vec![9000]); },
+                0 => {
+                    let mut n = t.nodes[&3].clone();
+                    n.parent = Some(1);
+                    t.changed_node = Some((3, n));
+                }
+                1 => {
+                    let mut n = t.nodes[&3].clone();
+                    n.role = "AXGroup";
+                    t.changed_node = Some((3, n));
+                }
+                2 => {
+                    let mut n = t.nodes[&5].clone();
+                    n.window = None;
+                    t.changed_node = Some((5, n));
+                }
+                3 => {
+                    let mut n = t.nodes[&5].clone();
+                    n.children.clear();
+                    t.changed_node = Some((5, n));
+                }
+                4 => {
+                    let mut n = t.nodes[&4].clone();
+                    n.id = 10;
+                    t.changed_node = Some((4, n));
+                }
+                5 => t.changed_frame = Some((4, [101.0, 120.0, 400.0, 300.0])),
+                6 => {
+                    let mut w = t.windows.clone();
+                    w[1].bounds.x += 1.0;
+                    t.changed_windows = Some(w);
+                }
+                7 => {
+                    let mut w = t.windows.clone();
+                    w[1].on_current_space = Some(false);
+                    t.changed_windows = Some(w);
+                }
+                8 => {
+                    t.nodes.insert(9000, t.nodes[&1].clone());
+                    t.changed_roots = Some(vec![9000]);
+                }
                 _ => t.expire_after_refresh = true,
             }
-            let expected = Err(if case == 9 { DiscoveryStop::Deadline } else { DiscoveryStop::Changed });
+            let expected = Err(if case == 9 {
+                DiscoveryStop::Deadline
+            } else {
+                DiscoveryStop::Changed
+            });
             assert_eq!(collect(&t, 42, 10, &t.windows), expected, "case{case}");
         }
     }
 
     #[test]
     fn tabgroup_shares_child_node_depth_cycle_and_deadline_limits() {
-        let mut t = tabgroup_popover(); t.nodes.get_mut(&5).unwrap().children = vec![3;129];
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::ChildLimit));
+        let mut t = tabgroup_popover();
+        t.nodes.get_mut(&5).unwrap().children = vec![3; 129];
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::ChildLimit)
+        );
         let mut t = tabgroup_popover();
         t.nodes.get_mut(&5).unwrap().children = (100..228).collect();
-        for n in 100..228 { t.nodes.insert(n,Fact { role:"AXStaticText", owner:42,id:10,parent:Some(5),window:Some(1),children:vec![] }); }
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::NodeLimit));
-        let mut t = tabgroup_popover(); t.nodes.get_mut(&5).unwrap().children = vec![5];
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::Cycle));
-        for depth in [12,13] {
-            let mut t = tabgroup_popover(); let count = depth - 5;
+        for n in 100..228 {
+            t.nodes.insert(
+                n,
+                Fact {
+                    role: "AXStaticText",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(5),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
+        }
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::NodeLimit)
+        );
+        let mut t = tabgroup_popover();
+        t.nodes.get_mut(&5).unwrap().children = vec![5];
+        assert_eq!(collect(&t, 42, 10, &t.windows), Err(DiscoveryStop::Cycle));
+        for depth in [12, 13] {
+            let mut t = tabgroup_popover();
+            let count = depth - 5;
             t.nodes.get_mut(&5).unwrap().children = vec![100];
             for i in 0..count {
-                let n = 100+i;
-                t.nodes.insert(n,Fact {role:"AXGroup",owner:42,id:10,parent:Some(if i==0 {5} else {n-1}),
-                    window:Some(1),children:vec![if i+1==count {3} else {n+1}]});
+                let n = 100 + i;
+                t.nodes.insert(
+                    n,
+                    Fact {
+                        role: "AXGroup",
+                        owner: 42,
+                        id: 10,
+                        parent: Some(if i == 0 { 5 } else { n - 1 }),
+                        window: Some(1),
+                        children: vec![if i + 1 == count { 3 } else { n + 1 }],
+                    },
+                );
             }
-            t.nodes.get_mut(&3).unwrap().parent = Some(100+count-1);
-            assert_eq!(collect(&t,42,10,&t.windows),if depth==12 {Ok(vec![20])} else {Err(DiscoveryStop::DepthLimit)},"depth{depth}");
+            t.nodes.get_mut(&3).unwrap().parent = Some(100 + count - 1);
+            assert_eq!(
+                collect(&t, 42, 10, &t.windows),
+                if depth == 12 {
+                    Ok(vec![20])
+                } else {
+                    Err(DiscoveryStop::DepthLimit)
+                },
+                "depth{depth}"
+            );
         }
-        let mut t = tabgroup_popover(); t.children_errors.insert(5);
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::AxUnavailable));
-        let mut t = tabgroup_popover(); t.expire_on_id = Some(5);
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::Deadline));
-        let mut t = tabgroup_popover(); t.expire_on_proof = true;
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::Deadline));
+        let mut t = tabgroup_popover();
+        t.children_errors.insert(5);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
+        let mut t = tabgroup_popover();
+        t.expire_on_id = Some(5);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Deadline)
+        );
+        let mut t = tabgroup_popover();
+        t.expire_on_proof = true;
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::Deadline)
+        );
     }
 
     #[test]
     fn tabgroup_invalid_later_branch_never_leaks_earlier_proven_ids() {
-        for read_error in [false,true] {
+        for read_error in [false, true] {
             let mut t = tabgroup_popover();
             t.nodes.get_mut(&5).unwrap().children.push(50);
-            t.nodes.insert(50,Fact {role:"AXGroup",owner:42,id:10,parent:Some(5),window:Some(1),children:vec![]});
-            let expected = if read_error { t.children_errors.insert(50); Err(DiscoveryStop::AxUnavailable) }
-                else { t.nodes.get_mut(&50).unwrap().window = None; Ok(vec![]) };
-            assert_eq!(collect(&t,42,10,&t.windows),expected);
-            assert_eq!(t.proof_calls.get(),1,"first sibling proved before later prefix failure");
+            t.nodes.insert(
+                50,
+                Fact {
+                    role: "AXGroup",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(5),
+                    window: Some(1),
+                    children: vec![],
+                },
+            );
+            let expected = if read_error {
+                t.children_errors.insert(50);
+                Err(DiscoveryStop::AxUnavailable)
+            } else {
+                t.nodes.get_mut(&50).unwrap().window = None;
+                Ok(vec![])
+            };
+            assert_eq!(collect(&t, 42, 10, &t.windows), expected);
+            assert_eq!(
+                t.proof_calls.get(),
+                1,
+                "first sibling proved before later prefix failure"
+            );
         }
     }
 
     #[test]
     fn tabgroup_new_reads_never_run_after_existing_nonempty_or_error() {
         for kind in 0..6 {
-            let mut t = match kind {0=>popover(),1=>native_menu(),2=>layer_zero_menu(),3=>collection_popover(),4=>outline_menu(),_=>{
-                let mut t=popover();t.nodes.get_mut(&1).unwrap().children=vec![4];t.nodes.get_mut(&4).unwrap().role="AXSheet";t.nodes.get_mut(&4).unwrap().parent=Some(1);t
-            }};
+            let mut t = match kind {
+                0 => popover(),
+                1 => native_menu(),
+                2 => layer_zero_menu(),
+                3 => collection_popover(),
+                4 => outline_menu(),
+                _ => {
+                    let mut t = popover();
+                    t.nodes.get_mut(&1).unwrap().children = vec![4];
+                    t.nodes.get_mut(&4).unwrap().role = "AXSheet";
+                    t.nodes.get_mut(&4).unwrap().parent = Some(1);
+                    t
+                }
+            };
             t.nodes.get_mut(&1).unwrap().children.push(50);
-            t.nodes.insert(50,Fact {role:"AXTabGroup",owner:42,id:10,parent:Some(1),window:Some(1),children:vec![51]});
-            t.children_errors.insert(50);t.expire_on_id=Some(50);
-            assert_eq!(collect(&t,42,10,&t.windows),Ok(vec![20]),"route{kind}");
+            t.nodes.insert(
+                50,
+                Fact {
+                    role: "AXTabGroup",
+                    owner: 42,
+                    id: 10,
+                    parent: Some(1),
+                    window: Some(1),
+                    children: vec![51],
+                },
+            );
+            t.children_errors.insert(50);
+            t.expire_on_id = Some(50);
+            assert_eq!(collect(&t, 42, 10, &t.windows), Ok(vec![20]), "route{kind}");
             assert!(!t.children_calls.borrow().contains(&50));
         }
-        let mut t=tabgroup_popover();t.children_errors.insert(1);
-        assert_eq!(collect(&t,42,10,&t.windows),Err(DiscoveryStop::AxUnavailable));
+        let mut t = tabgroup_popover();
+        t.children_errors.insert(1);
+        assert_eq!(
+            collect(&t, 42, 10, &t.windows),
+            Err(DiscoveryStop::AxUnavailable)
+        );
         assert!(!t.children_calls.borrow().contains(&5));
     }
 }

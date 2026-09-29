@@ -239,7 +239,10 @@ impl std::error::Error for AxActionDisabled {}
 
 fn ensure_ax_enabled(enabled: Option<bool>, action: &str) -> anyhow::Result<()> {
     if enabled == Some(false) {
-        return Err(AxActionDisabled { action: action.to_owned() }.into());
+        return Err(AxActionDisabled {
+            action: action.to_owned(),
+        }
+        .into());
     }
     Ok(())
 }

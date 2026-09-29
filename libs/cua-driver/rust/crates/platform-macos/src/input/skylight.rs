@@ -1201,18 +1201,32 @@ pub fn set_front_process_persistently(target_pid: libc::pid_t, target_wid: u32) 
 /// kCPSUserGenerated all-window ordering path. Every native write retains the
 /// caller's original ownership, activity and deadline checks.
 pub(crate) fn present_exact_window_guarded(
-    pid: i32, window: u32, mut check: impl FnMut() -> anyhow::Result<()>,
+    pid: i32,
+    window: u32,
+    mut check: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let set_front = set_front_process_fn().ok_or_else(|| anyhow::anyhow!("exact front-process API unavailable"))?;
-    anyhow::ensure!(post_event_record_to_fn().is_some(), "exact key-window API unavailable");
+    let set_front = set_front_process_fn()
+        .ok_or_else(|| anyhow::anyhow!("exact front-process API unavailable"))?;
+    anyhow::ensure!(
+        post_event_record_to_fn().is_some(),
+        "exact key-window API unavailable"
+    );
     let mut psn = [0u8; 8];
-    anyhow::ensure!(get_process_psn_for_window(window, pid, &mut psn), "exact presentation owner unavailable");
+    anyhow::ensure!(
+        get_process_psn_for_window(window, pid, &mut psn),
+        "exact presentation owner unavailable"
+    );
     check_exact_activation_owner(pid, window, &mut check)?;
     crate::focus_steal::cancel_deferred_suppression(pid);
     check_exact_activation_owner(pid, window, &mut check)?;
     let status = unsafe { set_front(psn.as_ptr() as *const c_void, window, 0x400) };
-    anyhow::ensure!(status == 0, "exact front-process request failed with OSStatus {status}");
-    post_exact_key_window_records_guarded(psn, window, || check_exact_activation_owner(pid, window, &mut check))
+    anyhow::ensure!(
+        status == 0,
+        "exact front-process request failed with OSStatus {status}"
+    );
+    post_exact_key_window_records_guarded(psn, window, || {
+        check_exact_activation_owner(pid, window, &mut check)
+    })
 }
 
 /// Called only by the successful bounded episode finalizer, after activity
@@ -1265,9 +1279,12 @@ pub(crate) fn restore_exact_window_guarded_with_phase(
             check_exact_activation_owner(pid, window, check).is_ok()
                 && unsafe { set_front(psn.as_ptr() as *const c_void, window, 0x200) } == 0
         },
-        |mut check| post_exact_key_window_records_guarded(psn, window, || {
-            check_exact_activation_owner(pid, window, &mut check)
-        }).is_ok(),
+        |mut check| {
+            post_exact_key_window_records_guarded(psn, window, || {
+                check_exact_activation_owner(pid, window, &mut check)
+            })
+            .is_ok()
+        },
         |check| match complete_exact_ax_window_activation(pid, window, check) {
             Ok(_) => true,
             Err(error) => {
@@ -1298,10 +1315,14 @@ fn failed_preparation_owner_psn(
     target: cua_driver_core::background_input::ExactWindowTarget,
 ) -> anyhow::Result<[u8; 8]> {
     let mut psn = [0; 8];
-    anyhow::ensure!(matches!(crate::windows::resolve_window_owner(target.pid, target.window_id),
-        crate::windows::WindowOwner::SamePid)
-        && get_process_psn_for_window(target.window_id, target.pid, &mut psn)
-        && psn != [0; 8], "failed preparation window/process identity unavailable");
+    anyhow::ensure!(
+        matches!(
+            crate::windows::resolve_window_owner(target.pid, target.window_id),
+            crate::windows::WindowOwner::SamePid
+        ) && get_process_psn_for_window(target.window_id, target.pid, &mut psn)
+            && psn != [0; 8],
+        "failed preparation window/process identity unavailable"
+    );
     Ok(psn)
 }
 
@@ -1312,50 +1333,90 @@ impl FailedPreparationFocus {
     ) -> anyhow::Result<Self> {
         let source_psn = failed_preparation_owner_psn(source)?;
         let original_psn = failed_preparation_owner_psn(original)?;
-        anyhow::ensure!((source.pid == original.pid) == (source_psn == original_psn),
-            "failed preparation process bindings disagree");
-        Ok(Self { source, original, source_psn, original_psn })
+        anyhow::ensure!(
+            (source.pid == original.pid) == (source_psn == original_psn),
+            "failed preparation process bindings disagree"
+        );
+        Ok(Self {
+            source,
+            original,
+            source_psn,
+            original_psn,
+        })
     }
 
-    pub(crate) fn check(&self, phase: ExactRestorationPhase,
+    pub(crate) fn check(
+        &self,
+        phase: ExactRestorationPhase,
         check_live: impl FnMut() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        self.check_with(phase, check_live, failed_preparation_owner_psn,
-            || current_front_process_psn().ok_or_else(|| anyhow::anyhow!("restoration foreground unavailable")),
-            failed_preparation_focused_window)
+        self.check_with(
+            phase,
+            check_live,
+            failed_preparation_owner_psn,
+            || {
+                current_front_process_psn()
+                    .ok_or_else(|| anyhow::anyhow!("restoration foreground unavailable"))
+            },
+            failed_preparation_focused_window,
+        )
     }
 
-    fn check_with(&self, phase: ExactRestorationPhase,
+    fn check_with(
+        &self,
+        phase: ExactRestorationPhase,
         mut check_live: impl FnMut() -> anyhow::Result<()>,
-        mut identity: impl FnMut(cua_driver_core::background_input::ExactWindowTarget) -> anyhow::Result<[u8; 8]>,
+        mut identity: impl FnMut(
+            cua_driver_core::background_input::ExactWindowTarget,
+        ) -> anyhow::Result<[u8; 8]>,
         mut front: impl FnMut() -> anyhow::Result<[u8; 8]>,
         mut focus: impl FnMut(i32) -> anyhow::Result<Option<u32>>,
     ) -> anyhow::Result<()> {
         check_live()?;
-        anyhow::ensure!(identity(self.source)? == self.source_psn
-            && identity(self.original)? == self.original_psn, "restoration identity changed");
+        anyhow::ensure!(
+            identity(self.source)? == self.source_psn
+                && identity(self.original)? == self.original_psn,
+            "restoration identity changed"
+        );
         let before = front()?;
-        let pid = if before == self.source_psn { self.source.pid }
-            else if before == self.original_psn { self.original.pid }
-            else { anyhow::bail!("restoration foreground changed to another process"); };
+        let pid = if before == self.source_psn {
+            self.source.pid
+        } else if before == self.original_psn {
+            self.original.pid
+        } else {
+            anyhow::bail!("restoration foreground changed to another process");
+        };
         let focused = focus(pid)?;
-        anyhow::ensure!(match focused {
-            Some(window) => (pid == self.source.pid && window == self.source.window_id)
-                || (pid == self.original.pid && window == self.original.window_id),
-            None => phase == ExactRestorationPhase::Handoff,
-        }, "restoration focus is absent before handoff or belongs to another window");
+        anyhow::ensure!(
+            match focused {
+                Some(window) =>
+                    (pid == self.source.pid && window == self.source.window_id)
+                        || (pid == self.original.pid && window == self.original.window_id),
+                None => phase == ExactRestorationPhase::Handoff,
+            },
+            "restoration focus is absent before handoff or belongs to another window"
+        );
         // A blocking AX read cannot carry its earlier process/lease evidence
         // forward. Recheck both fixed owners and the same front PSN afterward.
-        anyhow::ensure!(identity(self.source)? == self.source_psn
-            && identity(self.original)? == self.original_psn && front()? == before,
-            "restoration identity or foreground changed during AX read");
+        anyhow::ensure!(
+            identity(self.source)? == self.source_psn
+                && identity(self.original)? == self.original_psn
+                && front()? == before,
+            "restoration identity or foreground changed during AX read"
+        );
         check_live()
     }
 }
 
-fn failed_preparation_focus_status(status: i32, has_value: bool, valid_type: bool) -> anyhow::Result<bool> {
+fn failed_preparation_focus_status(
+    status: i32,
+    has_value: bool,
+    valid_type: bool,
+) -> anyhow::Result<bool> {
     use crate::ax::bindings::{kAXErrorNoValue, kAXErrorSuccess};
-    if status == kAXErrorNoValue && !has_value { return Ok(false); }
+    if status == kAXErrorNoValue && !has_value {
+        return Ok(false);
+    }
     anyhow::ensure!(status == kAXErrorSuccess && has_value && valid_type,
         "restoration AXFocusedWindow read failed: AXError={status}, value={has_value}, valid_type={valid_type}");
     Ok(true)
@@ -1363,24 +1424,31 @@ fn failed_preparation_focus_status(status: i32, has_value: bool, valid_type: boo
 
 fn failed_preparation_focused_window(pid: i32) -> anyhow::Result<Option<u32>> {
     use crate::ax::bindings::*;
-    use core_foundation::{base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType}, string::CFString};
+    use core_foundation::{
+        base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType},
+        string::CFString,
+    };
     let app = OwnedActivationAx(unsafe { AXUIElementCreateApplication(pid) });
     bound_activation_ax(&app)?;
     let name = CFString::new("AXFocusedWindow");
     let mut value: CFTypeRef = std::ptr::null();
-    let status = unsafe { AXUIElementCopyAttributeValue(app.0, name.as_concrete_TypeRef(), &mut value) };
+    let status =
+        unsafe { AXUIElementCopyAttributeValue(app.0, name.as_concrete_TypeRef(), &mut value) };
     let valid_type = !value.is_null() && unsafe { CFGetTypeID(value) == AXUIElementGetTypeID() };
     match failed_preparation_focus_status(status, !value.is_null(), valid_type) {
-        Ok(true) => {},
+        Ok(true) => {}
         outcome => {
-            if !value.is_null() { unsafe { CFRelease(value) }; }
+            if !value.is_null() {
+                unsafe { CFRelease(value) };
+            }
             return outcome.map(|_| None);
         }
     }
     let window = OwnedActivationAx(value as AXUIElementRef);
     bound_activation_ax(&window)?;
     background_ax_owner(&window, pid)?;
-    let id = unsafe { ax_get_window_id(window.0) }.filter(|id| *id != 0)
+    let id = unsafe { ax_get_window_id(window.0) }
+        .filter(|id| *id != 0)
         .ok_or_else(|| anyhow::anyhow!("restoration AX window identity unavailable"))?;
     Ok(Some(id))
 }
@@ -1479,15 +1547,19 @@ struct ExactActivationNonWindowRole(Option<String>);
 
 impl std::fmt::Display for ExactActivationNonWindowRole {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("exact activation requires an AXWindow, not a child or delegated surface")
+        formatter
+            .write_str("exact activation requires an AXWindow, not a child or delegated surface")
     }
 }
 
 impl std::error::Error for ExactActivationNonWindowRole {}
 
 fn permits_keyboard_sheet_proof(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<ExactActivationWindowUnavailable>().is_some()
-        || error.downcast_ref::<ExactActivationNonWindowRole>()
+    error
+        .downcast_ref::<ExactActivationWindowUnavailable>()
+        .is_some()
+        || error
+            .downcast_ref::<ExactActivationNonWindowRole>()
             .is_some_and(|role| role.0.as_deref() == Some("AXSheet"))
 }
 
@@ -1565,7 +1637,10 @@ fn request_cocoa_activation_without_all_windows(
         );
     }
     tracing::debug!(
-        pid, window_id, layer = window.layer, window_on_screen = window.is_on_screen,
+        pid,
+        window_id,
+        layer = window.layer,
+        window_on_screen = window.is_on_screen,
         focused_panel_verified = focused_panel,
         "requesting bounded Cocoa publication for exact input target"
     );
@@ -1698,10 +1773,7 @@ fn complete_exact_ax_window_activation(
             let ax_window = (pid_status == kAXErrorSuccess)
                 .then(|| unsafe { ax_get_window_id(target.0) })
                 .flatten();
-            if pid_status != kAXErrorSuccess
-                || ax_pid != pid
-                || ax_window != Some(window_id)
-            {
+            if pid_status != kAXErrorSuccess || ax_pid != pid || ax_window != Some(window_id) {
                 anyhow::bail!(
                     "exact activation AX target identity changed; pid_read_status={pid_status}, ax_pid={ax_pid}, ax_window={ax_window:?}, target_pid={pid}, target_window={window_id}, after_operation={}",
                     last_operation.get()
@@ -1746,7 +1818,9 @@ fn complete_keyboard_sheet_activation(
             check_exact_activation_owner(pid, window_id, &mut check_activity)?;
             check_exact_activation_owner(pid, sheet.host_id(), &mut check_activity)?;
             if !sheet.revalidate("ax_activation_guard") {
-                anyhow::bail!("ordinary sheet keyboard attachment changed or its activation budget expired");
+                anyhow::bail!(
+                    "ordinary sheet keyboard attachment changed or its activation budget expired"
+                );
             }
             check_activity()
         },
@@ -1780,12 +1854,15 @@ fn complete_keyboard_target_ax_activation(
     };
     if permits_keyboard_sheet_proof(&error) {
         check_activity()?;
-        if let Some(sheet) = crate::ax::attached_sheet::copy_keyboard_sheet_activation(
-            pid, window_id, deadline,
-        ) {
+        if let Some(sheet) =
+            crate::ax::attached_sheet::copy_keyboard_sheet_activation(pid, window_id, deadline)
+        {
             *retained = Some(sheet);
             return complete_keyboard_sheet_activation(
-                pid, window_id, retained.as_ref().expect("retained sheet proof"), check_activity,
+                pid,
+                window_id,
+                retained.as_ref().expect("retained sheet proof"),
+                check_activity,
             );
         }
     }
@@ -2979,8 +3056,11 @@ pub(crate) fn complete_exact_window_restore_guarded(
     let mut check = || {
         check_lease_and_activity()?;
         if !restoration_completion_context_matches(
-            front_process_pid(), bounded_focused_window_id(pid),
-            exact_window_on_screen(pid, window), pid, window,
+            front_process_pid(),
+            bounded_focused_window_id(pid),
+            exact_window_on_screen(pid, window),
+            pid,
+            window,
         ) {
             anyhow::bail!("original restoration window lost its current foreground context");
         }
@@ -2991,13 +3071,16 @@ pub(crate) fn complete_exact_window_restore_guarded(
 }
 
 fn restoration_completion_context_matches(
-    front: Option<i32>, focused: Option<u32>, visible: Option<bool>, pid: i32, window: u32,
+    front: Option<i32>,
+    focused: Option<u32>,
+    visible: Option<bool>,
+    pid: i32,
+    window: u32,
 ) -> bool {
     // None is permitted only in this post-submission completion path: the live
     // Notes Cmd+N race leaves the original app active but its AX key window
     // unpublished. A known different window must win over the old evidence.
-    front == Some(pid) && visible == Some(true)
-        && focused.is_none_or(|current| current == window)
+    front == Some(pid) && visible == Some(true) && focused.is_none_or(|current| current == window)
 }
 
 fn make_key_window_record(window_id: u32, event_kind: u8) -> [u8; 0xF8] {
@@ -3611,7 +3694,9 @@ pub(crate) fn with_foreground_hid_activation_delegated(
     delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    with_foreground_hid_activation_inner(target_pid, target_wid, None, delegation, false, |_| action())
+    with_foreground_hid_activation_inner(target_pid, target_wid, None, delegation, false, |_| {
+        action()
+    })
 }
 
 /// Preserve the original guarded write order. A positively proven standard
@@ -3670,8 +3755,10 @@ fn complete_proven_standard_dialog_activation(
     complete: impl FnOnce() -> anyhow::Result<[i32; 3]>,
 ) -> anyhow::Result<[i32; 3]> {
     check()?;
-    anyhow::ensure!(current_host() == Some(expected_host),
-        "standard dialog attachment changed or its activation budget expired");
+    anyhow::ensure!(
+        current_host() == Some(expected_host),
+        "standard dialog attachment changed or its activation budget expired"
+    );
     check()?;
     complete()
 }
@@ -3710,7 +3797,9 @@ fn with_foreground_hid_activation_inner(
     transient_route: Option<crate::transient_ui::TransientRoute>,
     app_context_delegation: Option<crate::ax::app_context::AppContextDelegationRoute>,
     keyboard_target: bool,
-    action: impl FnOnce(Option<&crate::ax::attached_sheet::KeyboardSheetActivation>) -> anyhow::Result<()>,
+    action: impl FnOnce(
+        Option<&crate::ax::attached_sheet::KeyboardSheetActivation>,
+    ) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     // Delegated panels without an exact native foreground identity need an
     // atomic native episode contract. Do not revive the old activation bypass.
@@ -3746,8 +3835,8 @@ fn with_foreground_hid_activation_inner(
             // checking visibility only after SLS skips that necessary step.
             let publication_started = std::time::Instant::now();
             let mut keyboard_sheet = None;
-            let hidden_panel = crate::windows::window_info_by_id(target_wid)
-                .is_some_and(|window| {
+            let hidden_panel =
+                crate::windows::window_info_by_id(target_wid).is_some_and(|window| {
                     window.layer != 0
                         && !window.is_on_screen
                         && cocoa_publication_target_allowed(
@@ -3768,19 +3857,35 @@ fn with_foreground_hid_activation_inner(
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
                 let probe_started = std::time::Instant::now();
                 let probe = crate::ax::attached_sheet::probe_standard_dialog_before(
-                    target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
+                    target_pid,
+                    target_wid,
+                    publication_started + ACTIVATION_WAIT_TIMEOUT,
                 );
                 let probe_finished = std::time::Instant::now();
-                trace_standard_dialog_probe(target_pid, target_wid, "initial_discovery",
-                    publication_started, probe_started, probe_finished, probe.host_id, None);
+                trace_standard_dialog_probe(
+                    target_pid,
+                    target_wid,
+                    "initial_discovery",
+                    publication_started,
+                    probe_started,
+                    probe_finished,
+                    probe.host_id,
+                    None,
+                );
                 check_exact_activation_owner(target_pid, target_wid, || episode.check())?;
-                anyhow::ensure!(publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
-                    "standard dialog discovery exceeded the foreground activation budget");
+                anyhow::ensure!(
+                    publication_started.elapsed() < ACTIVATION_WAIT_TIMEOUT,
+                    "standard dialog discovery exceeded the foreground activation budget"
+                );
                 probe
-            } else { crate::ax::attached_sheet::StandardDialogProbe::default() };
+            } else {
+                crate::ax::attached_sheet::StandardDialogProbe::default()
+            };
             let standard_dialog_host = standard_dialog_probe.host_id;
             let ordinary_probe_allowed = ordinary_activation_probe_allowed(
-                keyboard_target, hidden_panel, standard_dialog_host.is_some(),
+                keyboard_target,
+                hidden_panel,
+                standard_dialog_host.is_some(),
                 standard_dialog_probe.observed_requested_sheet,
             );
             let mut ready_ordinary_proof = None;
@@ -3789,21 +3894,30 @@ fn with_foreground_hid_activation_inner(
                 let mut probe = || {
                     let probe_started = std::time::Instant::now();
                     let result = probe_ready_ordinary_window(
-                        target_pid, target_wid, target_psn, publication_started,
-                        &mut ordinary_probe_diagnostics, || episode.check(),
+                        target_pid,
+                        target_wid,
+                        target_psn,
+                        publication_started,
+                        &mut ordinary_probe_diagnostics,
+                        || episode.check(),
                     );
-                    ordinary_probe_diagnostics.elapsed_us = probe_started.elapsed().as_micros() as u64;
+                    ordinary_probe_diagnostics.elapsed_us =
+                        probe_started.elapsed().as_micros() as u64;
                     ready_ordinary_proof = result?;
                     Ok(ready_ordinary_proof.is_some())
                 };
                 foreground_activation_preparation_steps(
                     standard_dialog_host.is_some(),
                     || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
-                    |flags| unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, flags) },
+                    |flags| unsafe {
+                        set_front(target_psn.as_ptr() as *const c_void, target_wid, flags)
+                    },
                     |check| post_exact_key_window_records_guarded(target_psn, target_wid, check),
                     if ordinary_probe_allowed {
                         Some(&mut probe)
-                    } else { None },
+                    } else {
+                        None
+                    },
                 )?
             };
             // Content-free branch evidence, after key records and before the
@@ -3818,50 +3932,84 @@ fn with_foreground_hid_activation_inner(
                     "foreground ordinary readiness probe selected");
             }
             let check_selected_ordinary = |phase| {
-                let proof = ready_ordinary_proof.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("selected ordinary readiness proof is unavailable"))?;
-                check_ready_ordinary_window(proof, target_pid, target_wid, target_psn,
-                    publication_started, phase, || episode.check())
-            };
-            let complete_original = || if let Some(host_id) = standard_dialog_host {
-                // A selected proof that fails is terminal. Do not attempt the
-                // old 0x200 path, ordinary-sheet admission or Cocoa recovery.
-                complete_proven_standard_dialog_activation(
-                    host_id,
-                    || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
-                    || {
-                        let probe_started = std::time::Instant::now();
-                        let current_host = crate::ax::attached_sheet::focused_dialog_host_before(
-                            target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
-                        );
-                        let probe_finished = std::time::Instant::now();
-                        trace_standard_dialog_probe(target_pid, target_wid, "before_ax_activation",
-                            publication_started, probe_started, probe_finished, current_host, Some(host_id));
-                        current_host
-                    },
-                    || complete_exact_ax_window_activation(target_pid, target_wid, || episode.check()),
+                let proof = ready_ordinary_proof.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("selected ordinary readiness proof is unavailable")
+                })?;
+                check_ready_ordinary_window(
+                    proof,
+                    target_pid,
+                    target_wid,
+                    target_psn,
+                    publication_started,
+                    phase,
+                    || episode.check(),
                 )
-            } else { complete_activation_with_bounded_cocoa_request(
-                hidden_panel,
-                || {
-                    if keyboard_target {
-                        complete_keyboard_target_ax_activation(
-                            target_pid, target_wid, publication_started + ACTIVATION_WAIT_TIMEOUT,
-                            &mut keyboard_sheet, || episode.check(),
-                        )
-                    } else {
-                        complete_exact_ax_window_activation(target_pid, target_wid, || episode.check())
-                    }
-                },
-                || {
-                    request_cocoa_activation_without_all_windows(target_pid, target_wid, || {
-                        episode.check()
-                    })
-                },
-                || episode.check(),
-                || publication_started.elapsed(),
-                || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
-            ) };
+            };
+            let complete_original = || {
+                if let Some(host_id) = standard_dialog_host {
+                    // A selected proof that fails is terminal. Do not attempt the
+                    // old 0x200 path, ordinary-sheet admission or Cocoa recovery.
+                    complete_proven_standard_dialog_activation(
+                        host_id,
+                        || check_exact_activation_owner(target_pid, target_wid, || episode.check()),
+                        || {
+                            let probe_started = std::time::Instant::now();
+                            let current_host =
+                                crate::ax::attached_sheet::focused_dialog_host_before(
+                                    target_pid,
+                                    target_wid,
+                                    publication_started + ACTIVATION_WAIT_TIMEOUT,
+                                );
+                            let probe_finished = std::time::Instant::now();
+                            trace_standard_dialog_probe(
+                                target_pid,
+                                target_wid,
+                                "before_ax_activation",
+                                publication_started,
+                                probe_started,
+                                probe_finished,
+                                current_host,
+                                Some(host_id),
+                            );
+                            current_host
+                        },
+                        || {
+                            complete_exact_ax_window_activation(target_pid, target_wid, || {
+                                episode.check()
+                            })
+                        },
+                    )
+                } else {
+                    complete_activation_with_bounded_cocoa_request(
+                        hidden_panel,
+                        || {
+                            if keyboard_target {
+                                complete_keyboard_target_ax_activation(
+                                    target_pid,
+                                    target_wid,
+                                    publication_started + ACTIVATION_WAIT_TIMEOUT,
+                                    &mut keyboard_sheet,
+                                    || episode.check(),
+                                )
+                            } else {
+                                complete_exact_ax_window_activation(target_pid, target_wid, || {
+                                    episode.check()
+                                })
+                            }
+                        },
+                        || {
+                            request_cocoa_activation_without_all_windows(
+                                target_pid,
+                                target_wid,
+                                || episode.check(),
+                            )
+                        },
+                        || episode.check(),
+                        || publication_started.elapsed(),
+                        || std::thread::sleep(ACTIVATION_POLL_INTERVAL),
+                    )
+                }
+            };
             let ax_statuses = complete_after_ordinary_probe(
                 ready_ordinary,
                 || check_selected_ordinary(OrdinaryValidationPhase::BeforeAxSkip),
@@ -3874,7 +4022,10 @@ fn with_foreground_hid_activation_inner(
                 Some(statuses) => anyhow::anyhow!("{error}; ax_activation_statuses={statuses:?}"),
                 None => anyhow::anyhow!("{error}; ax_activation_statuses=skipped_ready_ordinary"),
             })?;
-            if keyboard_sheet.as_ref().is_some_and(|sheet| !sheet.revalidate("before_pointer_priming")) {
+            if keyboard_sheet
+                .as_ref()
+                .is_some_and(|sheet| !sheet.revalidate("before_pointer_priming"))
+            {
                 anyhow::bail!("ordinary sheet keyboard attachment could not be revalidated before input (proof unavailable or activation budget expired)");
             }
             if ready_ordinary {
@@ -4158,9 +4309,20 @@ mod tests {
         use super::{exact_restoration_sequence, ExactRestorationPhase, FailedPreparationFocus};
         use cua_driver_core::background_input::ExactWindowTarget;
         use std::cell::{Cell, RefCell};
-        let source = ExactWindowTarget { pid: 7, window_id: 70 };
-        let original = ExactWindowTarget { pid: 8, window_id: 80 };
-        let proof = FailedPreparationFocus { source, original, source_psn: [7; 8], original_psn: [8; 8] };
+        let source = ExactWindowTarget {
+            pid: 7,
+            window_id: 70,
+        };
+        let original = ExactWindowTarget {
+            pid: 8,
+            window_id: 80,
+        };
+        let proof = FailedPreparationFocus {
+            source,
+            original,
+            source_psn: [7; 8],
+            original_psn: [8; 8],
+        };
         let front = Cell::new([7; 8]);
         let focus = Cell::new(Some(70));
         let live = Cell::new(true);
@@ -4180,20 +4342,33 @@ mod tests {
                     }
                 }
             }
-            proof.check_with(phase,
-                || { anyhow::ensure!(live.get(), "original lease/call ended"); Ok(()) },
-                |target| { anyhow::ensure!(stable_identity.get(), "owner changed"); Ok([target.pid as u8; 8]) },
+            proof.check_with(
+                phase,
+                || {
+                    anyhow::ensure!(live.get(), "original lease/call ended");
+                    Ok(())
+                },
+                |target| {
+                    anyhow::ensure!(stable_identity.get(), "owner changed");
+                    Ok([target.pid as u8; 8])
+                },
                 || Ok(front.get()),
                 |pid| {
                     assert_eq!([pid as u8; 8], front.get()); // AX queried for actual fixed front endpoint
                     anyhow::ensure!(!ax_error.get(), "AX read failed");
                     Ok(focus.get())
-                })
+                },
+            )
         };
-        if check(ExactRestorationPhase::BeforeFrontRequest).is_err() { return (false, writes.into_inner()); }
-        let ok = exact_restoration_sequence(check,
+        if check(ExactRestorationPhase::BeforeFrontRequest).is_err() {
+            return (false, writes.into_inner());
+        }
+        let ok = exact_restoration_sequence(
+            check,
             |guard| {
-                if guard().is_err() { return false; }
+                if guard().is_err() {
+                    return false;
+                }
                 writes.borrow_mut().push("0x200");
                 front.set([8; 8]);
                 focus.set(None); // real asynchronous process-before-AX transition
@@ -4201,17 +4376,29 @@ mod tests {
             },
             |guard| {
                 for label in ["key01", "key02"] {
-                    if guard().is_err() { return false; }
+                    if guard().is_err() {
+                        return false;
+                    }
                     writes.borrow_mut().push(label);
                 }
                 true
             },
-            |guard| super::exact_ax_activation_steps(guard, |operation| {
-                writes.borrow_mut().push(operation);
-                if operation == "AXFocused" { focus.set(Some(80)); }
-                0
-            }, || panic!("no ambiguous AX write in this model")).is_ok(),
-            |guard| guard().is_ok() && front.get() == [8; 8] && focus.get() == Some(80));
+            |guard| {
+                super::exact_ax_activation_steps(
+                    guard,
+                    |operation| {
+                        writes.borrow_mut().push(operation);
+                        if operation == "AXFocused" {
+                            focus.set(Some(80));
+                        }
+                        0
+                    },
+                    || panic!("no ambiguous AX write in this model"),
+                )
+                .is_ok()
+            },
+            |guard| guard().is_ok() && front.get() == [8; 8] && focus.get() == Some(80),
+        );
         (ok, writes.into_inner())
     }
 
@@ -4219,12 +4406,22 @@ mod tests {
     fn failed_preparation_handoff_reaches_key_records_and_exact_ax_completion() {
         let (ok, writes) = failed_preparation_model(None);
         assert!(ok);
-        assert_eq!(writes, ["0x200", "key01", "key02", "AXRaise", "AXMain", "AXFocused"]);
+        assert_eq!(
+            writes,
+            ["0x200", "key01", "key02", "AXRaise", "AXMain", "AXFocused"]
+        );
     }
 
     #[test]
     fn failed_preparation_handoff_stops_before_each_write_on_revocation_or_takeover() {
-        for kind in ["cancel", "expired", "third_process", "sibling", "owner_changed", "AX_error"] {
+        for kind in [
+            "cancel",
+            "expired",
+            "third_process",
+            "sibling",
+            "owner_changed",
+            "AX_error",
+        ] {
             for at in 0..=6 {
                 let (ok, writes) = failed_preparation_model(Some((kind, at)));
                 assert!(!ok, "{kind} at {at}");
@@ -4238,12 +4435,23 @@ mod tests {
         use super::{exact_restoration_sequence, ExactRestorationPhase};
         use std::cell::RefCell;
         let phases = RefCell::new(Vec::new());
-        assert!(!exact_restoration_sequence(|phase| { phases.borrow_mut().push(phase); Ok(()) },
-            |guard| { guard().unwrap(); false },
+        assert!(!exact_restoration_sequence(
+            |phase| {
+                phases.borrow_mut().push(phase);
+                Ok(())
+            },
+            |guard| {
+                guard().unwrap();
+                false
+            },
             |_| panic!("failed process request must not post key records"),
             |_| panic!("failed process request must not complete AX"),
-            |_| panic!("failed process request must not poll readiness")));
-        assert_eq!(*phases.borrow(), [ExactRestorationPhase::BeforeFrontRequest]);
+            |_| panic!("failed process request must not poll readiness")
+        ));
+        assert_eq!(
+            *phases.borrow(),
+            [ExactRestorationPhase::BeforeFrontRequest]
+        );
     }
 
     #[test]
@@ -4253,19 +4461,48 @@ mod tests {
         use std::cell::Cell;
         for changed in ["front", "owner", "PSN", "lease"] {
             let proof = FailedPreparationFocus {
-                source: ExactWindowTarget { pid: 7, window_id: 70 },
-                original: ExactWindowTarget { pid: 8, window_id: 80 },
-                source_psn: [7; 8], original_psn: [8; 8],
+                source: ExactWindowTarget {
+                    pid: 7,
+                    window_id: 70,
+                },
+                original: ExactWindowTarget {
+                    pid: 8,
+                    window_id: 80,
+                },
+                source_psn: [7; 8],
+                original_psn: [8; 8],
             };
             let read = Cell::new(false);
-            assert!(proof.check_with(ExactRestorationPhase::Handoff,
-                || { anyhow::ensure!(!(read.get() && changed == "lease"), "lease ended"); Ok(()) },
-                |target| {
-                    anyhow::ensure!(!(read.get() && changed == "owner"), "owner lost");
-                    Ok(if read.get() && changed == "PSN" { [9; 8] } else { [target.pid as u8; 8] })
-                },
-                || Ok(if read.get() && changed == "front" { [9; 8] } else { [8; 8] }),
-                |pid| { assert_eq!(pid, 8); read.set(true); Ok(None) }).is_err(), "{changed}");
+            assert!(
+                proof
+                    .check_with(
+                        ExactRestorationPhase::Handoff,
+                        || {
+                            anyhow::ensure!(!(read.get() && changed == "lease"), "lease ended");
+                            Ok(())
+                        },
+                        |target| {
+                            anyhow::ensure!(!(read.get() && changed == "owner"), "owner lost");
+                            Ok(if read.get() && changed == "PSN" {
+                                [9; 8]
+                            } else {
+                                [target.pid as u8; 8]
+                            })
+                        },
+                        || Ok(if read.get() && changed == "front" {
+                            [9; 8]
+                        } else {
+                            [8; 8]
+                        }),
+                        |pid| {
+                            assert_eq!(pid, 8);
+                            read.set(true);
+                            Ok(None)
+                        }
+                    )
+                    .is_err(),
+                "{changed}"
+            );
         }
     }
 
@@ -4276,15 +4513,39 @@ mod tests {
         for same_pid in [false, true] {
             let pid = if same_pid { 7 } else { 8 };
             let proof = FailedPreparationFocus {
-                source: ExactWindowTarget { pid: 7, window_id: 70 },
+                source: ExactWindowTarget {
+                    pid: 7,
+                    window_id: 70,
+                },
                 original: ExactWindowTarget { pid, window_id: 80 },
-                source_psn: [7; 8], original_psn: [pid as u8; 8],
+                source_psn: [7; 8],
+                original_psn: [pid as u8; 8],
             };
-            for phase in [ExactRestorationPhase::BeforeFrontRequest, ExactRestorationPhase::Handoff] {
-                for (focused, allowed) in [(Some(70), same_pid), (Some(80), true), (Some(81), false),
-                    (None, phase == ExactRestorationPhase::Handoff)] {
-                    assert_eq!(proof.check_with(phase, || Ok(()), |target| Ok([target.pid as u8; 8]),
-                        || Ok([pid as u8; 8]), |queried| { assert_eq!(queried, pid); Ok(focused) }).is_ok(), allowed);
+            for phase in [
+                ExactRestorationPhase::BeforeFrontRequest,
+                ExactRestorationPhase::Handoff,
+            ] {
+                for (focused, allowed) in [
+                    (Some(70), same_pid),
+                    (Some(80), true),
+                    (Some(81), false),
+                    (None, phase == ExactRestorationPhase::Handoff),
+                ] {
+                    assert_eq!(
+                        proof
+                            .check_with(
+                                phase,
+                                || Ok(()),
+                                |target| Ok([target.pid as u8; 8]),
+                                || Ok([pid as u8; 8]),
+                                |queried| {
+                                    assert_eq!(queried, pid);
+                                    Ok(focused)
+                                }
+                            )
+                            .is_ok(),
+                        allowed
+                    );
                 }
             }
         }
@@ -4295,8 +4556,14 @@ mod tests {
         use super::failed_preparation_focus_status;
         assert!(!failed_preparation_focus_status(-25212, false, false).unwrap());
         assert!(failed_preparation_focus_status(0, true, true).unwrap());
-        for (status, value, correct_type) in [(0, false, false), (0, true, false),
-            (-25212, true, true), (-25205, false, false), (-25204, false, false), (-25202, false, false)] {
+        for (status, value, correct_type) in [
+            (0, false, false),
+            (0, true, false),
+            (-25212, true, true),
+            (-25205, false, false),
+            (-25204, false, false),
+            (-25202, false, false),
+        ] {
             assert!(failed_preparation_focus_status(status, value, correct_type).is_err());
         }
     }
@@ -4307,8 +4574,20 @@ mod tests {
         // Native submission may clear AXFocusedWindow until the captured exact
         // window is made main/focused. Ordinary background ordering must not
         // use this post-submission allowance.
-        assert!(restoration_completion_context_matches(Some(7), None, Some(true), 7, 70));
-        assert!(restoration_completion_context_matches(Some(7), Some(70), Some(true), 7, 70));
+        assert!(restoration_completion_context_matches(
+            Some(7),
+            None,
+            Some(true),
+            7,
+            70
+        ));
+        assert!(restoration_completion_context_matches(
+            Some(7),
+            Some(70),
+            Some(true),
+            7,
+            70
+        ));
         for (front, focused, visible) in [
             (None, None, Some(true)),
             (Some(42), None, Some(true)),
@@ -4317,7 +4596,9 @@ mod tests {
             (Some(7), Some(70), Some(false)),
             (Some(7), Some(70), None),
         ] {
-            assert!(!restoration_completion_context_matches(front, focused, visible, 7, 70));
+            assert!(!restoration_completion_context_matches(
+                front, focused, visible, 7, 70
+            ));
         }
     }
 
@@ -5217,12 +5498,21 @@ mod tests {
     #[test]
     fn foreground_keyboard_sheet_proof_is_only_allowed_after_an_explicit_prewrite_absence() {
         assert!(super::permits_keyboard_sheet_proof(
-            &super::ExactActivationWindowUnavailable.into()));
+            &super::ExactActivationWindowUnavailable.into()
+        ));
         assert!(super::permits_keyboard_sheet_proof(
-            &super::ExactActivationNonWindowRole(Some("AXSheet".into())).into()));
-        for role in [None, Some("AXWindow".into()), Some("AXGroup".into()), Some("AXPopover".into()), Some("AXWebArea".into())] {
+            &super::ExactActivationNonWindowRole(Some("AXSheet".into())).into()
+        ));
+        for role in [
+            None,
+            Some("AXWindow".into()),
+            Some("AXGroup".into()),
+            Some("AXPopover".into()),
+            Some("AXWebArea".into()),
+        ] {
             assert!(!super::permits_keyboard_sheet_proof(
-                &super::ExactActivationNonWindowRole(role).into()));
+                &super::ExactActivationNonWindowRole(role).into()
+            ));
         }
         for failure in [
             "exact activation AXWindows failed: -25204",
@@ -5231,8 +5521,10 @@ mod tests {
             "foreground target ownership is unavailable",
             "native activity changed",
         ] {
-            assert!(!super::permits_keyboard_sheet_proof(&anyhow::anyhow!(failure)),
-                "a failed or indeterminate operation must never enter a second activation route");
+            assert!(
+                !super::permits_keyboard_sheet_proof(&anyhow::anyhow!(failure)),
+                "a failed or indeterminate operation must never enter a second activation route"
+            );
         }
     }
 
@@ -5245,13 +5537,27 @@ mod tests {
         let callback = super::keyboard_action_after_priming(
             Some(|| {
                 proof_checks.set(proof_checks.get() + 1);
-                assert_eq!(focused_id.get(), 900, "AX focus can lag behind a child sheet");
-                anyhow::ensure!(child_sheets.get() == 0, "retained leaf is no longer selected");
+                assert_eq!(
+                    focused_id.get(),
+                    900,
+                    "AX focus can lag behind a child sheet"
+                );
+                anyhow::ensure!(
+                    child_sheets.get() == 0,
+                    "retained leaf is no longer selected"
+                );
                 Ok(())
             }),
-            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+            || {
+                posted_keys.set(posted_keys.get() + 1);
+                Ok(())
+            },
         );
-        assert_eq!(proof_checks.get(), 0, "constructing the callback is not revalidation");
+        assert_eq!(
+            proof_checks.get(),
+            0,
+            "constructing the callback is not revalidation"
+        );
         // Inject the structural change during the pointer helper's priming
         // wait. It must be observed after that wait even with unchanged focus.
         child_sheets.set(1);
@@ -5267,10 +5573,16 @@ mod tests {
         let posted_keys = Cell::new(0);
         let callback = super::keyboard_action_after_priming(
             Some(|| {
-                anyhow::ensure!(now_ms.get() < original_deadline_ms, "retained proof expired");
+                anyhow::ensure!(
+                    now_ms.get() < original_deadline_ms,
+                    "retained proof expired"
+                );
                 Ok(())
             }),
-            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+            || {
+                posted_keys.set(posted_keys.get() + 1);
+                Ok(())
+            },
         );
         now_ms.set(now_ms.get() + 40);
         assert!(callback().is_err());
@@ -5288,7 +5600,10 @@ mod tests {
                 anyhow::ensure!(activity_current.get(), "activity lease revoked");
                 Ok(())
             }),
-            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+            || {
+                posted_keys.set(posted_keys.get() + 1);
+                Ok(())
+            },
         );
         activity_current.set(false);
         assert!(callback().is_err());
@@ -5300,16 +5615,27 @@ mod tests {
         let proof_checks = Cell::new(0);
         let posted_keys = Cell::new(0);
         let callback = super::keyboard_action_after_priming(
-            Some(|| { proof_checks.set(proof_checks.get() + 1); Ok(()) }),
-            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
+            Some(|| {
+                proof_checks.set(proof_checks.get() + 1);
+                Ok(())
+            }),
+            || {
+                posted_keys.set(posted_keys.get() + 1);
+                Ok(())
+            },
         );
         assert_eq!(proof_checks.get(), 0);
         callback().unwrap();
-        super::keyboard_action_after_priming(
-            None::<fn() -> anyhow::Result<()>>,
-            || { posted_keys.set(posted_keys.get() + 1); Ok(()) },
-        )().unwrap();
-        assert_eq!(proof_checks.get(), 1, "existing routes add no attachment query");
+        super::keyboard_action_after_priming(None::<fn() -> anyhow::Result<()>>, || {
+            posted_keys.set(posted_keys.get() + 1);
+            Ok(())
+        })()
+        .unwrap();
+        assert_eq!(
+            proof_checks.get(),
+            1,
+            "existing routes add no attachment query"
+        );
         assert_eq!(posted_keys.get(), 2);
     }
 
@@ -5454,7 +5780,10 @@ mod tests {
                     for observed_sheet in [false, true] {
                         assert_eq!(
                             super::ordinary_activation_probe_allowed(
-                                keyboard, hidden, dialog, observed_sheet,
+                                keyboard,
+                                hidden,
+                                dialog,
+                                observed_sheet,
                             ),
                             keyboard && !hidden && !dialog && !observed_sheet
                         );
@@ -5477,7 +5806,9 @@ mod tests {
             (Some("AXWindow"), Some("AXStandardWindow"), Some(true)),
         ] {
             assert!(!super::ordinary_activation_shape(
-                role, || subrole.map(str::to_owned), || modal,
+                role,
+                || subrole.map(str::to_owned),
+                || modal,
             ));
         }
     }
@@ -5506,8 +5837,14 @@ mod tests {
             let reads = std::cell::RefCell::new(Vec::new());
             let accepted = super::ordinary_activation_shape(
                 Some("AXWindow"),
-                || { reads.borrow_mut().push("AXSubrole"); Some("AXStandardWindow".to_owned()) },
-                || { reads.borrow_mut().push("AXModal"); modal },
+                || {
+                    reads.borrow_mut().push("AXSubrole");
+                    Some("AXStandardWindow".to_owned())
+                },
+                || {
+                    reads.borrow_mut().push("AXModal");
+                    modal
+                },
             );
             assert_eq!(accepted, modal == Some(false));
             assert_eq!(*reads.borrow(), vec!["AXSubrole", "AXModal"]);
@@ -5790,8 +6127,14 @@ mod tests {
             let events = std::cell::RefCell::new(Vec::new());
             super::foreground_activation_preparation_steps(
                 proven,
-                || { events.borrow_mut().push(("check", 0)); Ok(()) },
-                |flags| { events.borrow_mut().push(("front", flags)); 0 },
+                || {
+                    events.borrow_mut().push(("check", 0));
+                    Ok(())
+                },
+                |flags| {
+                    events.borrow_mut().push(("front", flags));
+                    0
+                },
                 |check| {
                     for kind in [1, 2] {
                         check()?;
@@ -5800,10 +6143,18 @@ mod tests {
                     Ok(())
                 },
                 None,
-            ).unwrap();
+            )
+            .unwrap();
             let mut expected = vec![("check", 0), ("front", 0x400), ("check", 0)];
-            if !proven { expected.push(("front", 0x200)); }
-            expected.extend([("check", 0), ("key_record", 1), ("check", 0), ("key_record", 2)]);
+            if !proven {
+                expected.push(("front", 0x200));
+            }
+            expected.extend([
+                ("check", 0),
+                ("key_record", 1),
+                ("check", 0),
+                ("key_record", 2),
+            ]);
             assert_eq!(*events.borrow(), expected);
         }
     }
@@ -5818,11 +6169,15 @@ mod tests {
                 let result = super::foreground_activation_preparation_steps(
                     proven,
                     || {
-                        let index = checks.get(); checks.set(index + 1);
+                        let index = checks.get();
+                        checks.set(index + 1);
                         anyhow::ensure!(index != lose_at, "activity or exact owner changed");
                         Ok(())
                     },
-                    |flags| { writes.borrow_mut().push(("front", flags)); 0 },
+                    |flags| {
+                        writes.borrow_mut().push(("front", flags));
+                        0
+                    },
                     |check| {
                         for kind in [1, 2] {
                             check()?;
@@ -5831,13 +6186,20 @@ mod tests {
                         Ok(())
                     },
                     None,
-                ).map(|_| hid.set(true));
+                )
+                .map(|_| hid.set(true));
                 assert!(result.is_err());
                 assert!(!hid.get());
                 let mut expected = Vec::new();
-                if lose_at > 0 { expected.push(("front", 0x400)); }
-                if lose_at > 1 && !proven { expected.push(("front", 0x200)); }
-                if lose_at > 2 { expected.push(("key_record", 1)); }
+                if lose_at > 0 {
+                    expected.push(("front", 0x400));
+                }
+                if lose_at > 1 && !proven {
+                    expected.push(("front", 0x200));
+                }
+                if lose_at > 2 {
+                    expected.push(("key_record", 1));
+                }
                 assert_eq!(*writes.borrow(), expected);
             }
         }
@@ -5849,26 +6211,52 @@ mod tests {
             let writes = std::cell::RefCell::new(Vec::new());
             let records = Cell::new(0);
             let result = super::foreground_activation_preparation_steps(
-                proven, || Ok(()),
+                proven,
+                || Ok(()),
                 |flags| {
                     writes.borrow_mut().push(flags);
-                    if flags == fail_at { -1 } else { 0 }
+                    if flags == fail_at {
+                        -1
+                    } else {
+                        0
+                    }
                 },
-                |_| { records.set(records.get() + 1); Ok(()) },
+                |_| {
+                    records.set(records.get() + 1);
+                    Ok(())
+                },
                 None,
             );
             assert!(result.is_err());
             assert_eq!(records.get(), 0);
-            assert_eq!(*writes.borrow(), if fail_at == 0x400 { vec![0x400] } else { vec![0x400, 0x200] });
+            assert_eq!(
+                *writes.borrow(),
+                if fail_at == 0x400 {
+                    vec![0x400]
+                } else {
+                    vec![0x400, 0x200]
+                }
+            );
         }
         let writes = std::cell::RefCell::new(Vec::new());
         let result = super::foreground_activation_preparation_steps(
-            true, || Ok(()), |flags| { writes.borrow_mut().push(flags); 0 },
-            |check| { check()?; anyhow::bail!("key-window record failed with OSStatus -1") },
+            true,
+            || Ok(()),
+            |flags| {
+                writes.borrow_mut().push(flags);
+                0
+            },
+            |check| {
+                check()?;
+                anyhow::bail!("key-window record failed with OSStatus -1")
+            },
             None,
         );
         assert_eq!(*writes.borrow(), [0x400]);
-        assert!(result.unwrap_err().to_string().contains("key-window record failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("key-window record failed"));
     }
 
     #[test]
@@ -5876,8 +6264,13 @@ mod tests {
         for current in [None, Some(701)] {
             let completions = Cell::new(0);
             let result = super::complete_proven_standard_dialog_activation(
-                700, || Ok(()), || current,
-                || { completions.set(completions.get() + 1); Ok([0; 3]) },
+                700,
+                || Ok(()),
+                || current,
+                || {
+                    completions.set(completions.get() + 1);
+                    Ok([0; 3])
+                },
             );
             assert!(result.is_err());
             assert_eq!(completions.get(), 0);
@@ -5888,10 +6281,16 @@ mod tests {
             let result = super::complete_proven_standard_dialog_activation(
                 700,
                 || {
-                    let n = checks.get(); checks.set(n + 1);
-                    anyhow::ensure!(n != lose_at, "activity changed"); Ok(())
+                    let n = checks.get();
+                    checks.set(n + 1);
+                    anyhow::ensure!(n != lose_at, "activity changed");
+                    Ok(())
                 },
-                || Some(700), || { completions.set(1); Ok([0; 3]) },
+                || Some(700),
+                || {
+                    completions.set(1);
+                    Ok([0; 3])
+                },
             );
             assert!(result.is_err());
             assert_eq!(completions.get(), 0);
@@ -5901,16 +6300,31 @@ mod tests {
     #[test]
     fn foreground_standard_dialog_completion_preserves_ax_result_without_retry() {
         let statuses = [0, crate::ax::bindings::kAXErrorAttributeUnsupported, 0];
-        assert_eq!(super::complete_proven_standard_dialog_activation(
-            700, || Ok(()), || Some(700), || Ok(statuses),
-        ).unwrap(), statuses);
+        assert_eq!(
+            super::complete_proven_standard_dialog_activation(
+                700,
+                || Ok(()),
+                || Some(700),
+                || Ok(statuses),
+            )
+            .unwrap(),
+            statuses
+        );
         let attempts = Cell::new(0);
         let error = super::complete_proven_standard_dialog_activation(
-            700, || Ok(()), || Some(700),
-            || { attempts.set(attempts.get() + 1); Err(super::ExactActivationWindowUnavailable.into()) },
-        ).unwrap_err();
+            700,
+            || Ok(()),
+            || Some(700),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(super::ExactActivationWindowUnavailable.into())
+            },
+        )
+        .unwrap_err();
         assert_eq!(attempts.get(), 1);
-        assert!(error.downcast_ref::<super::ExactActivationWindowUnavailable>().is_some());
+        assert!(error
+            .downcast_ref::<super::ExactActivationWindowUnavailable>()
+            .is_some());
     }
 
     #[test]
@@ -6295,8 +6709,12 @@ mod tests {
             }
         }
         impl Subscriber for Events {
-            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
-            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
             fn record(&self, _: &Id, _: &Record<'_>) {}
             fn record_follows_from(&self, _: &Id, _: &Id) {}
             fn event(&self, event: &Event<'_>) {
@@ -6316,7 +6734,9 @@ mod tests {
             (false, -54, false, 0),
         ] {
             let command = super::SyntheticFocusCommand {
-                psn: [7; 8], window_id: 731, focused,
+                psn: [7; 8],
+                window_id: 731,
+                focused,
             };
             let events = Events::default();
             let posts = Cell::new(0);
@@ -6325,16 +6745,20 @@ mod tests {
                 super::post_synthetic_focus_command_with(
                     &command,
                     |psn, record| {
-                        assert!(events.0.lock().unwrap().is_empty(),
-                            "diagnostics must not log before native dispatch");
+                        assert!(
+                            events.0.lock().unwrap().is_empty(),
+                            "diagnostics must not log before native dispatch"
+                        );
                         posts.set(posts.get() + 1);
                         assert_eq!(*psn, command.psn);
                         assert_eq!(*record, synthetic_focus_record(731, focused));
                         status
                     },
                     |_| {
-                        assert!(events.0.lock().unwrap().is_empty(),
-                            "new post diagnostics must wait for original outcome checks");
+                        assert!(
+                            events.0.lock().unwrap().is_empty(),
+                            "new post diagnostics must wait for original outcome checks"
+                        );
                         queries.set(queries.get() + 1);
                         Some(-600)
                     },
@@ -6344,13 +6768,19 @@ mod tests {
             assert_eq!(queries.get(), expected_queries);
             assert_eq!(result.is_ok(), succeeds);
             if let Err(error) = result {
-                assert_eq!(error.to_string(),
-                    format!("target-only synthetic focus event failed with OSStatus {status}"));
+                assert_eq!(
+                    error.to_string(),
+                    format!("target-only synthetic focus event failed with OSStatus {status}")
+                );
             }
             let rows = events.0.lock().unwrap();
-            let posts: Vec<_> = rows.iter().filter(|row| {
-                row.get("message").map(String::as_str) == Some("Synthetic focus native post completed")
-            }).collect();
+            let posts: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    row.get("message").map(String::as_str)
+                        == Some("Synthetic focus native post completed")
+                })
+                .collect();
             assert_eq!(posts.len(), 1);
             let row = posts[0];
             assert_eq!(row["window_id"], "731");
@@ -6360,9 +6790,19 @@ mod tests {
             let end: u64 = row["monotonic_end_us"].parse().unwrap();
             assert!(end >= start);
             assert_eq!(row["elapsed_us"], (end - start).to_string());
-            assert!(row.keys().all(|key| ["message", "window_id", "focused", "post_status",
-                "monotonic_start_us", "monotonic_end_us", "elapsed_us"].contains(&key.as_str())),
-                "diagnostics must not expose PSN or application content");
+            assert!(
+                row.keys().all(|key| [
+                    "message",
+                    "window_id",
+                    "focused",
+                    "post_status",
+                    "monotonic_start_us",
+                    "monotonic_end_us",
+                    "elapsed_us"
+                ]
+                .contains(&key.as_str())),
+                "diagnostics must not expose PSN or application content"
+            );
         }
     }
 
@@ -6389,8 +6829,15 @@ mod tests {
                 Some(-600)
             },
         );
-        assert!(result.is_ok(), "confirmed process exit must not turn completed AX dispatch into a cleanup failure");
-        assert_eq!(posts.get(), 1, "cleanup never reposts or changes the actuator");
+        assert!(
+            result.is_ok(),
+            "confirmed process exit must not turn completed AX dispatch into a cleanup failure"
+        );
+        assert_eq!(
+            posts.get(),
+            1,
+            "cleanup never reposts or changes the actuator"
+        );
         assert_eq!(lookups.get(), 1);
     }
 
@@ -6398,9 +6845,15 @@ mod tests {
     fn synthetic_focus_cleanup_keeps_uncertain_or_live_process_errors() {
         let plan = synthetic_target_focus_plan([1; 8], 731);
         for lookup in [None, Some(0), Some(-50), Some(-54)] {
-            assert!(super::post_synthetic_focus_command_with(
-                &plan.deactivate_target, |_, _| -600, |_| lookup,
-            ).is_err(), "process absence was not proven: {lookup:?}");
+            assert!(
+                super::post_synthetic_focus_command_with(
+                    &plan.deactivate_target,
+                    |_, _| -600,
+                    |_| lookup,
+                )
+                .is_err(),
+                "process absence was not proven: {lookup:?}"
+            );
         }
     }
 
@@ -6422,7 +6875,10 @@ mod tests {
                 Some(if queries.get() == 1 { 0 } else { -600 })
             },
         );
-        assert!(result.is_ok(), "delayed process retirement must settle without replaying cleanup input");
+        assert!(
+            result.is_ok(),
+            "delayed process retirement must settle without replaying cleanup input"
+        );
         assert_eq!(posts.get(), 1);
         assert_eq!(queries.get(), 2);
     }
@@ -6437,29 +6893,43 @@ mod tests {
                 |_, _| -600,
                 |_| {
                     queries.set(queries.get() + 1);
-                    if queries.get() == 1 { ambiguous } else { Some(-600) }
+                    if queries.get() == 1 {
+                        ambiguous
+                    } else {
+                        Some(-600)
+                    }
                 },
             );
             assert!(result.is_err());
-            assert_eq!(queries.get(), 1, "uncertain identity must not become a retry loop");
+            assert_eq!(
+                queries.get(),
+                1,
+                "uncertain identity must not become a retry loop"
+            );
         }
     }
 
     #[test]
     fn synthetic_focus_activation_and_other_post_errors_are_not_exit_cleanup() {
         let plan = synthetic_target_focus_plan([1; 8], 731);
-        for (command, status) in [(&plan.activate_target, -600),
-                                  (&plan.deactivate_target, -50),
-                                  (&plan.deactivate_target, -54)] {
+        for (command, status) in [
+            (&plan.activate_target, -600),
+            (&plan.deactivate_target, -50),
+            (&plan.deactivate_target, -54),
+        ] {
             assert!(super::post_synthetic_focus_command_with(
-                command, |_, _| status,
+                command,
+                |_, _| status,
                 |_| panic!("non-cleanup failure must not be reclassified by a process lookup"),
-            ).is_err());
+            )
+            .is_err());
         }
         assert!(super::post_synthetic_focus_command_with(
-            &plan.deactivate_target, |_, _| 0,
+            &plan.deactivate_target,
+            |_, _| 0,
             |_| panic!("successful post needs no process lookup"),
-        ).is_ok());
+        )
+        .is_ok());
     }
 
     #[test]

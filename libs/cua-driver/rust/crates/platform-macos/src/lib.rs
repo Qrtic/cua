@@ -17,8 +17,6 @@ mod background_mutation;
 #[cfg(target_os = "macos")]
 mod background_order;
 #[cfg(target_os = "macos")]
-mod order_diagnostics;
-#[cfg(target_os = "macos")]
 pub mod browser;
 #[cfg(target_os = "macos")]
 pub mod capture;
@@ -34,6 +32,8 @@ pub(crate) mod foreground_activity;
 pub mod history;
 #[cfg(target_os = "macos")]
 pub mod input;
+#[cfg(target_os = "macos")]
+mod order_diagnostics;
 #[cfg(target_os = "macos")]
 mod permission_observation;
 #[cfg(target_os = "macos")]

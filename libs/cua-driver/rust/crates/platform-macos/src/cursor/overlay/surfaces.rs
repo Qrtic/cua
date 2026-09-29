@@ -407,7 +407,12 @@ pub(super) fn order_above(generation: u64, target_wid: u64, raise_front: bool) {
     let diagnostic = DIAGNOSTICS.begin();
     let metadata = enqueue_diagnostic("overlay_enqueue_above", diagnostic.as_ref());
     dispatch_main(
-        Box::into_raw(Box::new((generation, Some((target_wid, raise_front)), metadata))).cast(),
+        Box::into_raw(Box::new((
+            generation,
+            Some((target_wid, raise_front)),
+            metadata,
+        )))
+        .cast(),
         order_callback,
     );
     if let Some(timing) = diagnostic.and_then(|measurement| measurement.finish()) {
