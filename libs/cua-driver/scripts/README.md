@@ -71,6 +71,29 @@ once. When the dedicated default keychain above exists, the installer prefers
 it automatically; exporting `CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN` remains the
 most explicit choice.
 
+Older installers imported this identity with an all-applications private-key
+ACL. The current installer no longer does that, but it cannot safely rewrite an
+existing key's ACL without the keychain password. Remove and recreate an older
+`CuaDriver Local Signing (cua-driver-rs)` identity in Keychain Access before
+using it for security-sensitive testing, then reset and re-grant the local
+bundle's TCC permissions.
+
+## Production macOS signing identity
+
+Production artifact builders must set `CUA_DRIVER_PRODUCTION_TEAM_ID` to the
+approved 10-character Apple Team ID while compiling the Driver and while
+running the release installer or uninstaller. There is deliberately no source
+default. The value is embedded into Computer History admission policy, and the
+install scripts use the same value to require an Apple-anchored, notarized app
+with the exact `com.meta.musecode.cua.driver` identity. Release wrappers must
+provide this value without asking end users to discover it.
+
+The one-time migration from `com.trycua.driver` defaults its old signer to
+`YCK386LBJ7`; a different reviewed legacy signer may be supplied through
+`CUA_DRIVER_LEGACY_TEAM_ID`. Migration stops before replacing the old app when
+encrypted Computer History is present. Purge that history with the verified old
+helper or use a separately reviewed key-migration tool before retrying.
+
 Released installers show a telemetry notice before asking the installed binary
 to record anything. Telemetry is enabled by default and can be persistently
 disabled with `cua-driver telemetry disable`. Installation events use the same

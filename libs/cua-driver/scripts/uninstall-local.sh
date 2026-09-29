@@ -42,18 +42,129 @@ SYSTEMD_UNIT="$HOME/.config/systemd/user/cua-driver-local.service"
 
 log() { printf '==> %s\n' "$*"; }
 
-LEGACY_LOCAL_APP_OWNED=0
-if [[ "$OS" == "Darwin" && -d "$LEGACY_APP_BUNDLE" && ! -L "$LEGACY_APP_BUNDLE" ]] \
-   && [[ "$(legacy_local_app_bundle_id "$LEGACY_APP_BUNDLE" || true)" == "com.trycua.driver.local" ]]; then
-    LEGACY_LOCAL_APP_OWNED=1
-fi
+CURRENT_LOCAL_BUNDLE_ID="com.meta.musecode.cua.driver.local"
+LEGACY_LOCAL_BUNDLE_ID="com.trycua.driver.local"
+LOCAL_EXECUTABLE="cua-driver-local"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+CODESIGN="/usr/bin/codesign"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+TCCUTIL="/usr/bin/tccutil"
 
-case "$HOME_DIR" in
-    /*) ;;
-    *) echo "error: CUA_DRIVER_LOCAL_HOME must be an absolute path" >&2; exit 2 ;;
-esac
-if [[ "$HOME_DIR" == "$HOME" || "$HOME_DIR" == "$HOME/.cua-driver" || "$HOME_DIR" == "/" ]]; then
-    echo "error: refusing unsafe or release-owned local home: $HOME_DIR" >&2
+reject_local_root_invocation() {
+    local effective_uid="$1" sudo_uid="${2:-}"
+    if [[ "$effective_uid" == "0" || -n "$sudo_uid" ]]; then
+        printf 'error: do not run the local Cua Driver uninstaller as root or with sudo; run it as the login user\n' >&2
+        return 77
+    fi
+}
+
+validate_local_home_dir() {
+    local home_dir="$1" user_home="$2" resolved_home resolved_dir
+    case "$home_dir" in
+        /*) ;;
+        *) echo "error: CUA_DRIVER_LOCAL_HOME must be an absolute path" >&2; return 1 ;;
+    esac
+    case "$home_dir" in
+        /|"$user_home"|"$user_home"/|"$user_home/.cua-driver"|*/../*|*/..|*/./*|*/.)
+            echo "error: refusing unsafe or release-owned local home: $home_dir" >&2
+            return 1
+            ;;
+    esac
+    [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* ]] || {
+        echo "error: refusing local home containing a line break" >&2
+        return 1
+    }
+    resolved_home="$(CDPATH= cd -- "$user_home" 2>/dev/null && pwd -P)" || return 1
+    case "$home_dir" in
+        "$user_home"/*) ;;
+        *) echo "error: CUA_DRIVER_LOCAL_HOME must remain inside HOME ($resolved_home): $home_dir" >&2; return 1 ;;
+    esac
+    if [[ -e "$home_dir" || -L "$home_dir" ]]; then
+        [[ ! -L "$home_dir" && -d "$home_dir" ]] || {
+            echo "error: refusing non-directory or symlink local home: $home_dir" >&2
+            return 1
+        }
+        resolved_dir="$(CDPATH= cd -- "$home_dir" 2>/dev/null && pwd -P)" || return 1
+        case "$resolved_dir" in
+            "$resolved_home"/*) ;;
+            *) echo "error: local home resolves outside HOME: $resolved_dir" >&2; return 1 ;;
+        esac
+    fi
+}
+
+local_plist_value() {
+    local plistbuddy="$1" app_bundle="$2" key="$3"
+    [[ -x "$plistbuddy" ]] || return 1
+    "$plistbuddy" -c "Print :$key" "$app_bundle/Contents/Info.plist" 2>/dev/null
+}
+
+# Local builds can be signed either ad-hoc or by the dedicated development
+# certificate. In both cases verify the signature-derived identifier and
+# designated requirement in addition to the mutable Info.plist fields.
+local_app_is_owned() {
+    local app_bundle="$1" expected_bundle_id="$2" codesign_tool="$3" plistbuddy="$4"
+    local actual_bundle_id actual_executable executable_path requirement
+
+    [[ -d "$app_bundle" && ! -L "$app_bundle" ]] || return 1
+    actual_bundle_id="$(local_plist_value "$plistbuddy" "$app_bundle" CFBundleIdentifier || true)"
+    actual_executable="$(local_plist_value "$plistbuddy" "$app_bundle" CFBundleExecutable || true)"
+    [[ "$actual_bundle_id" == "$expected_bundle_id" && "$actual_executable" == "$LOCAL_EXECUTABLE" ]] || return 1
+    executable_path="$app_bundle/Contents/MacOS/$LOCAL_EXECUTABLE"
+    [[ -f "$executable_path" && -x "$executable_path" && ! -L "$executable_path" ]] || return 1
+    [[ -x "$codesign_tool" ]] || return 1
+    "$codesign_tool" --verify --deep --strict "$app_bundle" >/dev/null 2>&1 || return 1
+    "$codesign_tool" --verify --deep --strict \
+        -R "=identifier \"$expected_bundle_id\"" "$app_bundle" >/dev/null 2>&1 \
+        || return 1
+    requirement="$("$codesign_tool" -d -r- "$app_bundle" 2>&1 \
+        | sed -n -e 's/^designated => //p' -e 's/^# designated => //p')" || return 1
+    [[ -n "$requirement" && "$requirement" == *"identifier \"$expected_bundle_id\""* ]] || return 1
+    [[ "$requirement" == *cdhash* || "$requirement" == *"certificate leaf"* ]]
+}
+
+prepare_local_app_removal() {
+    local app_bundle="$1" bundle_id="$2" failed_services="" service
+    [[ -x "$LSREGISTER" ]] || {
+        echo "error: LaunchServices registration tool is unavailable; preserved $app_bundle" >&2
+        return 1
+    }
+    "$LSREGISTER" -f "$app_bundle" >/dev/null 2>&1 || {
+        echo "error: could not register $app_bundle before permission cleanup; the app was preserved" >&2
+        return 1
+    }
+    if [[ "$RESET_TCC" == "1" ]]; then
+        [[ -x "$TCCUTIL" ]] || {
+            echo "error: tccutil is required to revoke permissions for $bundle_id; the app was preserved" >&2
+            return 1
+        }
+        for service in Accessibility ScreenCapture AppleEvents; do
+            "$TCCUTIL" reset "$service" "$bundle_id" >/dev/null 2>&1 \
+                || failed_services="$failed_services $service"
+        done
+        if [[ -n "$failed_services" ]]; then
+            echo "error: could not reset these TCC services for $bundle_id:$failed_services; the app was preserved" >&2
+            return 1
+        fi
+        log "revoked TCC grants for $bundle_id"
+    else
+        log "preserving TCC grants for $bundle_id (--keep-tcc)"
+    fi
+    "$LSREGISTER" -u "$app_bundle" >/dev/null 2>&1 || {
+        echo "error: could not unregister $app_bundle from LaunchServices; the app was preserved" >&2
+        return 1
+    }
+}
+
+remove_verified_local_app() {
+    local app_bundle="$1" bundle_id="$2"
+    local_app_is_owned "$app_bundle" "$bundle_id" "$CODESIGN" "$PLISTBUDDY" || {
+        echo "error: app identity changed during cleanup; preserved $app_bundle" >&2
+        return 1
+    }
+    remove_legacy_local_app_path "$app_bundle"
+}
+
+if ! validate_local_home_dir "$HOME_DIR" "$HOME"; then
     exit 2
 fi
 case "$BIN_DIR" in
@@ -65,6 +176,29 @@ if [[ "$VALIDATE_ONLY" == "1" ]]; then
     printf 'cli=%s\nhome=%s\ncache=%s\napp=%s\nbundle=com.meta.musecode.cua.driver.local\nlaunchagent=%s\nsystemd=%s\n' \
         "$CLI_LINK" "$HOME_DIR" "$CACHE_DIR" "$APP_BUNDLE" "$LAUNCHAGENT" "$SYSTEMD_UNIT"
     exit 0
+fi
+
+if ! reject_local_root_invocation "$(id -u)" "${SUDO_UID:-}"; then
+    exit 77
+fi
+
+CURRENT_LOCAL_APP_OWNED=0
+LEGACY_LOCAL_APP_OWNED=0
+if [[ "$OS" == "Darwin" && ( -e "$APP_BUNDLE" || -L "$APP_BUNDLE" ) ]]; then
+    if local_app_is_owned "$APP_BUNDLE" "$CURRENT_LOCAL_BUNDLE_ID" "$CODESIGN" "$PLISTBUDDY"; then
+        CURRENT_LOCAL_APP_OWNED=1
+    else
+        echo "error: refusing to stop or remove unverified local app $APP_BUNDLE" >&2
+        exit 1
+    fi
+fi
+if [[ "$OS" == "Darwin" && ( -e "$LEGACY_APP_BUNDLE" || -L "$LEGACY_APP_BUNDLE" ) ]]; then
+    if local_app_is_owned "$LEGACY_APP_BUNDLE" "$LEGACY_LOCAL_BUNDLE_ID" "$CODESIGN" "$PLISTBUDDY"; then
+        LEGACY_LOCAL_APP_OWNED=1
+    else
+        echo "error: refusing to stop or remove unverified legacy local app $LEGACY_APP_BUNDLE" >&2
+        exit 1
+    fi
 fi
 
 if [[ "$FORCE" != "1" ]]; then
@@ -110,30 +244,40 @@ fi
 # See the note in _install-local-rust.sh: `pkill -x cua-driver-local` never
 # matches on Linux, because `-x` compares against the 15-char truncated
 # `comm` and the name is 16. Match argv[0], anchored so the launcher shells
-# that merely mention the path in their script text are left alone.
-for _daemon_bin in \
-    "$CLI_LINK" \
-    "$HOME_DIR/packages/current/cua-driver-local" \
-    "$LEGACY_APP_BUNDLE/Contents/MacOS/cua-driver-local"; do
-    [ -n "$_daemon_bin" ] || continue
-    pkill -f "^${_daemon_bin}([[:space:]]|\$)" >/dev/null 2>&1 || true
-done
-unset _daemon_bin
-
-if [[ "$OS" == "Darwin" ]]; then
-    cleanup_legacy_local_app "$LEGACY_APP_BUNDLE" "$RESET_TCC"
+# that merely mention the path in their script text are left alone. App paths
+# enter this list only after their bundle, executable, and signer were
+# validated above.
+LOCAL_DAEMON_BINS=(
+    "$CLI_LINK"
+    "$HOME_DIR/packages/current/cua-driver-local"
+)
+if [[ "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
+    LOCAL_DAEMON_BINS+=("$APP_BUNDLE/Contents/MacOS/cua-driver-local")
 fi
+if [[ "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then
+    LOCAL_DAEMON_BINS+=("$LEGACY_APP_BUNDLE/Contents/MacOS/cua-driver-local")
+fi
+for _daemon_bin in "${LOCAL_DAEMON_BINS[@]}"; do
+    [ -n "$_daemon_bin" ] || continue
+    _daemon_pattern="$(escape_extended_regex "$_daemon_bin")"
+    pkill -f "^${_daemon_pattern}([[:space:]]|\$)" >/dev/null 2>&1 || true
+done
+unset _daemon_bin _daemon_pattern LOCAL_DAEMON_BINS
 
-# Revoke only the local bundle's TCC rows, while LaunchServices can resolve it.
-if [[ "$OS" == "Darwin" && "$RESET_TCC" == "1" ]] && command -v tccutil >/dev/null 2>&1; then
-    if [[ -d "$APP_BUNDLE" ]]; then
-        LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
-        [[ ! -x "$LSREGISTER" ]] || "$LSREGISTER" -f "$APP_BUNDLE" >/dev/null 2>&1 || true
+# Reset and unregister each verified identity while its app remains present.
+if [[ "$OS" == "Darwin" && "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then
+    if ! prepare_local_app_removal "$LEGACY_APP_BUNDLE" "$LEGACY_LOCAL_BUNDLE_ID" \
+       || ! remove_verified_local_app "$LEGACY_APP_BUNDLE" "$LEGACY_LOCAL_BUNDLE_ID"; then
+        exit 1
     fi
-    for service in Accessibility ScreenCapture AppleEvents; do
-        tccutil reset "$service" com.meta.musecode.cua.driver.local >/dev/null 2>&1 || true
-    done
-    log "revoked TCC grants for com.meta.musecode.cua.driver.local"
+    log "removed retired local app $LEGACY_APP_BUNDLE ($LEGACY_LOCAL_BUNDLE_ID)"
+fi
+if [[ "$OS" == "Darwin" && "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
+    if ! prepare_local_app_removal "$APP_BUNDLE" "$CURRENT_LOCAL_BUNDLE_ID" \
+       || ! remove_verified_local_app "$APP_BUNDLE" "$CURRENT_LOCAL_BUNDLE_ID"; then
+        exit 1
+    fi
+    log "removed $APP_BUNDLE"
 fi
 
 # Remove the CLI only if it is an installer-created link into the local product.
@@ -247,13 +391,4 @@ if [[ -e "$LOCAL_HOME_MARKER" || -L "$LOCAL_HOME_MARKER" ]]; then
 elif [[ -d "$HOME_DIR" ]]; then
     log "$HOME_DIR has no cua-driver-local install marker; leaving it untouched"
 fi
-if [[ "$OS" == "Darwin" && -d "$APP_BUNDLE" ]]; then
-    if [[ -w "$(dirname "$APP_BUNDLE")" ]]; then
-        rm -rf "$APP_BUNDLE"
-    else
-        sudo rm -rf "$APP_BUNDLE"
-    fi
-    log "removed $APP_BUNDLE"
-fi
-
 log "cua-driver-local uninstalled; release cua-driver was left untouched"

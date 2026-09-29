@@ -6,6 +6,10 @@
 
 CUA_LOCAL_SIGN_CN="CuaDriver Local Signing (cua-driver-rs)"
 
+escape_extended_regex() {
+    printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'
+}
+
 local_signing_keychain() {
     if [ -n "${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-}" ]; then
         printf '%s' "$CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN"
@@ -69,7 +73,8 @@ ensure_local_signing_identity() {
                 -out "$tmp/id.p12" -passout pass:"$pw" -name "$CUA_LOCAL_SIGN_CN" >/dev/null 2>&1 \
             || openssl pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
                 -out "$tmp/id.p12" -passout pass:"$pw" -name "$CUA_LOCAL_SIGN_CN" >/dev/null 2>&1; } \
-       && security import "$tmp/id.p12" -k "$kc" -P "$pw" -A -T /usr/bin/codesign >/dev/null 2>&1; then
+       && security import "$tmp/id.p12" -k "$kc" -P "$pw" \
+            -T /usr/bin/codesign >/dev/null 2>&1; then
         identity="$(security find-identity -p codesigning "$kc" 2>/dev/null \
             | awk -v cn="$CUA_LOCAL_SIGN_CN" 'index($0, "\"" cn "\"") { print $2; exit }')"
         rm -rf "$tmp"
@@ -117,6 +122,42 @@ designated_requirement() {
         | sed -n -e 's/^designated => //p' -e 's/^# designated => //p'
 }
 
+local_app_bundle_value() {
+    local app="$1"
+    local key="$2"
+    /usr/libexec/PlistBuddy -c "Print :$key" \
+        "$app/Contents/Info.plist" 2>/dev/null
+}
+
+# Local builds can use either the dedicated development certificate or an
+# ad-hoc signature, so there is no global signer pin. Still require a valid
+# sealed bundle, the exact bundle/executable tuple, and a code-signing
+# requirement that independently binds the expected identifier. This prevents
+# a mutable Info.plist alone from authorizing deletion or process cleanup.
+verify_local_app_identity() {
+    local app="$1"
+    local expected_bundle_id="$2"
+    local expected_executable="$3"
+    local actual_bundle_id actual_executable requirement
+
+    [ -d "$app" ] && [ ! -L "$app" ] || return 1
+    [ -f "$app/Contents/Info.plist" ] \
+        && [ ! -L "$app/Contents/Info.plist" ] || return 1
+    actual_bundle_id="$(local_app_bundle_value "$app" CFBundleIdentifier || true)"
+    actual_executable="$(local_app_bundle_value "$app" CFBundleExecutable || true)"
+    [ "$actual_bundle_id" = "$expected_bundle_id" ] || return 1
+    [ "$actual_executable" = "$expected_executable" ] || return 1
+    [ -f "$app/Contents/MacOS/$expected_executable" ] \
+        && [ ! -L "$app/Contents/MacOS/$expected_executable" ] \
+        && [ -x "$app/Contents/MacOS/$expected_executable" ] || return 1
+    codesign --verify --deep --strict "$app" >/dev/null 2>&1 || return 1
+    codesign --verify --deep --strict \
+        -R "=identifier \"$expected_bundle_id\"" "$app" >/dev/null 2>&1 \
+        || return 1
+    requirement="$(designated_requirement "$app" || true)"
+    [ "$(classify_designated_requirement "$requirement")" != "unknown" ]
+}
+
 classify_designated_requirement() {
     case "$1" in
         *"certificate leaf"*) printf '%s' "certificate-backed" ;;
@@ -162,7 +203,7 @@ reset_local_tcc_after_ad_hoc_change() {
     done
     if [ -n "$failed_services" ]; then
         echo "${RED}Error: could not reset these TCC services for $bundle_id:$failed_services.${NORMAL}" >&2
-        echo "The new app is installed, but its stale permission rows may remain. Run:" >&2
+        echo "The replacement will be rolled back. After resolving tccutil, retry:" >&2
         echo "  tccutil reset Accessibility $bundle_id" >&2
         echo "  tccutil reset ScreenCapture $bundle_id" >&2
         return 1
@@ -173,14 +214,58 @@ reset_local_tcc_after_ad_hoc_change() {
 }
 
 legacy_local_app_bundle_id() {
-    /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-        "$1/Contents/Info.plist" 2>/dev/null
+    local_app_bundle_value "$1" CFBundleIdentifier
 }
 
-register_legacy_local_app() {
+register_local_app() {
     local app="$1"
     local lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
     [ -x "$lsregister" ] && "$lsregister" -f "$app" >/dev/null 2>&1
+}
+
+register_legacy_local_app() {
+    register_local_app "$1"
+}
+
+# Restore only a replacement that this installer has authenticated. The prior
+# app is re-registered before failure is reported to the caller.
+restore_local_app_backup() {
+    local app="$1"
+    local backup="$2"
+    local expected_bundle_id="$3"
+    local expected_executable="$4"
+
+    if [ -e "$app" ] || [ -L "$app" ]; then
+        if ! verify_local_app_identity "$app" "$expected_bundle_id" "$expected_executable"; then
+            echo "${RED:-}Error: refusing to remove unauthenticated rollback candidate at $app.${NORMAL:-}" >&2
+            return 1
+        fi
+        rm -rf -- "$app" || return 1
+    fi
+    if [ -d "$backup" ] && [ ! -L "$backup" ]; then
+        if ! verify_local_app_identity "$backup" "$expected_bundle_id" "$expected_executable"; then
+            echo "${RED:-}Error: refusing to restore unauthenticated app backup at $backup.${NORMAL:-}" >&2
+            return 1
+        fi
+        mv "$backup" "$app" || return 1
+        if ! register_local_app "$app"; then
+            echo "${RED:-}Error: restored $app but could not re-register it with LaunchServices.${NORMAL:-}" >&2
+            return 1
+        fi
+    fi
+}
+
+remove_authenticated_local_app_backup() {
+    local backup="$1"
+    local expected_bundle_id="$2"
+    local expected_executable="$3"
+
+    [ -e "$backup" ] || [ -L "$backup" ] || return 0
+    if ! verify_local_app_identity "$backup" "$expected_bundle_id" "$expected_executable"; then
+        echo "${YELLOW:-}warning: preserving unauthenticated local install backup at $backup.${NORMAL:-}" >&2
+        return 1
+    fi
+    rm -rf -- "$backup"
 }
 
 remove_legacy_local_app_path() {
@@ -210,6 +295,10 @@ cleanup_legacy_local_app() {
     actual_bundle_id="$(legacy_local_app_bundle_id "$app" || true)"
     if [ "$actual_bundle_id" != "$expected_bundle_id" ]; then
         echo "${RED:-}Error: preserving $app because its bundle ID is ${actual_bundle_id:-unreadable}, not $expected_bundle_id.${NORMAL:-}" >&2
+        return 1
+    fi
+    if ! verify_local_app_identity "$app" "$expected_bundle_id" "cua-driver-local"; then
+        echo "${RED:-}Error: preserving $app because its executable or code-signing identity could not be authenticated.${NORMAL:-}" >&2
         return 1
     fi
 

@@ -39,6 +39,7 @@ def test_unix_local_uninstall_removes_owned_links_and_preserves_release(tmp_path
         (local_home / runtime_file).write_text("local runtime state\n", encoding="utf-8")
 
     _executable(fake_bin / "uname", "printf 'Linux\\n'")
+    _executable(fake_bin / "id", "printf '501\\n'")
     _executable(fake_bin / "pkill", "exit 0")
     _executable(fake_bin / "systemctl", "exit 0")
 
@@ -112,6 +113,7 @@ def test_unix_local_uninstall_keeps_shared_skill_link_owned_by_release(tmp_path:
     skill_link.parent.mkdir(parents=True)
     skill_link.symlink_to(release_skill_target)
     _executable(fake_bin / "uname", "printf 'Linux\\n'")
+    _executable(fake_bin / "id", "printf '501\\n'")
     _executable(fake_bin / "pkill", "exit 0")
 
     env = os.environ.copy()
@@ -153,7 +155,11 @@ def test_local_uninstall_contract_is_explicit_on_both_platforms() -> None:
     assert "Test-LocalLinkTarget" in windows
     assert "is_local_target" in unix
     assert "LOCAL_HOME_MARKER" in unix
-    assert "cleanup_legacy_local_app" in unix
+    assert "local_app_is_owned" in unix
+    assert "prepare_local_app_removal" in unix
+    assert "remove_verified_local_app" in unix
+    assert '"$APP_BUNDLE/Contents/MacOS/cua-driver-local"' in unix
+    assert "reject_local_root_invocation" in unix
     assert "$LocalHomeMarker" in windows
     assert "Remove-Item -LiteralPath $HomeDir -Force -Recurse" not in windows
     assert 'rm -rf "$HOME_DIR"' not in unix

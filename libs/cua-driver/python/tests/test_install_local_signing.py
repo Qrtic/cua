@@ -28,6 +28,15 @@ def test_local_installer_accepts_untrusted_self_signed_identity() -> None:
     assert script.count("security find-identity -p codesigning") >= 2
 
 
+def test_daemon_path_is_escaped_before_regex_process_matching() -> None:
+    result = run_signing_policy(
+        r'''escape_extended_regex '/tmp/Cua Driver.app/build+[one]/cua-driver-local' '''
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == r"/tmp/Cua Driver\.app/build\+\[one\]/cua-driver-local"
+
+
 def test_strict_local_signing_fails_before_ad_hoc_fallback() -> None:
     result = run_signing_policy(
         r"""
@@ -159,8 +168,13 @@ def test_legacy_local_app_cleanup_is_scoped_and_removes_after_resets(tmp_path: P
         r'''
         OS=Darwin
         legacy_local_app_bundle_id() { printf '%s' com.trycua.driver.local; }
+        verify_local_app_identity() { return 0; }
         register_legacy_local_app() { printf 'register:%s\n' "$1" >> "$TEST_CALLS"; }
         tccutil() { printf '%s:%s:%s\n' "$1" "$2" "$3" >> "$TEST_CALLS"; }
+        remove_legacy_local_app_path() {
+            printf 'remove:%s\n' "$1" >> "$TEST_CALLS"
+            rmdir "$1"
+        }
         cleanup_legacy_local_app "$TEST_LEGACY_APP" 1
         ''',
         {"TEST_LEGACY_APP": str(app), "TEST_CALLS": str(calls)},
@@ -173,6 +187,7 @@ def test_legacy_local_app_cleanup_is_scoped_and_removes_after_resets(tmp_path: P
         "reset:Accessibility:com.trycua.driver.local",
         "reset:ScreenCapture:com.trycua.driver.local",
         "reset:AppleEvents:com.trycua.driver.local",
+        f"remove:{app}",
     ]
 
 
@@ -183,6 +198,7 @@ def test_legacy_local_app_cleanup_failure_preserves_bundle(tmp_path: Path) -> No
         r'''
         OS=Darwin
         legacy_local_app_bundle_id() { printf '%s' com.trycua.driver.local; }
+        verify_local_app_identity() { return 0; }
         register_legacy_local_app() { return 0; }
         tccutil() { [ "$2" != ScreenCapture ]; }
         cleanup_legacy_local_app "$TEST_LEGACY_APP" 1
@@ -221,6 +237,7 @@ def test_legacy_local_app_cleanup_can_preserve_tcc(tmp_path: Path) -> None:
         r'''
         OS=Darwin
         legacy_local_app_bundle_id() { printf '%s' com.trycua.driver.local; }
+        verify_local_app_identity() { return 0; }
         tccutil() { echo unexpected >&2; return 99; }
         cleanup_legacy_local_app "$TEST_LEGACY_APP" 0
         ''',
@@ -253,8 +270,9 @@ def test_local_installer_uses_a_separate_macos_identity() -> None:
     assert 'CFBundleIdentifier -string "com.meta.musecode.cua.driver.local"' in script
     assert 'CFBundleExecutable -string "cua-driver-local"' in script
     assert "tccutil reset" not in script
-    assert 'cleanup_legacy_local_app "/Applications/CuaDriverLocal.app" 1' in script
-    assert '"/Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local"' in script
+    assert 'cleanup_legacy_local_app "$LEGACY_LOCAL_APP" 1' in script
+    assert 'if [ "${LEGACY_LOCAL_APP_OWNED:-0}" = "1" ]; then' in script
+    assert '_daemon_bin="$LEGACY_LOCAL_APP/Contents/MacOS/cua-driver-local"' in script
 
 
 def test_unix_local_installer_uses_separate_paths_and_autostart() -> None:

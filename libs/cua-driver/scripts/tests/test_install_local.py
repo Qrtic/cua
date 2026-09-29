@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,31 @@ def _write_executable(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"#!/bin/sh\n{body}", encoding="utf-8")
     path.chmod(0o755)
+
+
+def _extract_local_signing_function(name: str) -> str:
+    source = LOCAL_SIGNING.read_text(encoding="utf-8")
+    match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n", source)
+    assert match, f"could not find shell function {name}"
+    return match.group(0)
+
+
+def _run_local_signing_policy(body: str) -> subprocess.CompletedProcess[str]:
+    functions = "\n".join(
+        _extract_local_signing_function(name)
+        for name in (
+            "designated_requirement",
+            "classify_designated_requirement",
+            "local_app_bundle_value",
+            "verify_local_app_identity",
+        )
+    )
+    return subprocess.run(
+        ["/bin/bash", "-c", f"set -euo pipefail\n{functions}\n{body}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_explicit_local_signing_identity_is_selected_exactly(tmp_path: Path) -> None:
@@ -104,6 +130,79 @@ def test_explicit_local_signing_identity_never_falls_back(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "-"
+
+
+def test_created_local_signing_key_is_scoped_to_codesign() -> None:
+    source = LOCAL_SIGNING.read_text(encoding="utf-8")
+    import_line = next(line for line in source.splitlines() if "security import" in line)
+    continuation = source[source.index(import_line) : source.index(import_line) + 220]
+
+    assert " -A " not in continuation
+    assert "-T /usr/bin/codesign" in continuation
+
+
+def test_local_app_ownership_requires_sealed_identifier_and_executable(
+    tmp_path: Path,
+) -> None:
+    app = tmp_path / "MuseCodeCuaDriverLocal.app"
+    binary = app / "Contents/MacOS/cua-driver-local"
+    binary.parent.mkdir(parents=True)
+    (app / "Contents/Info.plist").write_text("fixture")
+    binary.write_text("fixture")
+    binary.chmod(0o755)
+    result = _run_local_signing_policy(
+        f"""
+        local_app_bundle_value() {{
+            [[ "$2" == CFBundleIdentifier ]] \
+                && printf '%s' com.meta.musecode.cua.driver.local \
+                || printf '%s' cua-driver-local
+        }}
+        designated_requirement() {{ printf '%s' 'identifier "com.meta.musecode.cua.driver.local" and cdhash H"1234"'; }}
+        codesign() {{
+            [[ "$*" == *'-R =identifier "com.meta.musecode.cua.driver.local"'* ]] \
+                || [[ "$*" != *' -R '* ]]
+        }}
+        verify_local_app_identity '{app}' \
+            com.meta.musecode.cua.driver.local cua-driver-local
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_local_app_ownership_rejects_signature_failure(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverLocal.app"
+    binary = app / "Contents/MacOS/cua-driver-local"
+    binary.parent.mkdir(parents=True)
+    (app / "Contents/Info.plist").write_text("fixture")
+    binary.write_text("fixture")
+    binary.chmod(0o755)
+    result = _run_local_signing_policy(
+        f"""
+        local_app_bundle_value() {{
+            [[ "$2" == CFBundleIdentifier ]] \
+                && printf '%s' com.trycua.driver.local \
+                || printf '%s' cua-driver-local
+        }}
+        codesign() {{ return 1; }}
+        ! verify_local_app_identity '{app}' com.trycua.driver.local cua-driver-local
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_macos_local_install_rolls_back_on_registration_or_tcc_failure() -> None:
+    source = INSTALL_LOCAL.read_text(encoding="utf-8")
+    install = source.index('if [ "$OS" = "Darwin" ]; then')
+    register = source.index('if ! register_local_app "$APP_DEST"', install)
+    register_rollback = source.index("restore_local_app_backup", register)
+    reset = source.index("reset_local_tcc_after_ad_hoc_change", register_rollback)
+    reset_rollback = source.index("restore_local_app_backup", reset)
+    delete_backup = source.index("remove_authenticated_local_app_backup", reset_rollback)
+
+    assert register < register_rollback < reset < reset_rollback < delete_backup
+    assert 'LEGACY_LOCAL_APP_OWNED:-0' in source
 
 
 @pytest.mark.parametrize("relative_target", [False, True], ids=["absolute", "relative"])
