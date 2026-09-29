@@ -541,7 +541,7 @@ pub fn parse_command() -> Command {
         println!("permissions options (macOS):");
         println!("  cua-driver permissions status   Report Accessibility + Screen Recording status. Read-only (no prompt).");
         println!("                                  Answers via a running daemon, so the result carries the CuaDriver");
-        println!("                                  identity (com.trycua.driver). If no daemon is running it reports");
+        println!("                                  identity (com.meta.musecode.cua.driver). If no daemon is running it reports");
         println!("                                  `unknown` rather than your terminal's grants. Add --json for the payload.");
         println!("  cua-driver permissions grant    Launch CuaDriver via LaunchServices so dialogs attribute to the app,");
         println!("                                  explain and request Accessibility, Screen Recording, and Tahoe's");
@@ -3302,7 +3302,7 @@ pub fn run_permissions_cmd(subcommand: &str, json: bool) {
 /// Report the CuaDriver daemon's TCC status — reliably, or not at all.
 ///
 /// macOS attributes Accessibility / Screen-Recording to the *responsible
-/// process*, so the ONLY process that can read `com.trycua.driver`'s real
+/// process*, so the ONLY process that can read `com.meta.musecode.cua.driver`'s real
 /// grants is the daemon running as its own responsible process. When the
 /// daemon is up we query it and report its
 /// `driver-daemon`-attributed answer. When it is NOT up we deliberately
@@ -3317,7 +3317,7 @@ fn run_permissions_status(json: bool) {
     let app_name = crate::bundle::app_name();
     let bundle_id = crate::bundle::bundle_id();
 
-    // Only a listening daemon can answer for com.trycua.driver. A failed/!ok
+    // Only a listening daemon can answer for com.meta.musecode.cua.driver. A failed/!ok
     // response (e.g. daemon still inside its first-launch permission gate) is
     // treated the same as "no daemon" → unknown.
     let daemon_status: Option<serde_json::Value> = if crate::serve::is_daemon_listening(&socket) {
@@ -5863,7 +5863,7 @@ fn request_permissions_via_launchservices(
 }
 
 /// Launch CuaDriver via LaunchServices so the permission prompt attributes to
-/// com.trycua.driver, wait (user-paced) for the daemon to come up — its socket
+/// com.meta.musecode.cua.driver, wait (user-paced) for the daemon to come up — its socket
 /// only appears once the permissions gate passes, i.e. the grant was given —
 /// then report the driver's own status.
 fn run_permissions_grant() {
@@ -6535,7 +6535,7 @@ pub fn run_dump_docs_with_type(tools_list: &serde_json::Value, pretty: bool, doc
 ///   - codesign info (cdhash, team-id, authority) via `codesign -dvvv`
 ///   - AX + screen recording TCC status (check_permissions tool)
 ///   - install layout (/Applications/CuaDriver.app, ~/.local/bin/cua-driver)
-///   - TCC DB rows for com.trycua.driver (sqlite3, best-effort)
+///   - TCC DB rows for com.meta.musecode.cua.driver (sqlite3, best-effort)
 ///   - config + state paths with existence booleans
 pub fn run_diagnose_cmd() {
     let sections = [
@@ -6708,9 +6708,9 @@ fn diagnose_tcc_db_section() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let db = format!("{home}/Library/Application Support/com.apple.TCC/TCC.db");
     let sql = "SELECT service, client, client_type, auth_value, auth_reason, \
-               hex(csreq) AS csreq_hex FROM access WHERE client='com.trycua.driver';";
+               hex(csreq) AS csreq_hex FROM access WHERE client='com.meta.musecode.cua.driver';";
 
-    let mut lines = vec!["## tcc database rows for com.trycua.driver".to_owned()];
+    let mut lines = vec!["## tcc database rows for com.meta.musecode.cua.driver".to_owned()];
     lines.push(format!(
         "(reading {db} — best-effort; system TCC DB requires FDA)"
     ));
@@ -7158,7 +7158,7 @@ mod tests {
         let host_pid = std::path::Path::new("/tmp/cua-driver-onboarding-host-test.pid");
         let diagnostic = std::path::Path::new("/tmp/cua-driver-onboarding-log-test.log");
         let argv = onboarding_launch_arguments(
-            "/private/plugin/CuaDriverLocal.app",
+            "/private/plugin/MuseCodeCuaDriverLocal.app",
             status,
             liveness,
             host_pid,
@@ -7172,7 +7172,7 @@ mod tests {
             "-W",
             "--stderr",
             "/tmp/cua-driver-onboarding-log-test.log",
-            "/private/plugin/CuaDriverLocal.app",
+            "/private/plugin/MuseCodeCuaDriverLocal.app",
             "--args",
             ONBOARDING_HOST_ARG,
             "--status-file",
@@ -7779,10 +7779,13 @@ mod tests {
     #[test]
     fn renamed_app_launch_uses_exact_path_as_one_argument() {
         let app = "/Users/developer/My Apps/cua.app";
-        assert_eq!(daemon_launch_target("CuaDriverLocal", app, true), app);
         assert_eq!(
-            daemon_launch_target("CuaDriverLocal", app, false),
-            "CuaDriverLocal"
+            daemon_launch_target("MuseCodeCuaDriverLocal", app, true),
+            app
+        );
+        assert_eq!(
+            daemon_launch_target("MuseCodeCuaDriverLocal", app, false),
+            "MuseCodeCuaDriverLocal"
         );
         let state = crate::history_runtime::DaemonLaunchState::default();
         let launch = daemon_launch_arguments(app, "/tmp/cua.sock", &state, false, true);

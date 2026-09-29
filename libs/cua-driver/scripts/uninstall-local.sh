@@ -3,6 +3,11 @@
 # cua-driver installation has different names and paths and is never touched.
 set -euo pipefail
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=_local-signing.sh
+. "$SCRIPT_DIR/_local-signing.sh"
+
 RESET_TCC=1
 FORCE=0
 VALIDATE_ONLY=0
@@ -25,7 +30,8 @@ OS="$(uname -s 2>/dev/null || echo unknown)"
 HOME_DIR="${CUA_DRIVER_LOCAL_HOME:-$HOME/.cua-driver-local}"
 BIN_DIR="${CUA_DRIVER_LOCAL_INSTALL_DIR:-$HOME/.local/bin}"
 CLI_LINK="$BIN_DIR/cua-driver-local"
-APP_BUNDLE="/Applications/CuaDriverLocal.app"
+APP_BUNDLE="/Applications/MuseCodeCuaDriverLocal.app"
+LEGACY_APP_BUNDLE="/Applications/CuaDriverLocal.app"
 if [[ "$OS" == "Darwin" ]]; then
     CACHE_DIR="$HOME/Library/Caches/cua-driver-local"
 else
@@ -35,6 +41,12 @@ LAUNCHAGENT="$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist"
 SYSTEMD_UNIT="$HOME/.config/systemd/user/cua-driver-local.service"
 
 log() { printf '==> %s\n' "$*"; }
+
+LEGACY_LOCAL_APP_OWNED=0
+if [[ "$OS" == "Darwin" && -d "$LEGACY_APP_BUNDLE" && ! -L "$LEGACY_APP_BUNDLE" ]] \
+   && [[ "$(legacy_local_app_bundle_id "$LEGACY_APP_BUNDLE" || true)" == "com.trycua.driver.local" ]]; then
+    LEGACY_LOCAL_APP_OWNED=1
+fi
 
 case "$HOME_DIR" in
     /*) ;;
@@ -50,7 +62,7 @@ case "$BIN_DIR" in
 esac
 
 if [[ "$VALIDATE_ONLY" == "1" ]]; then
-    printf 'cli=%s\nhome=%s\ncache=%s\napp=%s\nbundle=com.trycua.driver.local\nlaunchagent=%s\nsystemd=%s\n' \
+    printf 'cli=%s\nhome=%s\ncache=%s\napp=%s\nbundle=com.meta.musecode.cua.driver.local\nlaunchagent=%s\nsystemd=%s\n' \
         "$CLI_LINK" "$HOME_DIR" "$CACHE_DIR" "$APP_BUNDLE" "$LAUNCHAGENT" "$SYSTEMD_UNIT"
     exit 0
 fi
@@ -78,6 +90,7 @@ resolve_link() {
 is_local_target() {
     case "$1" in
         "$HOME_DIR"/*|"$APP_BUNDLE"/*) return 0 ;;
+        "$LEGACY_APP_BUNDLE"/*) [[ "$LEGACY_LOCAL_APP_OWNED" == "1" ]] ;;
         *) return 1 ;;
     esac
 }
@@ -98,11 +111,18 @@ fi
 # matches on Linux, because `-x` compares against the 15-char truncated
 # `comm` and the name is 16. Match argv[0], anchored so the launcher shells
 # that merely mention the path in their script text are left alone.
-for _daemon_bin in "$CLI_LINK" "$HOME_DIR/packages/current/cua-driver-local"; do
+for _daemon_bin in \
+    "$CLI_LINK" \
+    "$HOME_DIR/packages/current/cua-driver-local" \
+    "$LEGACY_APP_BUNDLE/Contents/MacOS/cua-driver-local"; do
     [ -n "$_daemon_bin" ] || continue
     pkill -f "^${_daemon_bin}([[:space:]]|\$)" >/dev/null 2>&1 || true
 done
 unset _daemon_bin
+
+if [[ "$OS" == "Darwin" ]]; then
+    cleanup_legacy_local_app "$LEGACY_APP_BUNDLE" "$RESET_TCC"
+fi
 
 # Revoke only the local bundle's TCC rows, while LaunchServices can resolve it.
 if [[ "$OS" == "Darwin" && "$RESET_TCC" == "1" ]] && command -v tccutil >/dev/null 2>&1; then
@@ -111,9 +131,9 @@ if [[ "$OS" == "Darwin" && "$RESET_TCC" == "1" ]] && command -v tccutil >/dev/nu
         [[ ! -x "$LSREGISTER" ]] || "$LSREGISTER" -f "$APP_BUNDLE" >/dev/null 2>&1 || true
     fi
     for service in Accessibility ScreenCapture AppleEvents; do
-        tccutil reset "$service" com.trycua.driver.local >/dev/null 2>&1 || true
+        tccutil reset "$service" com.meta.musecode.cua.driver.local >/dev/null 2>&1 || true
     done
-    log "revoked TCC grants for com.trycua.driver.local"
+    log "revoked TCC grants for com.meta.musecode.cua.driver.local"
 fi
 
 # Remove the CLI only if it is an installer-created link into the local product.

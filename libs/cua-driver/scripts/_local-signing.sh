@@ -145,7 +145,7 @@ ad_hoc_requirement_changed() {
 reset_local_tcc_after_ad_hoc_change() {
     local previous_requirement="$1"
     local installed_requirement="$2"
-    local bundle_id="com.trycua.driver.local"
+    local bundle_id="com.meta.musecode.cua.driver.local"
     local service failed_services=""
 
     ad_hoc_requirement_changed "$previous_requirement" "$installed_requirement" || return 0
@@ -170,6 +170,74 @@ reset_local_tcc_after_ad_hoc_change() {
 
     echo "${YELLOW}The ad-hoc cdhash changed; cleared stale Accessibility and Screen Recording rows for $bundle_id.${NORMAL}" >&2
     echo "Re-grant them to the new app with: cua-driver-local permissions grant" >&2
+}
+
+legacy_local_app_bundle_id() {
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+        "$1/Contents/Info.plist" 2>/dev/null
+}
+
+register_legacy_local_app() {
+    local app="$1"
+    local lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+    [ -x "$lsregister" ] && "$lsregister" -f "$app" >/dev/null 2>&1
+}
+
+remove_legacy_local_app_path() {
+    local app="$1"
+    if [ -w "$(dirname "$app")" ]; then
+        rm -rf -- "$app"
+    else
+        sudo rm -rf -- "$app"
+    fi
+}
+
+# Remove only the retired local-development bundle. When TCC cleanup is
+# requested, keep the bundle available and registered until every scoped reset
+# succeeds so a failed reset remains retryable.
+cleanup_legacy_local_app() {
+    local app="$1"
+    local reset_tcc="${2:-1}"
+    local expected_bundle_id="com.trycua.driver.local"
+    local actual_bundle_id service failed_services=""
+
+    [ "${OS:-}" = "Darwin" ] || return 0
+    [ -e "$app" ] || [ -L "$app" ] || return 0
+    if [ -L "$app" ] || [ ! -d "$app" ]; then
+        echo "${RED:-}Error: refusing to remove unsafe legacy local app path $app.${NORMAL:-}" >&2
+        return 1
+    fi
+    actual_bundle_id="$(legacy_local_app_bundle_id "$app" || true)"
+    if [ "$actual_bundle_id" != "$expected_bundle_id" ]; then
+        echo "${RED:-}Error: preserving $app because its bundle ID is ${actual_bundle_id:-unreadable}, not $expected_bundle_id.${NORMAL:-}" >&2
+        return 1
+    fi
+
+    if [ "$reset_tcc" = "1" ]; then
+        if ! command -v tccutil >/dev/null 2>&1; then
+            echo "${RED:-}Error: tccutil is required to clear the retired local-app permission rows.${NORMAL:-}" >&2
+            return 1
+        fi
+        if ! register_legacy_local_app "$app"; then
+            echo "${RED:-}Error: could not register $app before resetting its TCC rows; the app was preserved.${NORMAL:-}" >&2
+            return 1
+        fi
+        for service in Accessibility ScreenCapture AppleEvents; do
+            if ! tccutil reset "$service" "$expected_bundle_id" >/dev/null 2>&1; then
+                failed_services="$failed_services $service"
+            fi
+        done
+        if [ -n "$failed_services" ]; then
+            echo "${RED:-}Error: could not reset these TCC services for $expected_bundle_id:$failed_services; the legacy app was preserved.${NORMAL:-}" >&2
+            return 1
+        fi
+    fi
+
+    if ! remove_legacy_local_app_path "$app"; then
+        echo "${RED:-}Error: could not remove retired local app $app.${NORMAL:-}" >&2
+        return 1
+    fi
+    echo "${YELLOW:-}Removed retired local app $app (${expected_bundle_id}).${NORMAL:-}" >&2
 }
 
 # Signs a staged local app without touching the live installation. Strict mode
@@ -213,7 +281,7 @@ sign_staged_local_app() {
     clean_partial_bundle_signature "$app_stage"
     if ! codesign_bounded 20 --force --deep --sign - "$app_stage" 2>/dev/null; then
         clean_partial_bundle_signature "$app_stage"
-        echo "${RED}Error: codesign of staged CuaDriverLocal.app failed; live installation was not changed.${NORMAL}" >&2
+        echo "${RED}Error: codesign of staged MuseCodeCuaDriverLocal.app failed; live installation was not changed.${NORMAL}" >&2
         return 1
     fi
     requirement="$(designated_requirement "$app_stage")"
@@ -221,7 +289,7 @@ sign_staged_local_app() {
         echo "${RED}Error: could not verify the staged app's ad-hoc designated requirement; live installation was not changed.${NORMAL}" >&2
         return 1
     fi
-    echo "${YELLOW}WARNING: CuaDriverLocal.app was signed ad-hoc (designated requirement uses cdhash).${NORMAL}" >&2
+    echo "${YELLOW}WARNING: MuseCodeCuaDriverLocal.app was signed ad-hoc (designated requirement uses cdhash).${NORMAL}" >&2
     echo "${YELLOW}Accessibility and Screen Recording grants WILL become invalid on the next rebuild.${NORMAL}" >&2
     print_local_signing_bootstrap
 }

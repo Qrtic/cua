@@ -7,9 +7,12 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 SIGNING_HELPER = SCRIPTS_DIR / "_local-signing.sh"
 
 
-def run_signing_policy(shell_body: str) -> subprocess.CompletedProcess[str]:
+def run_signing_policy(
+    shell_body: str, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["SIGNING_HELPER"] = str(SIGNING_HELPER)
+    env.update(extra_env or {})
     return subprocess.run(
         ["/bin/bash", "-c", 'set -euo pipefail; source "$SIGNING_HELPER"; ' + shell_body],
         check=False,
@@ -67,7 +70,7 @@ def test_ad_hoc_fallback_is_prominent_and_reports_cdhash() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "WARNING: CuaDriverLocal.app was signed ad-hoc" in result.stderr
+    assert "WARNING: MuseCodeCuaDriverLocal.app was signed ad-hoc" in result.stderr
     assert "WILL become invalid on the next rebuild" in result.stderr
     assert "designated requirement uses cdhash" in result.stderr
 
@@ -108,8 +111,8 @@ def test_changed_ad_hoc_requirement_resets_only_local_driver_services() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == (
-        "reset:Accessibility:com.trycua.driver.local\n"
-        "reset:ScreenCapture:com.trycua.driver.local\n"
+        "reset:Accessibility:com.meta.musecode.cua.driver.local\n"
+        "reset:ScreenCapture:com.meta.musecode.cua.driver.local\n"
     )
     assert "cleared stale Accessibility and Screen Recording rows" in result.stderr
     assert "cua-driver-local permissions grant" in result.stderr
@@ -146,8 +149,89 @@ def test_ad_hoc_tcc_reset_failure_is_actionable_and_fails_closed() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "could not reset these TCC services" in result.stderr
-    assert "tccutil reset Accessibility com.trycua.driver.local" in result.stderr
-    assert "tccutil reset ScreenCapture com.trycua.driver.local" in result.stderr
+    assert "tccutil reset Accessibility com.meta.musecode.cua.driver.local" in result.stderr
+    assert "tccutil reset ScreenCapture com.meta.musecode.cua.driver.local" in result.stderr
+
+
+def test_legacy_local_app_cleanup_is_scoped_and_removes_after_resets(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverLocal.app"
+    calls = tmp_path / "calls"
+    app.mkdir()
+    result = run_signing_policy(
+        r'''
+        OS=Darwin
+        legacy_local_app_bundle_id() { printf '%s' com.trycua.driver.local; }
+        register_legacy_local_app() { printf 'register:%s\n' "$1" >> "$TEST_CALLS"; }
+        tccutil() { printf '%s:%s:%s\n' "$1" "$2" "$3" >> "$TEST_CALLS"; }
+        cleanup_legacy_local_app "$TEST_LEGACY_APP" 1
+        ''',
+        {"TEST_LEGACY_APP": str(app), "TEST_CALLS": str(calls)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not app.exists()
+    assert calls.read_text().splitlines() == [
+        f"register:{app}",
+        "reset:Accessibility:com.trycua.driver.local",
+        "reset:ScreenCapture:com.trycua.driver.local",
+        "reset:AppleEvents:com.trycua.driver.local",
+    ]
+
+
+def test_legacy_local_app_cleanup_failure_preserves_bundle(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverLocal.app"
+    app.mkdir()
+    result = run_signing_policy(
+        r'''
+        OS=Darwin
+        legacy_local_app_bundle_id() { printf '%s' com.trycua.driver.local; }
+        register_legacy_local_app() { return 0; }
+        tccutil() { [ "$2" != ScreenCapture ]; }
+        cleanup_legacy_local_app "$TEST_LEGACY_APP" 1
+        ''',
+        {"TEST_LEGACY_APP": str(app)},
+    )
+
+    assert result.returncode != 0
+    assert app.is_dir()
+    assert "legacy app was preserved" in result.stderr
+
+
+def test_legacy_local_app_cleanup_preserves_foreign_bundle(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverLocal.app"
+    app.mkdir()
+    result = run_signing_policy(
+        r'''
+        OS=Darwin
+        legacy_local_app_bundle_id() { printf '%s' com.example.foreign; }
+        tccutil() { echo unexpected >&2; return 99; }
+        cleanup_legacy_local_app "$TEST_LEGACY_APP" 1
+        ''',
+        {"TEST_LEGACY_APP": str(app)},
+    )
+
+    assert result.returncode != 0
+    assert app.is_dir()
+    assert "com.example.foreign" in result.stderr
+    assert "unexpected" not in result.stderr
+
+
+def test_legacy_local_app_cleanup_can_preserve_tcc(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverLocal.app"
+    app.mkdir()
+    result = run_signing_policy(
+        r'''
+        OS=Darwin
+        legacy_local_app_bundle_id() { printf '%s' com.trycua.driver.local; }
+        tccutil() { echo unexpected >&2; return 99; }
+        cleanup_legacy_local_app "$TEST_LEGACY_APP" 0
+        ''',
+        {"TEST_LEGACY_APP": str(app)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not app.exists()
+    assert "unexpected" not in result.stderr
 
 
 def test_installer_verifies_the_copied_designated_requirement() -> None:
@@ -167,10 +251,12 @@ def test_local_installer_uses_a_separate_macos_identity() -> None:
         Path(__file__).resolve().parents[2] / "scripts" / "_install-local-rust.sh"
     ).read_text()
 
-    assert 'APP_DEST="/Applications/CuaDriverLocal.app"' in script
-    assert 'CFBundleIdentifier -string "com.trycua.driver.local"' in script
+    assert 'APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"' in script
+    assert 'CFBundleIdentifier -string "com.meta.musecode.cua.driver.local"' in script
     assert 'CFBundleExecutable -string "cua-driver-local"' in script
     assert "tccutil reset" not in script
+    assert 'cleanup_legacy_local_app "/Applications/CuaDriverLocal.app" 1' in script
+    assert '"/Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local"' in script
 
 
 def test_unix_local_installer_uses_separate_paths_and_autostart() -> None:
@@ -223,6 +309,6 @@ def test_release_installers_do_not_target_local_product_artifacts() -> None:
     scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
     for name in ("_install-rust.sh", "install.ps1"):
         script = (scripts_dir / name).read_text()
-        assert "CuaDriverLocal" not in script
+        assert "MuseCodeCuaDriverLocal" not in script
         assert ".cua-driver-local" not in script
         assert "cua-driver-local-serve" not in script

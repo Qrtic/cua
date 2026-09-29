@@ -141,12 +141,12 @@ CHANNEL_EXPLICIT=0
 
 # macOS-only: name and install location of the .app bundle that wraps
 # the bare binary so the TCC auto-relaunch path in `cua-driver mcp` has
-# a stable bundle id (com.trycua.driver) to attribute the daemon to.
+# a stable bundle id (com.meta.musecode.cua.driver) to attribute the daemon to.
 # See libs/cua-driver/rust/scripts/CuaDriverBundle/Contents/Info.plist and
 # the matching docs on `cua-driver mcp`'s auto-relaunch behavior.
-# Identical to the Swift driver's CuaDriver.app + com.trycua.driver
-# pair — the Rust port replaces the Swift install at this path,
-# preserving TCC grants (they're keyed on bundle id, which we share).
+# The retired Swift driver used the same path with `com.trycua.driver`.
+# Replacing it with the Muse Code bundle ID is an identity migration: the app
+# path remains stable, but TCC grants must be requested for the new identity.
 APP_NAME="CuaDriver.app"
 APP_DEST="/Applications/$APP_NAME"
 
@@ -216,7 +216,7 @@ macos_requirement_compatibility() {
 # newly installed bundle has been verified and registered with LaunchServices.
 macos_reset_tcc_after_requirement_change() {
     local compatibility="$1"
-    local bundle_id="com.trycua.driver"
+    local bundle_id="com.meta.musecode.cua.driver"
     local failed_services=""
     local service
 
@@ -814,7 +814,7 @@ version_is_at_least() {
 #   The directory layout includes `CuaDriver.app/` alongside the bare
 #   binary, which we need to install into /Applications so the TCC
 #   auto-relaunch path in `cua-driver-rs mcp` can resolve
-#   `com.trycua.driver` via `open -n -g -a CuaDriver`. The
+#   `com.meta.musecode.cua.driver` via `open -n -g -a CuaDriver`. The
 #   directory variant carries the same universal binary as the
 #   bare-binary tarball, so users on both Apple Silicon and Intel
 #   get a working install from one download.
@@ -1027,10 +1027,11 @@ fi
 # `/Applications/CuaDriver.app/Contents/MacOS/cua-driver`. The
 # `realpath` walk in `is_executable_inside_cuadriver_app()` keys on
 # that resolved path to know whether the auto-relaunch heuristic
-# should fire. Same path and same bundle id as the Swift `cua-driver`
-# install (`/Applications/CuaDriver.app`, `com.trycua.driver`). The installer
-# also proves whether the replacement satisfies the previous app's designated
-# requirement; the bundle identifier alone is not enough to preserve TCC.
+# should fire. It retains the Swift `cua-driver` install path
+# (`/Applications/CuaDriver.app`) but adopts a new Muse Code-owned bundle ID.
+# Signing-requirement compatibility is evaluated only when replacing another
+# build of `com.meta.musecode.cua.driver`; legacy `com.trycua.driver` grants do
+# not transfer across the identity migration.
 #
 # The macOS path intentionally does NOT use the
 # $HOME_DIR/packages/releases/<v>/ + current symlink layout used on
@@ -1075,7 +1076,7 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
     fi
     STAGED_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
         "$SRC_APP/Contents/Info.plist" 2>/dev/null || true)
-    if [[ "$STAGED_BUNDLE_ID" != "com.trycua.driver" ]]; then
+    if [[ "$STAGED_BUNDLE_ID" != "com.meta.musecode.cua.driver" ]]; then
         err "downloaded app has unexpected bundle id ${STAGED_BUNDLE_ID:-<missing>}; the installed app was not changed"
         exit 1
     fi
@@ -1085,21 +1086,25 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
         exit 1
     fi
 
-    REPLACED_SWIFT=0
+    REPLACED_CANONICAL=0
+    MIGRATED_LEGACY_ID=0
     PREVIOUS_REQUIREMENT=""
     REQUIREMENT_COMPATIBILITY="unknown"
     if [[ -e "$APP_DEST" ]]; then
         PREV_BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_DEST/Contents/Info.plist" 2>/dev/null || true)
         PREV_BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DEST/Contents/Info.plist" 2>/dev/null || true)
-        if [[ "$PREV_BUNDLE_ID" == "com.trycua.driver" ]] && [[ -n "$PREV_BUNDLE_VERSION" ]]; then
+        if [[ "$PREV_BUNDLE_ID" == "com.meta.musecode.cua.driver" ]] && [[ -n "$PREV_BUNDLE_VERSION" ]]; then
             log "replacing existing cua-driver at $APP_DEST (${PREV_BUNDLE_ID}, version ${PREV_BUNDLE_VERSION})"
-            REPLACED_SWIFT=1
+            REPLACED_CANONICAL=1
+        elif [[ "$PREV_BUNDLE_ID" == "com.trycua.driver" ]]; then
+            log "replacing legacy CuaDriver.app identity ${PREV_BUNDLE_ID}; fresh macOS permissions will be required"
+            MIGRATED_LEGACY_ID=1
         elif [[ -n "$PREV_BUNDLE_ID" ]]; then
             log "replacing existing $APP_DEST (bundle id $PREV_BUNDLE_ID)"
         else
             log "removing existing $APP_DEST"
         fi
-        if [[ "$PREV_BUNDLE_ID" == "com.trycua.driver" ]] \
+        if [[ "$PREV_BUNDLE_ID" == "com.meta.musecode.cua.driver" ]] \
            && codesign --verify --deep --strict "$APP_DEST" 2>/dev/null; then
             PREVIOUS_REQUIREMENT="$(macos_designated_requirement "$APP_DEST" || true)"
             if [[ -n "$PREVIOUS_REQUIREMENT" ]]; then
@@ -1108,10 +1113,10 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
             else
                 log "warning: could not read the existing app's designated requirement; preserving TCC rows because compatibility is unknown"
             fi
-        elif [[ "$PREV_BUNDLE_ID" == "com.trycua.driver" ]]; then
+        elif [[ "$PREV_BUNDLE_ID" == "com.meta.musecode.cua.driver" ]]; then
             log "warning: existing CuaDriver.app signature could not be verified; preserving TCC rows because compatibility is unknown"
         else
-            log "warning: the existing app does not own com.trycua.driver; it will not be used to decide whether Cua Driver TCC rows are stale"
+            log "warning: the existing app does not own com.meta.musecode.cua.driver; it will not be used to decide whether Cua Driver TCC rows are stale"
         fi
     fi
 
@@ -1367,7 +1372,7 @@ echo ""
 echo "cua-driver-rs $VERSION installed."
 echo ""
 
-if [[ "${REPLACED_SWIFT:-0}" == "1" ]]; then
+if [[ "${REPLACED_CANONICAL:-0}" == "1" ]]; then
     echo "Upgraded the cua-driver bundle that was previously at $APP_DEST."
     case "${REQUIREMENT_COMPATIBILITY:-unknown}" in
         compatible)
@@ -1385,6 +1390,13 @@ if [[ "${REPLACED_SWIFT:-0}" == "1" ]]; then
             echo "TCC rows were left unchanged to avoid destroying valid grants."
             ;;
     esac
+    echo ""
+fi
+
+if [[ "${MIGRATED_LEGACY_ID:-0}" == "1" ]]; then
+    echo "Migrated CuaDriver.app from com.trycua.driver to com.meta.musecode.cua.driver."
+    echo "The bundle identity changed, so authorize Accessibility and Screen Recording"
+    echo "for the new Muse Code Driver identity. Legacy TCC rows were not modified."
     echo ""
 fi
 

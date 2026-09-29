@@ -149,8 +149,8 @@ pub(crate) fn direct_capture_evidence_store_for_bundle(
     home: &Path,
 ) -> Option<DirectCaptureEvidenceStore> {
     let state_directory = match bundle_id {
-        "com.trycua.driver.local" => ".cua-driver-local",
-        "com.trycua.driver" => ".cua-driver",
+        "com.meta.musecode.cua.driver.local" => ".cua-driver-local",
+        "com.meta.musecode.cua.driver" => ".cua-driver",
         _ => return None,
     };
     Some(DirectCaptureEvidenceStore::new(
@@ -200,7 +200,7 @@ fn write_json_atomic(path: &Path, value: &PersistedVerification) -> Result<(), S
 mod tests {
     use super::*;
 
-    const RELEASE_BUNDLE_ID: &str = "com.trycua.driver";
+    const RELEASE_BUNDLE_ID: &str = "com.meta.musecode.cua.driver";
     const VERIFIED_AT: i64 = 1_754_352_000;
 
     fn store(path: PathBuf) -> DirectCaptureEvidenceStore {
@@ -281,7 +281,7 @@ mod tests {
                 ..valid.clone()
             },
             PersistedVerification {
-                bundle_id: "com.trycua.driver.local".to_owned(),
+                bundle_id: "com.meta.musecode.cua.driver.local".to_owned(),
                 ..valid
             },
         ];

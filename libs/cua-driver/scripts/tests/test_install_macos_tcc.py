@@ -54,12 +54,12 @@ def test_semantically_compatible_requirement_preserves_tcc_rows() -> None:
         codesign() {
             [[ "$1" == "--verify" ]]
             [[ "$4" == '-R' ]]
-            [[ "$5" == '=identifier "com.trycua.driver" and anchor apple generic' ]]
+            [[ "$5" == '=identifier "com.meta.musecode.cua.driver" and anchor apple generic' ]]
             [[ "$6" == '/replacement.app' ]]
         }
         tccutil() { echo unexpected >&2; return 99; }
         compatibility="$(macos_requirement_compatibility \
-            'identifier "com.trycua.driver" and anchor apple generic' \
+            'identifier "com.meta.musecode.cua.driver" and anchor apple generic' \
             /replacement.app)"
         [[ "$compatibility" == compatible ]]
         macos_reset_tcc_after_requirement_change "$compatibility"
@@ -89,8 +89,8 @@ def test_incompatible_requirement_resets_only_driver_permissions() -> None:
     assert result.stdout == (
         "log: the app signing requirement changed; cleared stale Accessibility and Screen Recording rows\n"
         "log: macOS authorization is required again: cua-driver permissions grant\n"
-        "reset:Accessibility:com.trycua.driver\n"
-        "reset:ScreenCapture:com.trycua.driver\n"
+        "reset:Accessibility:com.meta.musecode.cua.driver\n"
+        "reset:ScreenCapture:com.meta.musecode.cua.driver\n"
     )
 
 
@@ -143,8 +143,8 @@ def test_reset_failure_is_actionable_and_returns_failure() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "could not reset these TCC services" in result.stderr
-    assert "tccutil reset Accessibility com.trycua.driver" in result.stderr
-    assert "tccutil reset ScreenCapture com.trycua.driver" in result.stderr
+    assert "tccutil reset Accessibility com.meta.musecode.cua.driver" in result.stderr
+    assert "tccutil reset ScreenCapture com.meta.musecode.cua.driver" in result.stderr
 
 
 def test_installer_verifies_then_registers_before_any_tcc_reset() -> None:
@@ -167,9 +167,21 @@ def test_only_the_release_bundle_identity_can_trigger_a_tcc_reset() -> None:
     source = INSTALLER.read_text()
 
     assert 'STAGED_BUNDLE_ID' in source
-    assert 'STAGED_BUNDLE_ID" != "com.trycua.driver"' in source
-    assert '[[ "$PREV_BUNDLE_ID" == "com.trycua.driver" ]]' in source
+    assert 'STAGED_BUNDLE_ID" != "com.meta.musecode.cua.driver"' in source
+    assert '[[ "$PREV_BUNDLE_ID" == "com.meta.musecode.cua.driver" ]]' in source
     assert 'INSTALLED_BUNDLE_ID" == "$STAGED_BUNDLE_ID"' in source
+
+
+def test_legacy_release_identity_is_an_explicit_fresh_permission_migration() -> None:
+    source = INSTALLER.read_text()
+
+    assert 'elif [[ "$PREV_BUNDLE_ID" == "com.trycua.driver" ]]' in source
+    assert "MIGRATED_LEGACY_ID=1" in source
+    assert (
+        "Migrated CuaDriver.app from com.trycua.driver to "
+        "com.meta.musecode.cua.driver."
+    ) in source
+    assert "Legacy TCC rows were not modified." in source
 
 
 def test_exit_cleanup_restores_the_previous_app(tmp_path: Path) -> None:
