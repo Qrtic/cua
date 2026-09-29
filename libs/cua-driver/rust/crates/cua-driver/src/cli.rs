@@ -3508,6 +3508,7 @@ fn build_attestation() -> serde_json::Value {
         "binary_version": option_env!("CUA_DRIVER_RELEASE_VERSION")
             .unwrap_or(env!("CARGO_PKG_VERSION")),
         "source_sha": option_env!("CUA_DRIVER_SOURCE_SHA"),
+        "production_team_id": option_env!("CUA_DRIVER_PRODUCTION_TEAM_ID"),
         "bundle_id": crate::bundle::bundle_id(),
         "plugin_managed": crate::bundle::is_plugin_managed_app(),
     })
@@ -7103,6 +7104,10 @@ mod tests {
         assert_eq!(
             attestation["source_sha"],
             serde_json::json!(option_env!("CUA_DRIVER_SOURCE_SHA"))
+        );
+        assert_eq!(
+            attestation["production_team_id"],
+            serde_json::json!(option_env!("CUA_DRIVER_PRODUCTION_TEAM_ID"))
         );
         assert!(attestation["bundle_id"].is_string());
         assert!(attestation["plugin_managed"].is_boolean());

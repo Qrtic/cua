@@ -18,8 +18,29 @@ use cua_driver_core::tool::ToolRegistry;
 
 static HISTORY_ADMITTED: AtomicBool = AtomicBool::new(false);
 static DAEMON_LAUNCH_STATE: OnceLock<Mutex<DaemonLaunchState>> = OnceLock::new();
+
 #[cfg(target_os = "macos")]
-const RELEASE_TEAM_IDENTIFIER: &str = "YCK386LBJ7";
+fn valid_production_team_identifier(value: &str) -> bool {
+    value.len() == 10
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+#[cfg(target_os = "macos")]
+fn production_team_identifier() -> anyhow::Result<&'static str> {
+    let value = option_env!("CUA_DRIVER_PRODUCTION_TEAM_ID").ok_or_else(|| {
+        anyhow::anyhow!(
+            "production Computer History requires CUA_DRIVER_PRODUCTION_TEAM_ID at build time"
+        )
+    })?;
+    if !valid_production_team_identifier(value) {
+        anyhow::bail!(
+            "CUA_DRIVER_PRODUCTION_TEAM_ID must be a 10-character uppercase Apple Team ID"
+        );
+    }
+    Ok(value)
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DaemonLaunchState {
@@ -282,13 +303,18 @@ pub fn verify_installed_app_for_history() -> anyhow::Result<()> {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
+    let expected_release_team = if crate::bundle::state_namespace() == "cua-driver" {
+        Some(production_team_identifier()?)
+    } else {
+        None
+    };
     validate_history_app_signature(
         &stderr,
         &requirement,
         team_identifier,
         &compact,
         crate::bundle::bundle_id(),
-        crate::bundle::state_namespace() == "cua-driver",
+        expected_release_team,
     )
 }
 
@@ -299,7 +325,7 @@ fn validate_history_app_signature(
     team_identifier: &str,
     compact_entitlements: &str,
     bundle_id: &str,
-    require_release_entitlements: bool,
+    expected_release_team: Option<&str>,
 ) -> anyhow::Result<()> {
     let expected = format!("Identifier={bundle_id}");
     if !detail.lines().any(|line| line.trim() == expected) {
@@ -314,13 +340,13 @@ fn validate_history_app_signature(
     // designated requirement but no Apple TeamIdentifier. That leaf pins local
     // history to the same signing identity across rebuilds. Production still
     // requires the exact Apple team and device-protected Keychain entitlements.
-    if !require_release_entitlements {
+    let Some(expected_release_team) = expected_release_team else {
         return Ok(());
-    }
+    };
     if team_identifier.is_empty() || team_identifier == "not set" {
         anyhow::bail!("installed Cua Driver signature has no team identifier");
     }
-    if team_identifier != RELEASE_TEAM_IDENTIFIER {
+    if team_identifier != expected_release_team {
         anyhow::bail!("installed Cua Driver signature does not match the release signing team");
     }
     if !requirement.contains("anchor apple generic") {
@@ -505,6 +531,9 @@ fn platform_application_identity_provider() -> std::sync::Arc<dyn ApplicationIde
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    const TEST_TEAM_IDENTIFIER: &str = "TEAM123456";
+
     #[test]
     fn default_root_is_namespace_specific() {
         let root = history_root();
@@ -584,7 +613,7 @@ mod tests {
             "",
             "",
             "com.meta.musecode.cua.driver.local",
-            false,
+            None,
         )
         .unwrap();
     }
@@ -598,7 +627,7 @@ mod tests {
             "TEAM123",
             "",
             "com.meta.musecode.cua.driver.local",
-            false,
+            None,
         );
         assert!(adhoc.is_err());
         let wrong_bundle = validate_history_app_signature(
@@ -607,7 +636,7 @@ mod tests {
             "TEAM123",
             "",
             "com.meta.musecode.cua.driver.local",
-            false,
+            None,
         );
         assert!(wrong_bundle.is_err());
     }
@@ -621,34 +650,34 @@ mod tests {
             "",
             "",
             "com.meta.musecode.cua.driver",
-            true,
+            Some(TEST_TEAM_IDENTIFIER),
         )
         .is_err());
         let detail = format!(
-            "Identifier=com.meta.musecode.cua.driver\nTeamIdentifier={RELEASE_TEAM_IDENTIFIER}"
+            "Identifier=com.meta.musecode.cua.driver\nTeamIdentifier={TEST_TEAM_IDENTIFIER}"
         );
         let requirement = format!(
-            "designated => anchor apple generic and identifier \"com.meta.musecode.cua.driver\" and certificate leaf[subject.OU] = {RELEASE_TEAM_IDENTIFIER}"
+            "designated => anchor apple generic and identifier \"com.meta.musecode.cua.driver\" and certificate leaf[subject.OU] = {TEST_TEAM_IDENTIFIER}"
         );
         assert!(validate_history_app_signature(
             &detail,
             &requirement,
-            RELEASE_TEAM_IDENTIFIER,
+            TEST_TEAM_IDENTIFIER,
             "",
             "com.meta.musecode.cua.driver",
-            true,
+            Some(TEST_TEAM_IDENTIFIER),
         )
         .is_err());
         let entitlements = format!(
-            "<key>com.apple.application-identifier</key><string>{RELEASE_TEAM_IDENTIFIER}.com.meta.musecode.cua.driver</string><key>keychain-access-groups</key><array><string>{RELEASE_TEAM_IDENTIFIER}.com.meta.musecode.cua.driver</string></array>"
+            "<key>com.apple.application-identifier</key><string>{TEST_TEAM_IDENTIFIER}.com.meta.musecode.cua.driver</string><key>keychain-access-groups</key><array><string>{TEST_TEAM_IDENTIFIER}.com.meta.musecode.cua.driver</string></array>"
         );
         validate_history_app_signature(
             &detail,
             &requirement,
-            RELEASE_TEAM_IDENTIFIER,
+            TEST_TEAM_IDENTIFIER,
             &entitlements,
             "com.meta.musecode.cua.driver",
-            true,
+            Some(TEST_TEAM_IDENTIFIER),
         )
         .unwrap();
 
@@ -658,8 +687,17 @@ mod tests {
             "OTHERTEAM",
             "<key>com.apple.application-identifier</key><string>OTHERTEAM.com.meta.musecode.cua.driver</string><key>keychain-access-groups</key><array><string>OTHERTEAM.com.meta.musecode.cua.driver</string></array>",
             "com.meta.musecode.cua.driver",
-            true,
+            Some(TEST_TEAM_IDENTIFIER),
         )
         .is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn production_team_identifier_format_is_strict() {
+        assert!(valid_production_team_identifier(TEST_TEAM_IDENTIFIER));
+        assert!(!valid_production_team_identifier("YCK386LBJ7-extra"));
+        assert!(!valid_production_team_identifier("team123456"));
+        assert!(!valid_production_team_identifier("SHORT"));
     }
 }

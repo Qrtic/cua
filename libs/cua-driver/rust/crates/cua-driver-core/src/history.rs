@@ -1019,15 +1019,20 @@ impl HistoryManager {
         if slot.is_some() {
             return Ok(());
         }
-        self.ensure_session_id_key()?;
         let writer_lease = WriterLease::acquire(&self.config.root)?;
         prune_expired_chunks(&self.config.root, self.config.retention_days)?;
+        // Read every existing chunk before creating or caching a namespace key.
+        // A signing-identity or Keychain access-group migration can make an
+        // existing key temporarily unavailable. Creating a replacement key in
+        // that state would reuse the same logical reference while permanently
+        // making the existing ciphertext unreadable.
         let existing = HistoryStore::read_all(
             &self.config.root,
             &self.config.namespace,
             self.key_provider.as_ref(),
             self.config.quota_bytes,
         )?;
+        self.ensure_session_id_key()?;
         let max_sequence = existing
             .iter()
             .map(|event| event.data.sequence)
@@ -3310,6 +3315,23 @@ mod tests {
         assert!(events
             .windows(2)
             .all(|pair| pair[0].data.sequence < pair[1].data.sequence));
+    }
+
+    #[test]
+    fn inaccessible_existing_history_never_creates_a_replacement_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeyProvider::default());
+        let first = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        first.enable().unwrap();
+        first.disable().unwrap();
+        drop(first);
+
+        keys.keys.lock().unwrap().clear();
+        let second = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        let error = second.enable().unwrap_err();
+
+        assert_eq!(error.category, HistoryHealthCategory::KeyUnavailable);
+        assert!(keys.keys.lock().unwrap().is_empty());
     }
 
     #[test]
