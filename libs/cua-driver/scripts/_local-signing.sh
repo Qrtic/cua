@@ -145,7 +145,7 @@ ad_hoc_requirement_changed() {
 reset_local_tcc_after_ad_hoc_change() {
     local previous_requirement="$1"
     local installed_requirement="$2"
-    local bundle_id="com.trycua.driver.local"
+    local bundle_id="com.meta.musecode.cua.driver.local"
     local service failed_services=""
 
     ad_hoc_requirement_changed "$previous_requirement" "$installed_requirement" || return 0
@@ -213,7 +213,7 @@ sign_staged_local_app() {
     clean_partial_bundle_signature "$app_stage"
     if ! codesign_bounded 20 --force --deep --sign - "$app_stage" 2>/dev/null; then
         clean_partial_bundle_signature "$app_stage"
-        echo "${RED}Error: codesign of staged CuaDriverLocal.app failed; live installation was not changed.${NORMAL}" >&2
+        echo "${RED}Error: codesign of staged MuseCodeCuaDriverLocal.app failed; live installation was not changed.${NORMAL}" >&2
         return 1
     fi
     requirement="$(designated_requirement "$app_stage")"
@@ -221,7 +221,7 @@ sign_staged_local_app() {
         echo "${RED}Error: could not verify the staged app's ad-hoc designated requirement; live installation was not changed.${NORMAL}" >&2
         return 1
     fi
-    echo "${YELLOW}WARNING: CuaDriverLocal.app was signed ad-hoc (designated requirement uses cdhash).${NORMAL}" >&2
+    echo "${YELLOW}WARNING: MuseCodeCuaDriverLocal.app was signed ad-hoc (designated requirement uses cdhash).${NORMAL}" >&2
     echo "${YELLOW}Accessibility and Screen Recording grants WILL become invalid on the next rebuild.${NORMAL}" >&2
     print_local_signing_bootstrap
 }

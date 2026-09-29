@@ -16,9 +16,9 @@ pub const RELEASE_CLI_NAME: &str = "cua-driver";
 pub const LOCAL_CLI_NAME: &str = "cua-driver-local";
 
 pub const RELEASE_APP_NAME: &str = "CuaDriver";
-pub const LOCAL_APP_NAME: &str = "CuaDriverLocal";
-pub const RELEASE_BUNDLE_ID: &str = "com.trycua.driver";
-pub const LOCAL_BUNDLE_ID: &str = "com.trycua.driver.local";
+pub const LOCAL_APP_NAME: &str = "MuseCodeCuaDriverLocal";
+pub const RELEASE_BUNDLE_ID: &str = "com.meta.musecode.cua.driver";
+pub const LOCAL_BUNDLE_ID: &str = "com.meta.musecode.cua.driver.local";
 
 pub(crate) fn path_is_local(path: &Path) -> bool {
     #[cfg(target_os = "macos")]
@@ -166,7 +166,7 @@ mod tests {
         )));
         assert!(!path_is_local(Path::new("/tmp/cua-driver-local-test")));
         assert!(!path_is_local(Path::new(
-            "/tmp/CuaDriverLocal.app/Contents/MacOS/unrelated"
+            "/tmp/MuseCodeCuaDriverLocal.app/Contents/MacOS/unrelated"
         )));
     }
 
@@ -248,7 +248,7 @@ mod tests {
                 ("cua.app", LOCAL_BUNDLE_ID, LOCAL_CLI_NAME, true),
                 ("Renamed.app", RELEASE_BUNDLE_ID, RELEASE_CLI_NAME, false),
                 (
-                    "CuaDriverLocal.app",
+                    "MuseCodeCuaDriverLocal.app",
                     RELEASE_BUNDLE_ID,
                     RELEASE_CLI_NAME,
                     false,

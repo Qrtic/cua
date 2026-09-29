@@ -579,11 +579,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn local_history_accepts_certificate_identity_without_apple_team_identifier() {
         validate_history_app_signature(
-            "Identifier=com.trycua.driver.local\nTeamIdentifier=not set",
-            "designated => identifier \"com.trycua.driver.local\" and certificate leaf = H\"d2badc24c61056ede3b61724c54c5a7d1649ce4d\"",
+            "Identifier=com.meta.musecode.cua.driver.local\nTeamIdentifier=not set",
+            "designated => identifier \"com.meta.musecode.cua.driver.local\" and certificate leaf = H\"d2badc24c61056ede3b61724c54c5a7d1649ce4d\"",
             "",
             "",
-            "com.trycua.driver.local",
+            "com.meta.musecode.cua.driver.local",
             false,
         )
         .unwrap();
@@ -593,20 +593,20 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn history_admission_rejects_adhoc_or_wrong_bundle_identity() {
         let adhoc = validate_history_app_signature(
-            "Identifier=com.trycua.driver.local\nTeamIdentifier=TEAM123",
+            "Identifier=com.meta.musecode.cua.driver.local\nTeamIdentifier=TEAM123",
             "designated => cdhash H\"1234\"",
             "TEAM123",
             "",
-            "com.trycua.driver.local",
+            "com.meta.musecode.cua.driver.local",
             false,
         );
         assert!(adhoc.is_err());
         let wrong_bundle = validate_history_app_signature(
-            "Identifier=com.trycua.driver\nTeamIdentifier=TEAM123",
-            "designated => identifier \"com.trycua.driver\" and certificate leaf[subject.OU] = TEAM123",
+            "Identifier=com.meta.musecode.cua.driver\nTeamIdentifier=TEAM123",
+            "designated => identifier \"com.meta.musecode.cua.driver\" and certificate leaf[subject.OU] = TEAM123",
             "TEAM123",
             "",
-            "com.trycua.driver.local",
+            "com.meta.musecode.cua.driver.local",
             false,
         );
         assert!(wrong_bundle.is_err());
@@ -616,47 +616,48 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn release_history_still_requires_device_protected_keychain_entitlements() {
         assert!(validate_history_app_signature(
-            "Identifier=com.trycua.driver\nTeamIdentifier=not set",
-            "designated => anchor apple generic and identifier \"com.trycua.driver\" and certificate leaf = H\"1234\"",
+            "Identifier=com.meta.musecode.cua.driver\nTeamIdentifier=not set",
+            "designated => anchor apple generic and identifier \"com.meta.musecode.cua.driver\" and certificate leaf = H\"1234\"",
             "",
             "",
-            "com.trycua.driver",
+            "com.meta.musecode.cua.driver",
             true,
         )
         .is_err());
-        let detail =
-            format!("Identifier=com.trycua.driver\nTeamIdentifier={RELEASE_TEAM_IDENTIFIER}");
+        let detail = format!(
+            "Identifier=com.meta.musecode.cua.driver\nTeamIdentifier={RELEASE_TEAM_IDENTIFIER}"
+        );
         let requirement = format!(
-            "designated => anchor apple generic and identifier \"com.trycua.driver\" and certificate leaf[subject.OU] = {RELEASE_TEAM_IDENTIFIER}"
+            "designated => anchor apple generic and identifier \"com.meta.musecode.cua.driver\" and certificate leaf[subject.OU] = {RELEASE_TEAM_IDENTIFIER}"
         );
         assert!(validate_history_app_signature(
             &detail,
             &requirement,
             RELEASE_TEAM_IDENTIFIER,
             "",
-            "com.trycua.driver",
+            "com.meta.musecode.cua.driver",
             true,
         )
         .is_err());
         let entitlements = format!(
-            "<key>com.apple.application-identifier</key><string>{RELEASE_TEAM_IDENTIFIER}.com.trycua.driver</string><key>keychain-access-groups</key><array><string>{RELEASE_TEAM_IDENTIFIER}.com.trycua.driver</string></array>"
+            "<key>com.apple.application-identifier</key><string>{RELEASE_TEAM_IDENTIFIER}.com.meta.musecode.cua.driver</string><key>keychain-access-groups</key><array><string>{RELEASE_TEAM_IDENTIFIER}.com.meta.musecode.cua.driver</string></array>"
         );
         validate_history_app_signature(
             &detail,
             &requirement,
             RELEASE_TEAM_IDENTIFIER,
             &entitlements,
-            "com.trycua.driver",
+            "com.meta.musecode.cua.driver",
             true,
         )
         .unwrap();
 
         assert!(validate_history_app_signature(
-            "Identifier=com.trycua.driver\nTeamIdentifier=OTHERTEAM",
-            "designated => identifier \"com.trycua.driver\" and certificate leaf[subject.OU] = OTHERTEAM",
+            "Identifier=com.meta.musecode.cua.driver\nTeamIdentifier=OTHERTEAM",
+            "designated => identifier \"com.meta.musecode.cua.driver\" and certificate leaf[subject.OU] = OTHERTEAM",
             "OTHERTEAM",
-            "<key>com.apple.application-identifier</key><string>OTHERTEAM.com.trycua.driver</string><key>keychain-access-groups</key><array><string>OTHERTEAM.com.trycua.driver</string></array>",
-            "com.trycua.driver",
+            "<key>com.apple.application-identifier</key><string>OTHERTEAM.com.meta.musecode.cua.driver</string><key>keychain-access-groups</key><array><string>OTHERTEAM.com.meta.musecode.cua.driver</string></array>",
+            "com.meta.musecode.cua.driver",
             true,
         )
         .is_err());

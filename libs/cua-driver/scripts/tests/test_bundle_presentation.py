@@ -16,9 +16,9 @@ class BundlePresentationTest(unittest.TestCase):
 
     def test_display_name_and_permission_copy(self):
         for key in ("CFBundleName", "CFBundleDisplayName"):
-            self.assertEqual(self.info[key], "cua")
+            self.assertEqual(self.info[key], "Computer Use")
         for key in ("NSScreenCaptureUsageDescription", "NSAppleEventsUsageDescription"):
-            self.assertTrue(self.info[key].startswith("cua "))
+            self.assertTrue(self.info[key].startswith("Computer Use "))
 
     def test_no_custom_icon_in_template(self):
         self.assertFalse(any(key.startswith("CFBundleIcon") for key in self.info))
@@ -28,9 +28,9 @@ class BundlePresentationTest(unittest.TestCase):
         }
         self.assertEqual(files, {"Contents/Info.plist", "Contents/MacOS/.gitkeep"})
 
-    def test_runtime_identity_and_capabilities_are_unchanged(self):
+    def test_runtime_identity_and_capabilities_match_muse_code(self):
         expected = {
-            "CFBundleIdentifier": "com.trycua.driver",
+            "CFBundleIdentifier": "com.meta.musecode.cua.driver",
             "CFBundleExecutable": "cua-driver",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "0.0.0-dev",
@@ -49,11 +49,11 @@ class BundlePresentationTest(unittest.TestCase):
         for key, value in {
             "CFBundleName": "cua",
             "CFBundleDisplayName": "cua",
-            "CFBundleIdentifier": "com.trycua.driver.local",
+            "CFBundleIdentifier": "com.meta.musecode.cua.driver.local",
             "CFBundleExecutable": "cua-driver-local",
         }.items():
             self.assertIn(f'plutil -replace {key} -string "{value}"', source)
-        self.assertIn('APP_DEST="/Applications/CuaDriverLocal.app"', source)
+        self.assertIn('APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"', source)
 
 
 if __name__ == "__main__":

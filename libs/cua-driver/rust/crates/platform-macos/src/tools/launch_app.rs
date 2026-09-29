@@ -398,7 +398,10 @@ fn contains_remote_debugging_flag(value: &str) -> bool {
 }
 
 fn is_cua_driver_bundle_id(bundle_id: &str) -> bool {
-    matches!(bundle_id, "com.trycua.driver" | "com.trycua.driver.local")
+    matches!(
+        bundle_id,
+        "com.meta.musecode.cua.driver" | "com.meta.musecode.cua.driver.local"
+    )
 }
 
 fn protected_host_launch_refusal() -> ToolResult {
@@ -690,8 +693,10 @@ mod tests {
 
     #[test]
     fn recognizes_release_and_local_protected_host_bundle_ids() {
-        assert!(is_cua_driver_bundle_id("com.trycua.driver"));
-        assert!(is_cua_driver_bundle_id("com.trycua.driver.local"));
+        assert!(is_cua_driver_bundle_id("com.meta.musecode.cua.driver"));
+        assert!(is_cua_driver_bundle_id(
+            "com.meta.musecode.cua.driver.local"
+        ));
         assert!(!is_cua_driver_bundle_id("com.trycua.harness.tauri"));
     }
 
@@ -766,7 +771,7 @@ mod tests {
         }
 
         let result = LaunchAppTool
-            .invoke(json!({ "bundle_id": "com.trycua.driver" }))
+            .invoke(json!({ "bundle_id": "com.meta.musecode.cua.driver" }))
             .await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(

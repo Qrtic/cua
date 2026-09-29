@@ -25,7 +25,7 @@ OS="$(uname -s 2>/dev/null || echo unknown)"
 HOME_DIR="${CUA_DRIVER_LOCAL_HOME:-$HOME/.cua-driver-local}"
 BIN_DIR="${CUA_DRIVER_LOCAL_INSTALL_DIR:-$HOME/.local/bin}"
 CLI_LINK="$BIN_DIR/cua-driver-local"
-APP_BUNDLE="/Applications/CuaDriverLocal.app"
+APP_BUNDLE="/Applications/MuseCodeCuaDriverLocal.app"
 if [[ "$OS" == "Darwin" ]]; then
     CACHE_DIR="$HOME/Library/Caches/cua-driver-local"
 else
@@ -50,7 +50,7 @@ case "$BIN_DIR" in
 esac
 
 if [[ "$VALIDATE_ONLY" == "1" ]]; then
-    printf 'cli=%s\nhome=%s\ncache=%s\napp=%s\nbundle=com.trycua.driver.local\nlaunchagent=%s\nsystemd=%s\n' \
+    printf 'cli=%s\nhome=%s\ncache=%s\napp=%s\nbundle=com.meta.musecode.cua.driver.local\nlaunchagent=%s\nsystemd=%s\n' \
         "$CLI_LINK" "$HOME_DIR" "$CACHE_DIR" "$APP_BUNDLE" "$LAUNCHAGENT" "$SYSTEMD_UNIT"
     exit 0
 fi
@@ -111,9 +111,9 @@ if [[ "$OS" == "Darwin" && "$RESET_TCC" == "1" ]] && command -v tccutil >/dev/nu
         [[ ! -x "$LSREGISTER" ]] || "$LSREGISTER" -f "$APP_BUNDLE" >/dev/null 2>&1 || true
     fi
     for service in Accessibility ScreenCapture AppleEvents; do
-        tccutil reset "$service" com.trycua.driver.local >/dev/null 2>&1 || true
+        tccutil reset "$service" com.meta.musecode.cua.driver.local >/dev/null 2>&1 || true
     done
-    log "revoked TCC grants for com.trycua.driver.local"
+    log "revoked TCC grants for com.meta.musecode.cua.driver.local"
 fi
 
 # Remove the CLI only if it is an installer-created link into the local product.

@@ -134,8 +134,8 @@ def test_local_uninstall_contract_is_explicit_on_both_platforms() -> None:
     windows = (SCRIPTS / "uninstall-local.ps1").read_text(encoding="utf-8-sig")
 
     for token in (
-        "/Applications/CuaDriverLocal.app",
-        "com.trycua.driver.local",
+        "/Applications/MuseCodeCuaDriverLocal.app",
+        "com.meta.musecode.cua.driver.local",
         ".cua-driver-local",
         "cua-driver-local.service",
         "com.trycua.cua-driver-local.plist",
@@ -190,6 +190,6 @@ def test_unix_local_uninstall_rejects_release_home_override(tmp_path: Path) -> N
 def test_release_uninstallers_do_not_target_local_identity() -> None:
     for name in ("uninstall.sh", "uninstall.ps1"):
         script = (SCRIPTS / name).read_text(encoding="utf-8-sig")
-        assert "CuaDriverLocal" not in script
+        assert "MuseCodeCuaDriverLocal" not in script
         assert ".cua-driver-local" not in script
         assert "cua-driver-local-serve" not in script

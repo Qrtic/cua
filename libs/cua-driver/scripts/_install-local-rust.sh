@@ -30,8 +30,8 @@
 #   ${CUA_DRIVER_LOCAL_INSTALL_DIR:-$HOME/.local/bin}/cua-driver-local
 #
 # macOS layout produced:
-#   /Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local
-#   $HOME/.local/bin/cua-driver-local -> .../CuaDriverLocal.app/Contents/MacOS/cua-driver-local
+#   /Applications/MuseCodeCuaDriverLocal.app/Contents/MacOS/cua-driver-local
+#   $HOME/.local/bin/cua-driver-local -> .../MuseCodeCuaDriverLocal.app/Contents/MacOS/cua-driver-local
 #
 # The version string carries `-local-debug` / `-local-release` so it
 # never collides with a real release dir and is trivial to GC.
@@ -126,7 +126,7 @@ while [ "$#" -gt 0 ]; do
             echo "                  macOS: LaunchAgent under ~/Library/LaunchAgents"
             echo "                  Linux: systemd --user unit"
             echo "                On macOS this also fixes TCC: a launchd-started daemon"
-            echo "                is attributed to com.trycua.driver.local (not your terminal),"
+            echo "                is attributed to com.meta.musecode.cua.driver.local (not your terminal),"
             echo "                so you grant Accessibility + Screen Recording once and"
             echo "                every cua-driver-local call/mcp routes through it correctly."
             echo "  --bin-dir <path>"
@@ -364,10 +364,10 @@ echo ""
 # shellcheck source=_local-signing.sh
 . "$SCRIPT_DIR/_local-signing.sh"
 
-# --- macOS: wrap the binary in CuaDriverLocal.app for a stable TCC identity ---
+# --- macOS: wrap the binary in MuseCodeCuaDriverLocal.app for a stable TCC identity ---
 #
 # TCC keys Accessibility / Screen-Recording grants on the bundle
-# identifier (com.trycua.driver.local), not the bare executable path. A loose
+# identifier (com.meta.musecode.cua.driver.local), not the bare executable path. A loose
 # binary gets grants attributed to its ad-hoc cdhash, which changes on
 # every rebuild — so permissions silently reset and never appear cleanly
 # under System Settings. Mirror the production path (install.sh) + the CD
@@ -375,14 +375,14 @@ echo ""
 # CuaDriverBundle skeleton, install the bundle to /Applications, and point
 # the visible bin at the binary INSIDE the bundle. Linux/Windows have no
 # .app concept and keep the bare-binary symlink below.
-APP_DEST="/Applications/CuaDriverLocal.app"
+APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"
 if [ "$OS" = "Darwin" ]; then
     SKELETON="$REPO_ROOT/scripts/CuaDriverBundle"
     if [ ! -d "$SKELETON/Contents" ]; then
         echo "${RED}Error: bundle skeleton missing at $SKELETON${NORMAL}" >&2
         exit 1
     fi
-    APP_STAGE="$VERSIONED_DIR/CuaDriverLocal.app"
+    APP_STAGE="$VERSIONED_DIR/MuseCodeCuaDriverLocal.app"
     rm -rf "$APP_STAGE"
     mkdir -p "$APP_STAGE/Contents/MacOS"
     cp -R "$SKELETON/Contents/." "$APP_STAGE/Contents/"
@@ -403,7 +403,7 @@ if [ "$OS" = "Darwin" ]; then
             "$APP_STAGE/Contents/Info.plist" 2>/dev/null || true
         plutil -replace CFBundleExecutable -string "cua-driver-local" \
             "$APP_STAGE/Contents/Info.plist"
-        plutil -replace CFBundleIdentifier -string "com.trycua.driver.local" \
+        plutil -replace CFBundleIdentifier -string "com.meta.musecode.cua.driver.local" \
             "$APP_STAGE/Contents/Info.plist"
         plutil -replace CFBundleName -string "cua" \
             "$APP_STAGE/Contents/Info.plist"
@@ -420,13 +420,13 @@ if [ "$OS" = "Darwin" ]; then
             exit 1
         fi
         if ! codesign --verify --deep --strict "$APP_STAGE" 2>/dev/null; then
-            echo "${RED}Error: staged CuaDriverLocal.app failed signature verification; live installation was not changed.${NORMAL}" >&2
+            echo "${RED}Error: staged MuseCodeCuaDriverLocal.app failed signature verification; live installation was not changed.${NORMAL}" >&2
             exit 1
         fi
         STAGED_REQUIREMENT="$(designated_requirement "$APP_STAGE")"
         STAGED_SIGNING_CLASS="$(classify_designated_requirement "$STAGED_REQUIREMENT")"
     else
-        echo "${RED}Error: codesign is required to install CuaDriverLocal.app safely.${NORMAL}" >&2
+        echo "${RED}Error: codesign is required to install MuseCodeCuaDriverLocal.app safely.${NORMAL}" >&2
         exit 1
     fi
 
@@ -456,7 +456,7 @@ if [ "$OS" = "Darwin" ]; then
         if [ -d "$APP_BACKUP" ]; then
             mv "$APP_BACKUP" "$APP_DEST"
         fi
-        echo "${RED}Error: installed CuaDriverLocal.app did not preserve its verified signing identity; restored the previous bundle.${NORMAL}" >&2
+        echo "${RED}Error: installed MuseCodeCuaDriverLocal.app did not preserve its verified signing identity; restored the previous bundle.${NORMAL}" >&2
         exit 1
     fi
     echo "${GREEN}installed $APP_DEST${NORMAL}"
@@ -469,8 +469,8 @@ if [ "$OS" = "Darwin" ]; then
     # --- Force LaunchServices registration of the freshly-copied bundle ----
     #
     # `ditto` drops the bundle on disk, but LaunchServices registers the new
-    # com.trycua.driver.local identity ASYNCHRONOUSLY (seconds later). Until it
-    # does, `open -n -g -a CuaDriverLocal` (what `permissions grant` / MCP use to
+    # com.meta.musecode.cua.driver.local identity ASYNCHRONOUSLY (seconds later). Until it
+    # does, `open -n -g -a MuseCodeCuaDriverLocal` (what `permissions grant` / MCP use to
     # launch the daemon) fails with -1728. A synchronous `lsregister -f` closes
     # that race so both the reset and the first launch resolve the bundle id.
     LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
@@ -483,7 +483,7 @@ fi
 # --- Visible-bin symlink ------------------------------------------------
 #
 # On macOS point at the binary INSIDE the installed bundle so the process
-# that actually runs carries the com.trycua.driver.local identity (TCC keys
+# that actually runs carries the com.meta.musecode.cua.driver.local identity (TCC keys
 # grants on it). On Linux/Windows point at the versioned-store binary.
 mkdir -p "$BIN_DIR"
 if [ "$OS" = "Darwin" ]; then
@@ -635,7 +635,7 @@ if [ "$INSTALL_AUTOSTART" != true ]; then
     echo ""
     if [ "$OS" = "Darwin" ]; then
         echo "Auto-start (recommended on macOS): re-run with --autostart to register a LaunchAgent."
-        echo "  A launchd-started daemon is attributed to com.trycua.driver.local (not your terminal),"
+        echo "  A launchd-started daemon is attributed to com.meta.musecode.cua.driver.local (not your terminal),"
         echo "  so permission prompts say \"cua\" and grants stick — grant Accessibility +"
         echo "  Screen Recording once and every cua-driver-local call/mcp routes through it correctly."
         echo "  (Without it, a prompt raised from a terminal attributes to the terminal instead.)"

@@ -67,7 +67,7 @@ def test_ad_hoc_fallback_is_prominent_and_reports_cdhash() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "WARNING: CuaDriverLocal.app was signed ad-hoc" in result.stderr
+    assert "WARNING: MuseCodeCuaDriverLocal.app was signed ad-hoc" in result.stderr
     assert "WILL become invalid on the next rebuild" in result.stderr
     assert "designated requirement uses cdhash" in result.stderr
 
@@ -108,8 +108,8 @@ def test_changed_ad_hoc_requirement_resets_only_local_driver_services() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == (
-        "reset:Accessibility:com.trycua.driver.local\n"
-        "reset:ScreenCapture:com.trycua.driver.local\n"
+        "reset:Accessibility:com.meta.musecode.cua.driver.local\n"
+        "reset:ScreenCapture:com.meta.musecode.cua.driver.local\n"
     )
     assert "cleared stale Accessibility and Screen Recording rows" in result.stderr
     assert "cua-driver-local permissions grant" in result.stderr
@@ -146,8 +146,8 @@ def test_ad_hoc_tcc_reset_failure_is_actionable_and_fails_closed() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "could not reset these TCC services" in result.stderr
-    assert "tccutil reset Accessibility com.trycua.driver.local" in result.stderr
-    assert "tccutil reset ScreenCapture com.trycua.driver.local" in result.stderr
+    assert "tccutil reset Accessibility com.meta.musecode.cua.driver.local" in result.stderr
+    assert "tccutil reset ScreenCapture com.meta.musecode.cua.driver.local" in result.stderr
 
 
 def test_installer_verifies_the_copied_designated_requirement() -> None:
@@ -167,8 +167,8 @@ def test_local_installer_uses_a_separate_macos_identity() -> None:
         Path(__file__).resolve().parents[2] / "scripts" / "_install-local-rust.sh"
     ).read_text()
 
-    assert 'APP_DEST="/Applications/CuaDriverLocal.app"' in script
-    assert 'CFBundleIdentifier -string "com.trycua.driver.local"' in script
+    assert 'APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"' in script
+    assert 'CFBundleIdentifier -string "com.meta.musecode.cua.driver.local"' in script
     assert 'CFBundleExecutable -string "cua-driver-local"' in script
     assert "tccutil reset" not in script
 
@@ -223,6 +223,6 @@ def test_release_installers_do_not_target_local_product_artifacts() -> None:
     scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
     for name in ("_install-rust.sh", "install.ps1"):
         script = (scripts_dir / name).read_text()
-        assert "CuaDriverLocal" not in script
+        assert "MuseCodeCuaDriverLocal" not in script
         assert ".cua-driver-local" not in script
         assert "cua-driver-local-serve" not in script

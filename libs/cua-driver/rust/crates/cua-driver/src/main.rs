@@ -777,7 +777,7 @@ fn main() {
             // Bind the Unix socket FIRST, on a background thread, BEFORE
             // running the (blocking) permissions gate (#1761).
             //
-            // The gate's `wait_for_grants` blocks while `com.trycua.driver`
+            // The gate's `wait_for_grants` blocks while `com.meta.musecode.cua.driver`
             // is ungranted. Fresh helper processes poll TCC until the user
             // grants or the deadline elapses. If serve ran after the gate,
             // the daemon's socket wouldn't appear for minutes on first

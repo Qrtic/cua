@@ -85,10 +85,14 @@ pub fn driver_app_for_executable(executable: &Path) -> Option<DriverAppIdentity>
     let bundle_executable = string_value("CFBundleExecutable")?;
     let (bundle_id, executable_name, is_local) =
         match (bundle_id.as_str(), bundle_executable.as_str()) {
-            ("com.trycua.driver.local", "cua-driver-local") => {
-                ("com.trycua.driver.local", "cua-driver-local", true)
+            ("com.meta.musecode.cua.driver.local", "cua-driver-local") => (
+                "com.meta.musecode.cua.driver.local",
+                "cua-driver-local",
+                true,
+            ),
+            ("com.meta.musecode.cua.driver", "cua-driver") => {
+                ("com.meta.musecode.cua.driver", "cua-driver", false)
             }
-            ("com.trycua.driver", "cua-driver") => ("com.trycua.driver", "cua-driver", false),
             _ => return None,
         };
     if executable.file_name()? != executable_name {

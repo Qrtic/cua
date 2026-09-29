@@ -43,8 +43,9 @@
 #     - Skill symlinks under ~/.claude/skills/cua-driver(-rs), etc.
 #
 # Shared-path safety: /Applications/CuaDriver.app + its ~/.local/bin
-# symlink use the same bundle id (com.trycua.driver) as the Swift driver,
-# so they're only removed when an unambiguous Rust marker is on disk
+# symlink share the historical Swift install path but use the Muse Code bundle
+# id `com.meta.musecode.cua.driver`, so they're only removed when an
+# unambiguous Rust marker is on disk
 # (~/.cua-driver/packages/, legacy ~/.cua-driver-rs/, CuaDriverRs.app,
 # the LaunchAgent/systemd unit, or current Rust telemetry state).
 #
@@ -326,11 +327,12 @@ reject_root_invocation() {
 }
 
 # TCC revocation is on by default so uninstall leaves the next macOS install
-# in a clean promptable state. The bundle id com.trycua.driver is shared with
-# the retired Swift driver, so `--keep-tcc` remains available for users who
-# intentionally want grants to survive uninstall/reinstall.
+# in a clean promptable state. The retired Swift driver's
+# `com.trycua.driver` rows are a separate legacy identity and are never reset
+# by this uninstaller. `--keep-tcc` remains available for users who
+# intentionally want Muse Code grants to survive uninstall/reinstall.
 # When enabled, revoke Accessibility + Screen-Recording + Automation for
-# com.trycua.driver. macOS-only; no-op elsewhere.
+# com.meta.musecode.cua.driver. macOS-only; no-op elsewhere.
 maybe_reset_tcc() {
     [[ "$RESET_TCC" == "1" ]] || return 0
     if [[ "$OS" != "Darwin" ]]; then
@@ -341,7 +343,7 @@ maybe_reset_tcc() {
         log "TCC reset: tccutil not found; skipping"
         return 0
     fi
-    # `tccutil reset <svc> com.trycua.driver` resolves the bundle id through
+    # `tccutil reset <svc> com.meta.musecode.cua.driver` resolves the bundle id through
     # LaunchServices. If the bundle isn't registered — or this runs AFTER the
     # app was removed — tccutil fails with -10814 and the grant silently
     # survives. This MUST run while /Applications/CuaDriver.app still exists;
@@ -356,11 +358,11 @@ maybe_reset_tcc() {
     else
         log "  warning: CuaDriver.app already removed; TCC reset may not resolve the bundle id"
     fi
-    log "revoking TCC grants for com.trycua.driver"
-    log "  note: com.trycua.driver is shared with the retired Swift driver;"
-    log "  this clears grants for both. Pass --keep-tcc to preserve them."
+    log "revoking TCC grants for com.meta.musecode.cua.driver"
+    log "  legacy com.trycua.driver grants are a separate identity and are preserved"
+    log "  pass --keep-tcc to preserve the Muse Code grants as well"
     for SVC in Accessibility ScreenCapture AppleEvents; do
-        if tccutil reset "$SVC" com.trycua.driver >/dev/null 2>&1; then
+        if tccutil reset "$SVC" com.meta.musecode.cua.driver >/dev/null 2>&1; then
             log "  reset $SVC"
         else
             log "  $SVC: nothing to reset (or reset failed)"
@@ -473,7 +475,7 @@ fi
 if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     USER_BIN_LINK="$HOME/.local/bin/cua-driver"
     # Canonical bundle path (post-rename — shares bundle id
-    # `com.trycua.driver` with the Swift driver). The Rust install
+    # `com.meta.musecode.cua.driver` with the Swift driver). The Rust install
     # replaces Swift here; both uninstallers target this path.
     APP_BUNDLE="/Applications/CuaDriver.app"
     # Legacy bundle path from earlier Rust releases that coexisted with
@@ -501,8 +503,8 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     LEGACY_SKILL_PACK_NAME="cua-driver-rs"
 
     # Rust-install marker. The Rust bundle path `/Applications/CuaDriver.app`
-    # is shared with the Swift driver (same bundle id `com.trycua.driver`),
-    # so we can't use that path alone as a discriminator — a Swift-only Mac
+    # is shared with the retired Swift driver's install path, so we can't use
+    # that path alone as a discriminator — a Swift-only Mac
     # that runs `uninstall.sh --backend=rust` by mistake would lose its
     # Swift bundle, symlink, and Claude MCP registrations. This marker says
     # "there's at least one unambiguously-Rust artifact on disk." We gate
@@ -598,7 +600,7 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     fi
 
     # --- Revoke TCC grants BEFORE removing the app ---
-    # tccutil resolves com.trycua.driver through LaunchServices, so the reset
+    # tccutil resolves com.meta.musecode.cua.driver through LaunchServices, so the reset
     # only works while /Applications/CuaDriver.app is still installed. Running
     # it here (not at the closing message) is what makes the revoke actually
     # take — otherwise it fails with -10814 and the grant silently survives.
@@ -608,7 +610,7 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     # Legacy /Applications/CuaDriverRs.app is unambiguously Rust and
     # always removed when present. /Applications/CuaDriver.app is the
     # current canonical Rust path BUT also where the Swift driver
-    # lives (same bundle id `com.trycua.driver`), so we only remove
+    # lived (with legacy bundle id `com.trycua.driver`), so we only remove
     # it when $RUST_INSTALL_PRESENT — protects a Swift-only Mac from
     # losing its bundle if `uninstall.sh --experimental-rust` is run
     # by mistake.
@@ -891,8 +893,8 @@ TCC grants (Accessibility + Screen Recording) remain in System
 Settings > Privacy & Security because uninstall was run with --keep-tcc.
 Reset them explicitly if you want a clean re-install flow:
 
-  tccutil reset Accessibility com.trycua.driver
-  tccutil reset ScreenCapture com.trycua.driver
+  tccutil reset Accessibility com.meta.musecode.cua.driver
+  tccutil reset ScreenCapture com.meta.musecode.cua.driver
 FINALUNMSG
         fi
     else
@@ -1130,7 +1132,7 @@ TCC grants (Accessibility + Screen Recording) remain in System
 Settings > Privacy & Security because uninstall was run with --keep-tcc.
 Reset them explicitly if you want a clean re-install flow:
 
-  tccutil reset Accessibility com.trycua.driver
-  tccutil reset ScreenCapture com.trycua.driver
+  tccutil reset Accessibility com.meta.musecode.cua.driver
+  tccutil reset ScreenCapture com.meta.musecode.cua.driver
 FINALUNMSG
 fi
