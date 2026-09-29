@@ -7,6 +7,7 @@
 //! starts the guarded Python wrapper, initializes and attests its tool catalog,
 //! and forwards later tool calls without replacing the client MCP connection.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const SETUP_STATUS_SCHEMA_VERSION: u64 = 1;
 const SETUP_PENDING_CODE: &str = "computer_use_setup_pending";
 const SETUP_READY_CODE: &str = "computer_use_setup_ready";
@@ -485,6 +486,7 @@ struct BackendProcess {
     stdout_closed: bool,
     exit_status: Option<ExitStatus>,
     pending_request_ids: Vec<Value>,
+    cancelled_request_ids: Vec<Value>,
 }
 
 struct Failure {
@@ -767,9 +769,17 @@ impl Server {
             return Ok(());
         }
         if self.backend_ready() {
-            let calls = std::mem::take(&mut self.deferred_tool_calls);
-            for call in calls {
+            let mut calls = VecDeque::from(std::mem::take(&mut self.deferred_tool_calls));
+            while let Some(call) = calls.pop_front() {
+                // Keep every not-yet-attempted call visible to fail_backend.
+                // If this write observes a closed backend pipe, fail_backend
+                // settles both already-forwarded IDs and the untouched tail.
+                self.deferred_tool_calls = calls.into();
                 self.forward_to_backend(call.raw, Some(call.id), output)?;
+                if !self.backend_ready() {
+                    return Ok(());
+                }
+                calls = VecDeque::from(std::mem::take(&mut self.deferred_tool_calls));
             }
             return Ok(());
         }
@@ -805,44 +815,33 @@ impl Server {
                 .retain(|call| &call.id != request_id);
             self.deferred_tool_calls.len() != before
         });
+        // Setup and backend initialization are shared session work. Cancelling
+        // one deferred request only withdraws that request; it must not tear
+        // down work needed by other or future calls.
+        if cancelled_deferred {
+            return Ok(());
+        }
         match &mut self.runtime {
-            RuntimeState::Setup(setup) if cancelled_deferred => {
-                if setup.reported_failure.is_none() {
-                    setup.reported_failure = Some(("setup_cancelled".into(), true));
-                }
-                // Setup relays handle TERM as an explicit cancellation and it
-                // is delivered reliably to non-interactive shell process
-                // groups whose foreground child may ignore SIGINT.
-                terminate_child_with_group_grace(&mut setup.child);
-                setup.exit_status = setup.child.try_wait().ok().flatten();
-                Ok(())
-            }
             RuntimeState::Setup(_) => Ok(()),
             RuntimeState::Backend(backend) if backend.phase == BackendPhase::Ready => {
-                let removed_request = request_id.as_ref().is_some_and(|request_id| {
+                let cancelled_request = request_id.as_ref().and_then(|request_id| {
                     backend
                         .pending_request_ids
                         .iter()
                         .position(|pending| pending == request_id)
                         .map(|position| {
                             backend.pending_request_ids.remove(position);
+                            request_id.clone()
                         })
-                        .is_some()
                 });
-                if !removed_request {
+                let Some(cancelled_request) = cancelled_request else {
                     return Ok(());
-                }
+                };
+                // The backend may have committed a response before it reads
+                // this cancellation. Retain the ID until that response arrives
+                // so it can be discarded without poisoning the session.
+                backend.cancelled_request_ids.push(cancelled_request);
                 self.forward_to_backend(raw, None, output)
-            }
-            RuntimeState::Backend(_) if cancelled_deferred => {
-                // Backend initialization is shared by every deferred call. If
-                // cancelling one call stops it, settle every other deferred
-                // request before transitioning to the retryable failure state.
-                self.fail_backend(
-                    "Computer Use backend initialization was cancelled".into(),
-                    true,
-                    output,
-                )
             }
             RuntimeState::Backend(_) => Ok(()),
             RuntimeState::Dormant | RuntimeState::Failed(_) => Ok(()),
@@ -912,7 +911,7 @@ impl Server {
             "jsonrpc": "2.0",
             "id": INTERNAL_INITIALIZE_ID,
             "method": "initialize",
-            "params": self.initialize_params.clone().unwrap_or_else(|| json!({})),
+            "params": self.backend_initialize_params(),
         });
         if let Err(error) = write_child_json(&mut stdin, &initialize) {
             drop(stdin);
@@ -930,8 +929,21 @@ impl Server {
             stdout_closed: false,
             exit_status: None,
             pending_request_ids: Vec::new(),
+            cancelled_request_ids: Vec::new(),
         });
         Ok(())
+    }
+
+    fn backend_initialize_params(&self) -> Value {
+        let mut params = self.initialize_params.clone().unwrap_or_else(|| json!({}));
+        params
+            .as_object_mut()
+            .expect("initialize params are validated before storage")
+            .insert(
+                "protocolVersion".into(),
+                Value::String(MCP_PROTOCOL_VERSION.into()),
+            );
+        params
     }
 
     fn handle_event(
@@ -1047,18 +1059,35 @@ impl Server {
                     );
                 }
                 let id = object.get("id").expect("checked above");
-                let recognized = if let RuntimeState::Backend(backend) = &mut self.runtime {
-                    backend
-                        .pending_request_ids
-                        .iter()
-                        .position(|pending| pending == id)
-                        .map(|position| {
-                            backend.pending_request_ids.remove(position);
-                        })
-                        .is_some()
-                } else {
-                    false
-                };
+                let (recognized, cancelled) =
+                    if let RuntimeState::Backend(backend) = &mut self.runtime {
+                        let recognized = backend
+                            .pending_request_ids
+                            .iter()
+                            .position(|pending| pending == id)
+                            .map(|position| {
+                                backend.pending_request_ids.remove(position);
+                            })
+                            .is_some();
+                        let cancelled = if recognized {
+                            false
+                        } else {
+                            backend
+                                .cancelled_request_ids
+                                .iter()
+                                .position(|cancelled| cancelled == id)
+                                .map(|position| {
+                                    backend.cancelled_request_ids.remove(position);
+                                })
+                                .is_some()
+                        };
+                        (recognized, cancelled)
+                    } else {
+                        (false, false)
+                    };
+                if cancelled {
+                    return Ok(());
+                }
                 if !recognized {
                     return self.fail_backend(
                         "Computer Use backend emitted a response for an unknown or completed request"
@@ -1334,11 +1363,23 @@ impl RuntimeState {
     }
 
     fn terminate_with_signal(&mut self, signal: Option<i32>) {
+        let grace = if signal.is_some() {
+            CHILD_TERMINATION_GRACE
+        } else {
+            Duration::ZERO
+        };
         match self {
-            Self::Setup(setup) => terminate_child(&mut setup.child, signal),
+            Self::Setup(setup) => {
+                terminate_child_impl(&mut setup.child, signal, setup.exit_status.is_some(), grace)
+            }
             Self::Backend(backend) => {
                 let _ = backend.stdin.flush();
-                terminate_child(&mut backend.child, signal);
+                terminate_child_impl(
+                    &mut backend.child,
+                    signal,
+                    backend.exit_status.is_some(),
+                    grace,
+                );
             }
             Self::Dormant | Self::Failed(_) => {}
         }
@@ -1487,66 +1528,139 @@ fn signal_process_group(process_group: i32, signal: i32) {
     }
 }
 
-#[cfg(unix)]
-fn process_group_exists(process_group: i32) -> bool {
-    if unsafe { libc::kill(-process_group, 0) } == 0 {
-        return true;
-    }
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 fn terminate_child(child: &mut Child, initial_signal: Option<i32>) {
-    terminate_child_impl(child, initial_signal, initial_signal.is_some());
-}
-
-fn terminate_child_with_group_grace(child: &mut Child) {
-    terminate_child_impl(child, None, true);
+    let grace = if initial_signal.is_some() {
+        CHILD_TERMINATION_GRACE
+    } else {
+        Duration::ZERO
+    };
+    terminate_child_impl(child, initial_signal, false, grace);
 }
 
 fn terminate_child_impl(
     child: &mut Child,
     initial_signal: Option<i32>,
-    wait_for_process_group: bool,
+    leader_reaped: bool,
+    grace: Duration,
 ) {
     #[cfg(unix)]
     let process_group = i32::try_from(child.id()).ok();
     #[cfg(unix)]
-    if let Some(process_group) = process_group {
-        signal_process_group(process_group, initial_signal.unwrap_or(libc::SIGTERM));
+    if !leader_reaped {
+        if let Some(process_group) = process_group {
+            // The caller has not reaped this child, so its PID pins the PGID
+            // through the complete TERM/grace/KILL sequence.
+            signal_process_group(process_group, initial_signal.unwrap_or(libc::SIGTERM));
+        }
     }
     #[cfg(not(unix))]
-    let _ = child.kill();
-
-    let mut parent_reaped = child.try_wait().ok().flatten().is_some();
-    let deadline = Instant::now() + CHILD_TERMINATION_GRACE;
-    loop {
-        if !parent_reaped {
-            parent_reaped = child.try_wait().ok().flatten().is_some();
-        }
-        #[cfg(unix)]
-        let termination_complete = parent_reaped
-            && (!wait_for_process_group
-                || process_group.is_none_or(|group| !process_group_exists(group)));
-        #[cfg(not(unix))]
-        let termination_complete = parent_reaped;
-        if termination_complete || Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
+    if !leader_reaped {
+        let _ = child.kill();
     }
+
+    let deadline = Instant::now() + grace;
     #[cfg(unix)]
-    if let Some(process_group) = process_group {
-        if process_group_exists(process_group) {
-            signal_process_group(process_group, libc::SIGKILL);
+    if !leader_reaped {
+        if let Some(process_group) = process_group {
+            let mut drained_observations = 0;
+            while drained_observations < 2 && Instant::now() < deadline {
+                if process_group_has_live_members(process_group) {
+                    drained_observations = 0;
+                } else {
+                    drained_observations += 1;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if process_group_has_live_members(process_group) {
+                signal_process_group(process_group, libc::SIGKILL);
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = child.kill();
+        if !leader_reaped {
+            let _ = child.kill();
+        }
     }
-    if !parent_reaped {
+    if !leader_reaped {
         let _ = child.wait();
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_has_live_members(process_group: i32) -> bool {
+    const MAX_GROUP_PROCESSES: usize = 256;
+    let mut pids = [0 as libc::pid_t; MAX_GROUP_PROCESSES];
+    let buffer_bytes = std::mem::size_of_val(&pids);
+    let returned_count = unsafe {
+        libc::proc_listpgrppids(
+            process_group,
+            pids.as_mut_ptr().cast(),
+            i32::try_from(buffer_bytes).expect("bounded PID buffer fits c_int"),
+        )
+    };
+    if returned_count < 0 {
+        return true;
+    }
+    let count = returned_count as usize;
+    if count >= pids.len() {
+        return true;
+    }
+    pids[..count].iter().copied().any(|pid| {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let info_bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+                    .expect("proc_bsdinfo fits c_int"),
+            )
+        };
+        if info_bytes as usize != std::mem::size_of::<libc::proc_bsdinfo>() {
+            return false;
+        }
+        let info = unsafe { info.assume_init() };
+        info.pbi_pgid == process_group as u32 && info.pbi_status != libc::SZOMB
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_has_live_members(process_group: i32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let Some(_parent_pid) = fields.next() else {
+            continue;
+        };
+        let Some(group) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        if group == process_group && !matches!(state, "Z" | "X" | "x") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_group_has_live_members(process_group: i32) -> bool {
+    unsafe { libc::kill(-process_group, 0) == 0 }
 }
 
 fn canonical_executable(path: &Path) -> Result<PathBuf, String> {
@@ -1949,6 +2063,71 @@ mod tests {
     fn child_termination_grace_contains_plugin_cleanup_budget() {
         assert_eq!(CHILD_TERMINATION_GRACE, Duration::from_secs(25));
         assert!(CHILD_TERMINATION_GRACE > Duration::from_secs(20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn termination_keeps_the_leader_unreaped_until_descendants_are_killed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let marker = temp.path().join("group");
+        let script = r#"
+import os, pathlib, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+
+def stop_parent(_signal, _frame):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop_parent)
+pid = os.fork()
+if pid == 0:
+    def keep_running(_signal, _frame):
+        root.with_suffix('.term').write_text('term\n')
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, keep_running)
+    root.with_suffix('.child-pid').write_text(str(os.getpid()))
+    while not root.with_suffix('.term').exists():
+        signal.pause()
+    time.sleep(0.5)
+    root.with_suffix('.survived').write_text('orphaned\n')
+    while True:
+        signal.pause()
+
+while not root.with_suffix('.child-pid').exists():
+    time.sleep(0.01)
+root.with_suffix('.ready').write_text('ready\n')
+while True:
+    signal.pause()
+"#;
+        let mut command = Command::new("/usr/bin/python3");
+        command.arg("-c").arg(script).arg(&marker);
+        configure_child_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.with_extension("ready").exists() {
+            assert!(Instant::now() < deadline, "process group did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        terminate_child_impl(&mut child, None, false, Duration::from_millis(100));
+
+        let child_pid: i32 = fs::read_to_string(marker.with_extension("child-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let descendant_saw_term = marker.with_extension("term").exists();
+        thread::sleep(Duration::from_millis(550));
+        let descendant_was_orphaned = marker.with_extension("survived").exists();
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+        }
+        assert!(
+            descendant_saw_term,
+            "descendant did not receive initial SIGTERM"
+        );
+        assert!(
+            !descendant_was_orphaned,
+            "descendant survived after the original group leader exited"
+        );
     }
 
     #[test]

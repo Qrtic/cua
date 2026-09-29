@@ -111,7 +111,7 @@ const NORMAL_BACKEND: &str = r#"#!/bin/sh
 set -eu
 catalog=$1
 IFS= read -r initialize
-printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
 IFS= read -r initialized
 IFS= read -r tools_list
 tools=$(/usr/bin/tr -d '\n' < "$catalog")
@@ -130,6 +130,57 @@ fn spawn_host(temp: &TempDir) -> Host {
 }
 
 #[test]
+fn negotiates_and_forwards_the_canonical_protocol_version() {
+    let temp = TempDir::new().unwrap();
+    let gate = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+printf 'start\n' >> "$1"
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"ready","retryable":false,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
+"#;
+    let backend = r#"#!/bin/sh
+set -eu
+IFS= read -r initialize
+printf '%s\n' "$initialize" > "$2.initialize"
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
+/bin/sleep 30
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, backend);
+    host.send(json!({
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"initialize",
+        "params":{
+            "protocolVersion":"2024-11-05",
+            "capabilities":{"roots":{"listChanged":true}},
+            "clientInfo":{"name":"legacy-client","version":"1"}
+        }
+    }));
+    let initialized = host.receive();
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.receive();
+
+    let marker = gate.with_extension("initialize");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "backend did not receive initialize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let forwarded: Value = serde_json::from_str(&fs::read_to_string(marker).unwrap()).unwrap();
+    assert_eq!(forwarded["params"]["protocolVersion"], "2025-06-18");
+    assert_eq!(forwarded["params"]["clientInfo"]["name"], "legacy-client");
+    assert_eq!(
+        forwarded["params"]["capabilities"]["roots"]["listChanged"],
+        true
+    );
+}
+
+#[test]
 fn initializes_lists_then_setups_once_and_proxies_without_reconnect() {
     let temp = TempDir::new().unwrap();
     let starts = temp.path().join("setup-starts");
@@ -141,7 +192,7 @@ fn initializes_lists_then_setups_once_and_proxies_without_reconnect() {
         "id":1,
         "method":"initialize",
         "params":{
-            "protocolVersion":"2024-11-05",
+            "protocolVersion":"2025-06-18",
             "capabilities":{},
             "clientInfo":{"name":"test","version":"1"}
         }
@@ -243,27 +294,31 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 }
 
 #[test]
-fn cancelling_a_deferred_autonomous_call_stops_setup_without_a_response() {
+fn cancelling_one_deferred_call_does_not_stop_setup_or_other_waiters() {
     let temp = TempDir::new().unwrap();
     let gate = temp.path().join("permission-gate");
     let setup = r#"#!/bin/sh
 set -eu
 printf 'start\n' >> "$1"
 printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_pending","stage":"service_starting","retryable":true,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
-exec python3 -c '
-import pathlib, signal, sys
-marker = pathlib.Path(sys.argv[1] + ".cancelled")
-def stop(_signal, _frame):
-    marker.write_text("cancelled\n")
-    raise SystemExit(130)
-signal.signal(signal.SIGINT, stop)
-signal.signal(signal.SIGTERM, stop)
-pathlib.Path(sys.argv[1] + ".service-starting").write_text("ready\n")
-while True:
-    signal.pause()
-' "$2"
+trap 'printf "cancelled\n" > "$2.cancelled"; exit 130' INT TERM
+: > "$2.service-starting"
+while [ ! -f "$2" ]; do /bin/sleep 0.01; done
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"ready","retryable":false,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
 "#;
-    let mut host = spawn_host_with_scripts(&temp, setup, NORMAL_BACKEND);
+    let backend = r#"#!/bin/sh
+set -eu
+catalog=$1
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
+IFS= read -r initialized
+IFS= read -r tools_list
+tools=$(/usr/bin/tr -d '\n' < "$catalog")
+printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","result":{"tools":%s}}\n' "$tools"
+IFS= read -r call
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"proxied"}],"structuredContent":{"proxied":true}}}'
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, backend);
     host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
     host.receive();
     host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
@@ -279,20 +334,26 @@ while True:
         );
         thread::sleep(Duration::from_millis(10));
     }
-    host.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
-    host.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"test"}}));
-    let cancelled = gate.with_extension("cancelled");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !cancelled.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "setup did not observe cancellation"
-        );
-        thread::sleep(Duration::from_millis(10));
+    for id in [7, 8] {
+        host.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
     }
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"test"}}));
     assert!(
-        host.lines.recv_timeout(Duration::from_millis(250)).is_err(),
+        host.lines.recv_timeout(Duration::from_millis(150)).is_err(),
         "cancelled deferred call must not receive a response"
+    );
+    assert!(
+        !gate.with_extension("cancelled").exists(),
+        "one cancelled waiter stopped shared setup"
+    );
+
+    File::create(&gate).unwrap();
+    let response = host.receive();
+    assert_eq!(response["id"], 8);
+    assert_eq!(response["result"]["structuredContent"]["proxied"], true);
+    assert!(
+        !gate.with_extension("cancelled").exists(),
+        "shared setup was terminated instead of completing"
     );
 }
 
@@ -336,7 +397,7 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 }
 
 #[test]
-fn cancellation_during_backend_initialization_settles_other_deferred_calls() {
+fn cancellation_during_backend_initialization_preserves_other_deferred_calls() {
     let temp = TempDir::new().unwrap();
     let gate = temp.path().join("permission-gate");
     let setup = r#"#!/bin/sh
@@ -346,9 +407,17 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 "#;
     let backend = r#"#!/bin/sh
 set -eu
+catalog=$1
 IFS= read -r initialize
 : > "$2.backend-initialize"
-while true; do /bin/sleep 1; done
+while [ ! -f "$2" ]; do /bin/sleep 0.01; done
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
+IFS= read -r initialized
+IFS= read -r tools_list
+tools=$(/usr/bin/tr -d '\n' < "$catalog")
+printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","result":{"tools":%s}}\n' "$tools"
+IFS= read -r call
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"proxied"}],"structuredContent":{"proxied":true}}}'
 "#;
     let mut host = spawn_host_with_scripts(&temp, setup, backend);
     host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
@@ -370,17 +439,15 @@ while true; do /bin/sleep 1; done
         host.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
     }
     host.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"test"}}));
-
-    let settled = host.receive();
-    assert_eq!(settled["id"], 8);
-    assert_eq!(
-        settled["result"]["structuredContent"]["code"],
-        "computer_use_backend_unavailable"
-    );
     assert!(
-        host.lines.recv_timeout(Duration::from_millis(250)).is_err(),
+        host.lines.recv_timeout(Duration::from_millis(150)).is_err(),
         "cancelled request must not receive a response"
     );
+    File::create(&gate).unwrap();
+
+    let completed = host.receive();
+    assert_eq!(completed["id"], 8);
+    assert_eq!(completed["result"]["structuredContent"]["proxied"], true);
 }
 
 #[test]
@@ -494,7 +561,7 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 set -eu
 catalog=$1
 IFS= read -r initialize
-printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
 IFS= read -r initialized
 IFS= read -r tools_list
 tools=$(/usr/bin/tr -d '\n' < "$catalog")
@@ -532,6 +599,64 @@ exit 17
 }
 
 #[test]
+fn backend_write_failure_settles_the_entire_deferred_batch() {
+    let temp = TempDir::new().unwrap();
+    let gate = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+printf 'start\n' >> "$1"
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"ready","retryable":false,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
+"#;
+    let backend = r#"#!/bin/sh
+set -eu
+catalog=$1
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
+IFS= read -r initialized
+IFS= read -r tools_list
+: > "$2.catalog-waiting"
+while [ ! -f "$2" ]; do /bin/sleep 0.01; done
+exec 0<&-
+tools=$(/usr/bin/tr -d '\n' < "$catalog")
+printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","result":{"tools":%s}}\n' "$tools"
+/bin/sleep 30
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, backend);
+    host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    host.receive();
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.receive();
+
+    let marker = gate.with_extension("catalog-waiting");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "backend did not reach catalog initialization"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    for id in [7, 8, 9] {
+        host.send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    }
+    File::create(&gate).unwrap();
+
+    let mut settled_ids = Vec::new();
+    for _ in 0..3 {
+        let response = host.receive();
+        settled_ids.push(response["id"].as_i64().unwrap());
+        assert_eq!(
+            response["result"]["structuredContent"]["code"],
+            "computer_use_backend_unavailable"
+        );
+        assert_eq!(response["result"]["structuredContent"]["retryable"], true);
+    }
+    settled_ids.sort_unstable();
+    assert_eq!(settled_ids, [7, 8, 9]);
+}
+
+#[test]
 fn invalid_ready_backend_responses_fail_before_retiring_the_request() {
     let cases = [
         r#"{"id":7,"result":{"unexpected":true}}"#,
@@ -549,7 +674,7 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 set -eu
 catalog=$1
 IFS= read -r initialize
-printf '%s\n' '{{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}}}}}}'
 IFS= read -r initialized
 IFS= read -r tools_list
 tools=$(/usr/bin/tr -d '\n' < "$catalog")
@@ -592,7 +717,7 @@ set -eu
 catalog=$1
 marker=$2.cancelled
 IFS= read -r initialize
-printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
 IFS= read -r initialized
 IFS= read -r tools_list
 tools=$(/usr/bin/tr -d '\n' < "$catalog")
@@ -637,7 +762,7 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 set -eu
 catalog=$1
 IFS= read -r initialize
-printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
 IFS= read -r initialized
 IFS= read -r tools_list
 tools=$(/usr/bin/tr -d '\n' < "$catalog")
@@ -678,7 +803,7 @@ exec 0<&-
 }
 
 #[test]
-fn late_response_for_cancelled_request_is_not_forwarded() {
+fn late_response_for_cancelled_request_is_discarded_without_poisoning_backend() {
     let temp = TempDir::new().unwrap();
     let marker = temp.path().join("permission-gate.late-response-written");
     let setup = r#"#!/bin/sh
@@ -691,7 +816,7 @@ set -eu
 catalog=$1
 marker=$2.late-response-written
 IFS= read -r initialize
-printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
 IFS= read -r initialized
 IFS= read -r tools_list
 tools=$(/usr/bin/tr -d '\n' < "$catalog")
@@ -701,6 +826,8 @@ IFS= read -r call
 IFS= read -r cancelled
 printf 'written\n' > "$marker"
 printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"must not escape"}]}}'
+IFS= read -r next_call
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"proxied"}],"structuredContent":{"proxied":true}}}'
 /bin/sleep 1
 "#;
     let mut host = spawn_host_with_scripts(&temp, setup, backend);
@@ -725,13 +852,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text
         "late response for a cancelled request escaped the bootstrap"
     );
     host.send(json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
-    let failure = host.receive();
-    assert_eq!(failure["id"], 8);
-    assert_eq!(
-        failure["result"]["structuredContent"]["code"],
-        "computer_use_setup_failed"
-    );
-    assert_eq!(failure["result"]["structuredContent"]["retryable"], false);
+    let response = host.receive();
+    assert_eq!(response["id"], 8);
+    assert_eq!(response["result"]["structuredContent"]["proxied"], true);
 }
 
 #[test]

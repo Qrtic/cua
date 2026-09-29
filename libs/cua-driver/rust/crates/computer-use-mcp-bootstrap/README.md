@@ -56,12 +56,28 @@ failure re-arms setup for the call after that. The host initializes the backend
 and requires its complete tool catalog to equal the embedded public catalog
 before forwarding. It tracks every deferred and forwarded request ID and
 resolves all outstanding calls with a structured failure if setup or the
-backend exits. On Unix, child commands run in private process groups so
-cancellation and host termination cannot leave ordinary descendants behind.
-The bootstrap allows the group up to 25 seconds to exit cleanly before
-escalating to `SIGKILL`; this contains the plugin relay's bounded 20-second
-exact-daemon cleanup window.
+backend exits. On Unix, child commands run in private process groups so host
+termination can reach ordinary descendants. The bootstrap allows the group up
+to 25 seconds to exit cleanly before escalating to `SIGKILL`. The original
+group leader remains unreaped through that sequence, pinning the PGID while
+descendants finish or are stopped. This contains the plugin relay's bounded
+20-second exact-daemon cleanup window without risking a signal to a recycled
+PGID or leaving an ordinary descendant behind.
+
+The public and guarded-backend handshakes use MCP `2025-06-18`. Client
+initialize metadata is preserved, but its `protocolVersion` is rewritten to
+the version selected by the bootstrap before the backend is started. Cancelling
+one deferred call withdraws only that request; shared setup and backend
+initialization continue. Once a request has reached the backend, its cancelled
+ID remains tracked until any racing response arrives and is discarded.
 
 `src/tool_catalog.json` and `src/initialize_instructions.txt` are generated
 from the marketplace Python wrapper's public definitions and must be refreshed
 together when that wrapper contract changes.
+
+This binary is intentionally not part of the standalone Cua Driver release
+archives. The Muse Code Computer Use release pipeline builds and signs it as a
+separate plugin asset, stamps `CuaPluginManaged` into its managed Driver input,
+and verifies the onboarding contract, build attestation, and public tool
+catalog before assembling a plugin release. A Cua source merge alone is not a
+shippable plugin release.
