@@ -2273,9 +2273,16 @@ while True:
         command.arg("-c").arg(script).arg(&marker);
         configure_child_process_group(&mut command);
         let mut child = command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Hosted macOS runners resolve /usr/bin/python3 through the selected
+        // Xcode toolchain, whose first cold launch can take more than three
+        // seconds. Keep this deadline bounded without making toolchain startup
+        // part of the process-group behavior under test.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !marker.with_extension("ready").exists() {
-            assert!(Instant::now() < deadline, "process group did not start");
+            if Instant::now() >= deadline {
+                terminate_child_impl(&mut child, None, false, Duration::ZERO);
+                panic!("process group did not start");
+            }
             thread::sleep(Duration::from_millis(10));
         }
 
