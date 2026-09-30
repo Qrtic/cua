@@ -555,6 +555,48 @@ exit 1
 }
 
 #[test]
+fn setup_failure_settles_deferred_call_before_cleanup_grace() {
+    let temp = TempDir::new().unwrap();
+    let cleanup = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+trap '' TERM
+printf 'start\n' >> "$1"
+/bin/sleep 0.2
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_failed","stage":"failed","retryable":true,"requires_user_action":false,"error":{"code":"onboarding_host_exited","message":"retry"}}'
+/bin/sleep 1
+printf cleaned > "$2"
+exit 1
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, NORMAL_BACKEND);
+    host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    host.receive();
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    assert_eq!(
+        host.receive()["result"]["structuredContent"]["code"],
+        "computer_use_setup_pending"
+    );
+    host.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+
+    let failure = host.receive();
+    assert_eq!(failure["id"], 3);
+    assert_eq!(
+        failure["result"]["structuredContent"]["code"],
+        "computer_use_setup_failed"
+    );
+    assert!(
+        !cleanup.exists(),
+        "failure response arrived only after setup cleanup completed"
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !cleanup.exists() {
+        assert!(Instant::now() < deadline, "setup cleanup did not complete");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn backend_exit_settles_every_forwarded_request_id() {
     let temp = TempDir::new().unwrap();
     let setup = r#"#!/bin/sh

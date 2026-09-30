@@ -1274,9 +1274,10 @@ impl Server {
         let mut restart_retired_backend = false;
         match &mut self.runtime {
             RuntimeState::Setup(setup) => {
-                if setup.reported_failure.is_some() && setup.exit_status.is_none() {
-                    terminate_child(&mut setup.child, None);
-                    setup.exit_status = setup.child.try_wait().ok().flatten();
+                if let Some(failure) = setup.reported_failure.take() {
+                    // Settle and flush deferred client calls in fail_setup
+                    // before waiting for the setup group's cleanup window.
+                    setup_finished = Some(Err(failure));
                 } else if setup.stdout_closed && setup.exit_status.is_none() {
                     // Keep an exited group leader unreaped while descendants
                     // still hold stdout. Its PID pins the PGID so later host
@@ -1347,9 +1348,9 @@ impl Server {
         }
 
         if let Some(result) = setup_finished {
-            self.runtime = RuntimeState::Dormant;
             match result {
                 Ok(()) => {
+                    self.runtime = RuntimeState::Dormant;
                     if let Err(error) = self.start_backend(events) {
                         self.fail_setup(error, false, output)?;
                     }
