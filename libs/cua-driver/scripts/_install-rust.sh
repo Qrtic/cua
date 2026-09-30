@@ -1214,7 +1214,11 @@ extract_release_tarball_safely() {
             err "release archive contains a link or special member"
             return 1
         fi
-        if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size > max_member_size )); then
+        # Validate a small canonical decimal before Bash arithmetic. Values
+        # wider than ten digits cannot be valid under either fixed bound and
+        # would otherwise wrap signed shell integers on crafted metadata.
+        if ! [[ "$size" =~ ^(0|[1-9][0-9]{0,9})$ ]] \
+           || (( size > max_member_size )); then
             err "release archive contains an oversized member"
             return 1
         fi

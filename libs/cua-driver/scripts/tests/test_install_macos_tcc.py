@@ -417,6 +417,43 @@ def test_release_archive_extraction_rejects_traversal_links_and_duplicates(
     assert result.returncode == 0, result.stderr
     assert "oversized member" in result.stderr
 
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    extraction_marker = tmp_path / "overflow-extracted"
+    fake_tar = fake_bin / "tar"
+    fake_tar.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  --version) printf '%s\\n' 'tar (GNU tar) 1.35' ;;\n"
+        "  -tzf) printf '%s\\n' 'payload/huge' ;;\n"
+        "  -tvzf) printf '%s\\n' '-rw-r--r-- 0/0 9223372036854775808 2026-01-01 00:00 payload/huge' ;;\n"
+        f"  -xzf) : > '{extraction_marker}' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_tar.chmod(0o755)
+    overflow_result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {function}
+            TMP_DIR='{destination}'
+            err() {{ printf 'error: %s\n' "$*" >&2; }}
+            ! extract_release_tarball_safely '{tmp_path}/unused.tar.gz' '{destination}'
+            [[ ! -e '{extraction_marker}' ]]
+            """,
+        ],
+        env={**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert overflow_result.returncode == 0, overflow_result.stderr
+    assert "oversized member" in overflow_result.stderr
+
 
 def test_install_daemon_stop_is_path_authenticated_and_fail_closed(tmp_path: Path) -> None:
     functions = "\n".join(
