@@ -11,6 +11,7 @@ on:
       - "libs/cua-driver/rust/Cargo.toml"
       - "libs/cua-driver/rust/Cargo.lock"
       - "libs/cua-driver/rust/include/**"
+      - "libs/cua-driver/rust/scripts/**"
       - "libs/cua-driver/rust/tests/**"
       - "libs/cua-driver/rust/crates/cua-driver/**"
       - "libs/cua-driver/rust/crates/cua-driver-contract/**"
@@ -42,6 +43,7 @@ on:
       - "libs/cua-driver/rust/Cargo.toml"
       - "libs/cua-driver/rust/Cargo.lock"
       - "libs/cua-driver/rust/include/**"
+      - "libs/cua-driver/rust/scripts/**"
       - "libs/cua-driver/rust/tests/**"
       - "libs/cua-driver/rust/crates/cua-driver/**"
       - "libs/cua-driver/rust/crates/cua-driver-contract/**"
@@ -150,8 +152,6 @@ jobs:
       - name: Test macOS onboarding runtime
         if: runner.os == 'macOS'
         working-directory: libs/cua-driver/rust
-        env:
-          CUA_DRIVER_PRODUCTION_TEAM_ID: TEAM123456
         run: |
           cargo test --locked -p computer-use-mcp-bootstrap --all-targets
           cargo test --locked -p platform-macos --lib app_identity::
@@ -160,10 +160,11 @@ jobs:
           cargo test --locked -p platform-macos --lib tools::check_permissions::tests::
           cargo test --locked -p platform-macos --lib tools::health_report::tests::
           cargo test --locked -p platform-macos --lib tools::launch_app::tests::
-          cargo test --locked -p cua-driver --bin cua-driver onboarding
+          cargo test --locked -p cua-driver --bin cua-driver cli::tests::
           cargo test --locked -p cua-driver --bin cua-driver serve::socket_tests::
           cargo test --locked -p cua-driver --bin cua-driver history_runtime::tests::
           cargo test --locked -p cua-driver --bin cua-driver bundle::tests::
+          cargo test --locked -p cua-driver-core inaccessible_existing_history_never_creates_a_replacement_key
 
       - name: Test macOS installer and identity contracts
         if: runner.os == 'macOS'
@@ -172,9 +173,13 @@ jobs:
           python3 -m pytest -q \
             libs/cua-driver/python/tests/test_install_local_signing.py \
             libs/cua-driver/scripts/tests/test_bundle_presentation.py \
+            libs/cua-driver/scripts/tests/test_install_local.py \
             libs/cua-driver/scripts/tests/test_install_macos_tcc.py \
             libs/cua-driver/scripts/tests/test_macos_lume_runner.py \
-            libs/cua-driver/scripts/tests/test_uninstall_local.py
+            libs/cua-driver/scripts/tests/test_uninstall_daemon_stop.py \
+            libs/cua-driver/scripts/tests/test_uninstall_local.py \
+            libs/cua-driver/scripts/tests/test_uninstall_macos_safety.py
+          bash libs/cua-driver/scripts/tests/uninstall-history-purge-test.sh
 
       - name: Verify released CLI and MCP compatibility
         if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
