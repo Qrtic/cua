@@ -301,6 +301,15 @@ impl SetupStage {
 
 fn setup_stage_transition_allowed(previous: SetupStage, next: SetupStage) -> bool {
     use SetupStage::*;
+
+    // The native onboarding supervisor publishes progress through a latest-value
+    // status file, so an intermediate capture-verification event can be missed.
+    // ServiceStarting still carries the independently validated, fully-ready
+    // permission state, making it a safe handoff from any pre-service stage.
+    if next == ServiceStarting {
+        return true;
+    }
+
     match previous {
         Installing => true,
         Accessibility => matches!(
@@ -342,8 +351,8 @@ fn setup_stage_transition_allowed(previous: SetupStage, next: SetupStage) -> boo
                 | ScreenRecording
                 | CaptureVerification
         ),
-        CaptureVerification => matches!(next, CaptureVerification | ServiceStarting),
-        ServiceStarting => next == ServiceStarting,
+        CaptureVerification => matches!(next, CaptureVerification | DriverRestarting),
+        ServiceStarting => false,
     }
 }
 
@@ -1034,6 +1043,11 @@ impl Server {
                         if setup_stage_transition_allowed(setup.stage, stage) {
                             setup.stage = stage;
                         } else {
+                            eprintln!(
+                                "computer-use setup: rejected stage transition {} -> {}",
+                                setup.stage.as_str(),
+                                stage.as_str()
+                            );
                             setup.reported_failure =
                                 Some(("setup_stage_transition_invalid".into(), false));
                         }
@@ -2154,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_stage_transitions_allow_restart_cycles_but_reject_regression() {
+    fn setup_stage_transitions_allow_restart_cycles_and_verified_handoff() {
         assert!(setup_stage_transition_allowed(
             SetupStage::Accessibility,
             SetupStage::ScreenRecordingRegistration
@@ -2177,16 +2191,48 @@ mod tests {
         ));
         assert!(setup_stage_transition_allowed(
             SetupStage::CaptureVerification,
-            SetupStage::ServiceStarting
+            SetupStage::DriverRestarting
         ));
+        for stage in [
+            SetupStage::Installing,
+            SetupStage::Accessibility,
+            SetupStage::ScreenRecordingRegistration,
+            SetupStage::ScreenRecording,
+            SetupStage::DriverRestarting,
+            SetupStage::TccPropagation,
+            SetupStage::CaptureVerification,
+            SetupStage::ServiceStarting,
+        ] {
+            assert!(setup_stage_transition_allowed(
+                stage,
+                SetupStage::ServiceStarting
+            ));
+        }
         assert!(!setup_stage_transition_allowed(
             SetupStage::ServiceStarting,
-            SetupStage::Accessibility
+            SetupStage::DriverRestarting
         ));
         assert!(!setup_stage_transition_allowed(
             SetupStage::CaptureVerification,
             SetupStage::ScreenRecording
         ));
+    }
+
+    #[test]
+    fn service_starting_signal_requires_verified_capture() {
+        for capture in [Value::Null, Value::Bool(false)] {
+            let service = json!({
+                "schema_version": 1,
+                "code": SETUP_PENDING_CODE,
+                "stage": "service_starting",
+                "retryable": true,
+                "requires_user_action": false,
+                "accessibility": true,
+                "screen_recording": true,
+                "screen_recording_capturable": capture
+            });
+            assert!(parse_setup_signal(&service.to_string()).is_err());
+        }
     }
 
     #[test]

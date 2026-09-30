@@ -299,6 +299,50 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
 }
 
 #[test]
+fn capture_host_recovery_with_elided_progress_reaches_backend() {
+    let temp = TempDir::new().unwrap();
+    let gate = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+printf 'start\n' >> "$1"
+while [ ! -f "$2.begin" ]; do /bin/sleep 0.01; done
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_pending","stage":"capture_verification","retryable":true,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":null}'
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_pending","stage":"driver_restarting","retryable":true,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":null}'
+: > "$2.recovery"
+while [ ! -f "$2" ]; do /bin/sleep 0.01; done
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_pending","stage":"service_starting","retryable":true,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"ready","retryable":false,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, NORMAL_BACKEND);
+    host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    host.receive();
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    let pending = host.receive();
+    assert_eq!(
+        pending["result"]["structuredContent"]["code"],
+        "computer_use_setup_pending"
+    );
+
+    File::create(gate.with_extension("begin")).unwrap();
+    let recovery = gate.with_extension("recovery");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !recovery.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "capture host recovery was not emitted"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    File::create(&gate).unwrap();
+    host.send(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    let response = host.receive();
+    assert_eq!(response["id"], 5);
+    assert_eq!(response["result"]["structuredContent"]["proxied"], true);
+}
+
+#[test]
 fn cancelling_one_deferred_call_does_not_stop_setup_or_other_waiters() {
     let temp = TempDir::new().unwrap();
     let gate = temp.path().join("permission-gate");
