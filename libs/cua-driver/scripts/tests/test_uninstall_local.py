@@ -44,7 +44,14 @@ def test_unix_local_uninstall_removes_owned_links_and_preserves_release(tmp_path
     _executable(fake_bin / "uname", "printf 'Linux\\n'")
     _executable(fake_bin / "id", "printf '501\\n'")
     _executable(fake_bin / "pgrep", "exit 1")
-    _executable(fake_bin / "systemctl", "exit 0")
+    _executable(
+        fake_bin / "systemctl",
+        'case "$*" in\n'
+        '  *"is-active --quiet"*) exit 3 ;;\n'
+        '  *"is-enabled"*) printf "disabled\\n"; exit 1 ;;\n'
+        '  *) exit 0 ;;\n'
+        'esac\n',
+    )
 
     local_cli = local_bin / "cua-driver-local"
     local_cli.symlink_to(local_home / "packages/current/cua-driver-local")
@@ -253,6 +260,180 @@ def test_unix_local_uninstall_aborts_before_cleanup_when_process_inspection_fail
     assert result.returncode != 0
     assert "process inspection failed" in result.stderr
     assert sentinel.read_text() == "present"
+
+
+def test_local_uninstall_fails_closed_when_systemd_service_remains_active(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "fake-bin"
+    local_home = home / ".cua-driver-local"
+    local_cache = home / ".cache/cua-driver-local"
+    unit = home / ".config/systemd/user/cua-driver-local.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("keepalive\n", encoding="utf-8")
+    local_cache.mkdir(parents=True)
+    sentinel = local_cache / "preserve-me"
+    sentinel.write_text("present", encoding="utf-8")
+    _executable(fake_bin / "uname", "printf 'Linux\\n'")
+    _executable(fake_bin / "id", "printf '501\\n'")
+    _executable(fake_bin / "pgrep", "exit 1")
+    _executable(
+        fake_bin / "systemctl",
+        'case "$*" in\n'
+        '  *"disable --now"*) exit 0 ;;\n'
+        '  *"is-active --quiet"*) exit 0 ;;\n'
+        '  *"is-enabled"*) printf "disabled\\n"; exit 1 ;;\n'
+        '  *) exit 0 ;;\n'
+        'esac\n',
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "CUA_DRIVER_LOCAL_HOME": str(local_home),
+    }
+    result = subprocess.run(
+        ["/bin/bash", str(UNINSTALL_LOCAL), "--force", "--keep-tcc"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "remains active, enabled, or unverifiable" in result.stderr
+    assert unit.exists()
+    assert sentinel.read_text(encoding="utf-8") == "present"
+
+
+def test_local_uninstall_requires_successful_systemd_disable(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "fake-bin"
+    local_home = home / ".cua-driver-local"
+    unit = home / ".config/systemd/user/cua-driver-local.service"
+    marker = local_home / "packages/current/cua-driver-local"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("driver\n", encoding="utf-8")
+    unit.parent.mkdir(parents=True)
+    unit.write_text("restart\n", encoding="utf-8")
+    _executable(fake_bin / "uname", "printf 'Linux\\n'")
+    _executable(fake_bin / "id", "printf '501\\n'")
+    _executable(fake_bin / "pgrep", "exit 1")
+    _executable(
+        fake_bin / "systemctl",
+        'case "$*" in\n'
+        '  *"is-active --quiet"*) exit 0 ;;\n'
+        '  *"is-enabled"*) printf "enabled\\n"; exit 0 ;;\n'
+        '  *"disable --now"*) exit 70 ;;\n'
+        '  *) exit 0 ;;\n'
+        'esac\n',
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(UNINSTALL_LOCAL), "--force", "--keep-tcc"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CUA_DRIVER_LOCAL_HOME": str(local_home),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "could not disable and stop" in result.stderr
+    assert unit.exists()
+    assert marker.exists()
+
+
+def test_local_uninstall_fails_if_systemd_unit_removal_fails(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "fake-bin"
+    local_home = home / ".cua-driver-local"
+    unit = home / ".config/systemd/user/cua-driver-local.service"
+    marker = local_home / "packages/current/cua-driver-local"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("driver\n", encoding="utf-8")
+    unit.parent.mkdir(parents=True)
+    unit.write_text("restart\n", encoding="utf-8")
+    _executable(fake_bin / "uname", "printf 'Linux\\n'")
+    _executable(fake_bin / "id", "printf '501\\n'")
+    _executable(fake_bin / "pgrep", "exit 1")
+    _executable(
+        fake_bin / "systemctl",
+        'case "$*" in\n'
+        '  *"is-active --quiet"*) exit 3 ;;\n'
+        '  *"is-enabled"*) printf "disabled\\n"; exit 1 ;;\n'
+        '  *) exit 0 ;;\n'
+        'esac\n',
+    )
+    _executable(fake_bin / "rm", 'exit 70\n')
+    result = subprocess.run(
+        ["/bin/bash", str(UNINSTALL_LOCAL), "--force", "--keep-tcc"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CUA_DRIVER_LOCAL_HOME": str(local_home),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "could not remove systemd user unit" in result.stderr
+    assert unit.exists()
+    assert marker.exists()
+
+
+def test_local_uninstall_detects_systemd_respawn_after_reload(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    fake_bin = tmp_path / "fake-bin"
+    local_home = home / ".cua-driver-local"
+    unit = home / ".config/systemd/user/cua-driver-local.service"
+    marker = local_home / "packages/current/cua-driver-local"
+    state = tmp_path / "service-state"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("driver\n", encoding="utf-8")
+    unit.parent.mkdir(parents=True)
+    unit.write_text("restart\n", encoding="utf-8")
+    state.write_text("enabled\n", encoding="utf-8")
+    _executable(fake_bin / "uname", "printf 'Linux\\n'")
+    _executable(fake_bin / "id", "printf '501\\n'")
+    _executable(fake_bin / "pgrep", "exit 1")
+    _executable(
+        fake_bin / "systemctl",
+        'case "$*" in\n'
+        '  *"disable --now"*) printf "disabled\\n" > "$TEST_STATE" ;;\n'
+        '  *"daemon-reload"*) printf "respawned\\n" > "$TEST_STATE" ;;\n'
+        '  *"is-active --quiet"*) test "$(cat "$TEST_STATE")" = respawned && exit 0 || test "$(cat "$TEST_STATE")" = enabled && exit 0 || exit 3 ;;\n'
+        '  *"is-enabled"*) test "$(cat "$TEST_STATE")" = enabled && printf "enabled\\n" && exit 0; printf "disabled\\n"; exit 1 ;;\n'
+        'esac\n',
+    )
+    result = subprocess.run(
+        ["/bin/bash", str(UNINSTALL_LOCAL), "--force", "--keep-tcc"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CUA_DRIVER_LOCAL_HOME": str(local_home),
+            "TEST_STATE": str(state),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "reappeared" in result.stderr
+    assert marker.exists()
 
 
 def test_unix_local_uninstall_terminates_and_verifies_owned_daemon(

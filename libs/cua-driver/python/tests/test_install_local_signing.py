@@ -448,7 +448,9 @@ def test_local_installer_uses_a_separate_macos_identity() -> None:
     assert 'CFBundleIdentifier -string "com.meta.musecode.cua.driver.local"' in script
     assert 'CFBundleExecutable -string "cua-driver-local"' in script
     assert "tccutil reset" not in script
-    assert 'cleanup_legacy_local_app "$LEGACY_LOCAL_APP" 1' in script
+    assert 'prepare_legacy_local_app_removal "$LEGACY_LOCAL_APP" 1' in script
+    assert 'mv "$LEGACY_LOCAL_APP" "$LEGACY_LOCAL_APP_BACKUP"' in script
+    assert "rollback_legacy_local_app_on_exit" in script
     assert 'if [ "${LEGACY_LOCAL_APP_OWNED:-0}" = "1" ]; then' in script
     assert 'owned_paths+=("$LEGACY_LOCAL_APP/Contents/MacOS/cua-driver-local")' in script
     assert 'stop_verified_local_processes 0 "${owned_paths[@]}"' in script

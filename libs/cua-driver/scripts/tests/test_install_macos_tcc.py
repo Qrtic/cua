@@ -106,8 +106,13 @@ def run_legacy_rs_rollback_policy(
 ) -> subprocess.CompletedProcess[str]:
     function = extract_shell_function("restore_macos_legacy_rs_backup_on_exit")
     stubs = r'''
-    macos_verify_release_app() { return 0; }
+    macos_verify_release_app() {
+        [[ -z "${REJECT_APP_PATH:-}" || "$1" != "$REJECT_APP_PATH" ]]
+    }
     macos_register_app() {
+        if [[ -n "${REGISTER_LOG:-}" ]]; then
+            printf '%s\n' "$1" >> "$REGISTER_LOG"
+        fi
         [[ "${REGISTER_FAIL:-0}" != "1" ]]
     }
     LEGACY_RS_BUNDLE_ID=com.trycua.cuadriverrs
@@ -499,11 +504,64 @@ def test_install_daemon_stop_is_path_authenticated_and_fail_closed(tmp_path: Pat
     assert args.read_text() == "-a -p 4242 -d txt -Fn"
     source = INSTALLER.read_text()
     stop = extract_shell_function("stop_authenticated_macos_daemons")
-    assert "com.trycua.cua-driver.plist" in stop
-    assert "com.trycua.cua-driver-rs.plist" in stop
+    supervisors = extract_shell_function("macos_stop_and_verify_install_supervisors")
+    assert "com.trycua.cua-driver.plist" in supervisors
+    assert "com.trycua.cua-driver-rs.plist" in supervisors
+    assert stop.count("macos_stop_and_verify_install_supervisors") == 2
     assert "kill -TERM" in stop and "kill -KILL" in stop
     darwin_cleanup = extract_shell_function("cleanup_prior_local_install")
-    assert '[[ "${OS:-}" != "Darwin" ]]' in darwin_cleanup
+    assert '"${OS:-}" != "Darwin"' in darwin_cleanup
+    assert '"${DAEMONS_STOPPED_BEFORE_SWAP:-0}" != "1"' in darwin_cleanup
+
+
+def test_release_installer_boots_out_loaded_keepalive_and_fails_if_it_survives(
+    tmp_path: Path,
+) -> None:
+    functions = "\n".join(
+        extract_shell_function(name)
+        for name in ("macos_launchagent_state", "macos_stop_and_verify_launchagent")
+    )
+    state = tmp_path / "loaded"
+    state.write_text("loaded\n", encoding="utf-8")
+    calls = tmp_path / "calls"
+    launchctl = tmp_path / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$TEST_CALLS"\n'
+        'case "$1" in\n'
+        '  print) test -e "$TEST_STATE" && exit 0 || exit 113 ;;\n'
+        '  unload) exit 70 ;;\n'
+        '  bootout) test "${TEST_BOOTOUT_FAIL:-0}" = 1 && exit 71; rm -f "$TEST_STATE" ;;\n'
+        'esac\n',
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    plist = tmp_path / "release.plist"
+    plist.write_text("fixture\n", encoding="utf-8")
+    command = f"""set -euo pipefail
+    err() {{ printf 'error: %s\\n' "$*" >&2; }}
+    {functions}
+    MACOS_LAUNCHCTL='{launchctl}'
+    macos_stop_and_verify_launchagent '{plist}' com.trycua.cua-driver
+    """
+    env = {**os.environ, "TEST_STATE": str(state), "TEST_CALLS": str(calls)}
+    result = subprocess.run(
+        ["/bin/bash", "-c", command], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert not state.exists()
+    assert "bootout gui/" in calls.read_text(encoding="utf-8")
+
+    state.write_text("loaded\n", encoding="utf-8")
+    failed = subprocess.run(
+        ["/bin/bash", "-c", command],
+        env={**env, "TEST_BOOTOUT_FAIL": "1"},
+        text=True,
+        capture_output=True,
+    )
+    assert failed.returncode != 0
+    assert state.exists()
+    assert "could not stop loaded launchd job" in failed.stderr
 
 
 def test_release_app_requires_exact_team_apple_anchor_and_notarization(
@@ -846,11 +904,18 @@ def test_legacy_rs_migration_and_history_checks_precede_bundle_moves() -> None:
     second_history = source.index(
         "macos_refuse_legacy_history_identity_transition", first_history + 1
     )
-    legacy_reset = source.index("macos_reset_legacy_tcc_before_migration", second_history)
+    legacy_started = source.index(
+        "MACOS_LEGACY_RS_REMOVAL_STARTED=1", second_history
+    )
+    legacy_reset = source.index("macos_reset_legacy_tcc_before_migration", legacy_started)
     assert "$LEGACY_RS_APP_DEST" in source[legacy_reset : legacy_reset + 180]
     assert "$LEGACY_RS_BUNDLE_ID" in source[legacy_reset : legacy_reset + 180]
     legacy_move = source.index("macos_stage_legacy_rs_removal", legacy_reset)
-    canonical_move = source.index('mv "$APP_DEST" "$MACOS_APP_BACKUP"', legacy_move)
+    canonical_started = source.index("MACOS_APP_SWAP_STARTED=1", legacy_move)
+    canonical_reset = source.index(
+        "macos_reset_legacy_tcc_before_migration", canonical_started
+    )
+    canonical_move = source.index('mv "$APP_DEST" "$MACOS_APP_BACKUP"', canonical_reset)
     commit = source.index("MACOS_APP_INSTALL_COMMITTED=1", canonical_move)
     local_cleanup = source.index("cleanup_prior_local_install", commit)
 
@@ -860,8 +925,11 @@ def test_legacy_rs_migration_and_history_checks_precede_bundle_moves() -> None:
         < stop
         < first_history
         < second_history
+        < legacy_started
         < legacy_reset
         < legacy_move
+        < canonical_started
+        < canonical_reset
         < canonical_move
         < commit
         < local_cleanup
@@ -896,6 +964,63 @@ def test_exit_cleanup_restores_the_previous_app(tmp_path: Path) -> None:
     assert not backup.exists()
     assert register_log.read_text().strip() == str(app)
     assert unregister_log.read_text().strip() == str(app)
+
+
+def test_legacy_canonical_pre_move_rollback_reregisters_source(
+    tmp_path: Path,
+) -> None:
+    app = tmp_path / "CuaDriver.app"
+    app.mkdir()
+    (app / "previous").write_text("valid")
+    register_log = tmp_path / "register.log"
+
+    result = run_rollback_policy(
+        "restore_macos_app_backup_on_exit",
+        {
+            "APP_DEST": str(app),
+            "MACOS_APP_BACKUP": str(tmp_path / "missing-backup"),
+            "MACOS_APP_SWAP_STARTED": "1",
+            "MACOS_APP_HAD_PREVIOUS": "1",
+            "MACOS_APP_INSTALL_COMMITTED": "0",
+            "MACOS_APP_BACKUP_BUNDLE_ID": "com.trycua.driver",
+            "MACOS_APP_BACKUP_TEAM_ID": "YCK386LBJ7",
+            "REGISTER_LOG": str(register_log),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (app / "previous").read_text() == "valid"
+    assert register_log.read_text().strip() == str(app)
+    assert "re-registered the preserved previous" in result.stderr
+
+
+def test_legacy_canonical_pre_move_rollback_rejects_unauthenticated_source(
+    tmp_path: Path,
+) -> None:
+    app = tmp_path / "CuaDriver.app"
+    app.mkdir()
+    (app / "untrusted").write_text("preserve")
+    register_log = tmp_path / "register.log"
+
+    result = run_rollback_policy(
+        "restore_macos_app_backup_on_exit",
+        {
+            "APP_DEST": str(app),
+            "MACOS_APP_BACKUP": str(tmp_path / "missing-backup"),
+            "MACOS_APP_SWAP_STARTED": "1",
+            "MACOS_APP_HAD_PREVIOUS": "1",
+            "MACOS_APP_INSTALL_COMMITTED": "0",
+            "MACOS_APP_BACKUP_BUNDLE_ID": "com.trycua.driver",
+            "MACOS_APP_BACKUP_TEAM_ID": "YCK386LBJ7",
+            "REGISTER_LOG": str(register_log),
+            "REJECT_APP_PATH": str(app),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (app / "untrusted").read_text() == "preserve"
+    assert not register_log.exists()
+    assert "refusing to re-register unauthenticated previous" in result.stderr
 
 
 def test_exit_cleanup_removes_a_partial_first_install(tmp_path: Path) -> None:
@@ -1024,6 +1149,7 @@ def test_rollback_preserves_failed_candidate_when_unregister_fails(
 def test_legacy_rs_backup_is_restored_and_reregistered(tmp_path: Path) -> None:
     app = tmp_path / "CuaDriverRs.app"
     backup = tmp_path / "CuaDriverRs.app.install-backup"
+    register_log = tmp_path / "register.log"
     backup.mkdir()
     (backup / "previous").write_text("valid")
     result = run_legacy_rs_rollback_policy(
@@ -1033,9 +1159,60 @@ def test_legacy_rs_backup_is_restored_and_reregistered(tmp_path: Path) -> None:
             "MACOS_LEGACY_RS_BACKUP": str(backup),
             "MACOS_LEGACY_RS_REMOVAL_STARTED": "1",
             "MACOS_LEGACY_RS_REMOVAL_COMMITTED": "0",
+            "REGISTER_LOG": str(register_log),
         },
     )
 
     assert result.returncode == 0, result.stderr
     assert (app / "previous").read_text() == "valid"
     assert not backup.exists()
+    assert register_log.read_text().strip() == str(app)
+
+
+def test_legacy_rs_pre_move_rollback_reregisters_source(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverRs.app"
+    app.mkdir()
+    (app / "previous").write_text("valid")
+    register_log = tmp_path / "register.log"
+
+    result = run_legacy_rs_rollback_policy(
+        "restore_macos_legacy_rs_backup_on_exit",
+        {
+            "LEGACY_RS_APP_DEST": str(app),
+            "MACOS_LEGACY_RS_BACKUP": str(tmp_path / "missing-backup"),
+            "MACOS_LEGACY_RS_REMOVAL_STARTED": "1",
+            "MACOS_LEGACY_RS_REMOVAL_COMMITTED": "0",
+            "REGISTER_LOG": str(register_log),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (app / "previous").read_text() == "valid"
+    assert register_log.read_text().strip() == str(app)
+    assert "re-registered preserved legacy" in result.stderr
+
+
+def test_legacy_rs_pre_move_rollback_rejects_unauthenticated_source(
+    tmp_path: Path,
+) -> None:
+    app = tmp_path / "CuaDriverRs.app"
+    app.mkdir()
+    (app / "untrusted").write_text("preserve")
+    register_log = tmp_path / "register.log"
+
+    result = run_legacy_rs_rollback_policy(
+        "restore_macos_legacy_rs_backup_on_exit",
+        {
+            "LEGACY_RS_APP_DEST": str(app),
+            "MACOS_LEGACY_RS_BACKUP": str(tmp_path / "missing-backup"),
+            "MACOS_LEGACY_RS_REMOVAL_STARTED": "1",
+            "MACOS_LEGACY_RS_REMOVAL_COMMITTED": "0",
+            "REGISTER_LOG": str(register_log),
+            "REJECT_APP_PATH": str(app),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (app / "untrusted").read_text() == "preserve"
+    assert not register_log.exists()
+    assert "refusing to re-register unauthenticated legacy" in result.stderr

@@ -169,6 +169,163 @@ EOF
     fi
 }
 
+# A successful process scan is not enough when launchd still owns a KeepAlive
+# job: the daemon can be absent for one poll and respawn immediately before an
+# app/signing-identity transition. Treat only launchctl's documented
+# "service not found" status as quiescent, and use bootout as the fallback when
+# the legacy plist-based unload did not actually remove the loaded job.
+local_launchagent_state() {
+    local label="$1" tool="${CUA_DRIVER_LAUNCHCTL:-/bin/launchctl}"
+    local uid="" status=0
+    command -v "$tool" >/dev/null 2>&1 || return 2
+    uid="$(id -u 2>/dev/null || true)"
+    case "$uid" in ''|*[!0-9]*) return 2 ;; esac
+    "$tool" print "gui/$uid/$label" >/dev/null 2>&1 || status=$?
+    case "$status" in
+        0) return 0 ;;
+        113) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+stop_and_verify_local_launchagent() {
+    local plist="$1" label="$2" tool="${CUA_DRIVER_LAUNCHCTL:-/bin/launchctl}"
+    local uid="" state=0
+    [ "${OS:-}" = "Darwin" ] || return 0
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "${RED:-}Error: launchctl is unavailable; local daemon quiescence cannot be verified.${NORMAL:-}" >&2
+        return 1
+    }
+    uid="$(id -u 2>/dev/null || true)"
+    case "$uid" in
+        ''|*[!0-9]*)
+            echo "${RED:-}Error: current user identity is unavailable; local daemon quiescence cannot be verified.${NORMAL:-}" >&2
+            return 1
+            ;;
+    esac
+
+    if [ -f "$plist" ]; then
+        "$tool" unload "$plist" >/dev/null 2>&1 || true
+    fi
+    state=0
+    local_launchagent_state "$label" || state=$?
+    if [ "$state" = "0" ]; then
+        if ! "$tool" bootout "gui/$uid/$label" >/dev/null 2>&1; then
+            echo "${RED:-}Error: could not stop loaded local launchd job $label; no history or app identity was changed.${NORMAL:-}" >&2
+            return 1
+        fi
+    elif [ "$state" != "1" ]; then
+        echo "${RED:-}Error: could not inspect local launchd job $label; no history or app identity was changed.${NORMAL:-}" >&2
+        return 1
+    fi
+
+    state=0
+    local_launchagent_state "$label" || state=$?
+    if [ "$state" != "1" ]; then
+        echo "${RED:-}Error: local launchd job $label remains active or unverifiable; no history or app identity was changed.${NORMAL:-}" >&2
+        return 1
+    fi
+}
+
+# Return 0 when the unit is active/enabled, 1 when it is provably
+# inactive/disabled, and 2 when systemd cannot answer reliably.
+local_systemd_active_state() {
+    local service="$1" status=0
+    command -v systemctl >/dev/null 2>&1 || return 2
+    systemctl --user is-active --quiet "$service" >/dev/null 2>&1 || status=$?
+    case "$status" in
+        0) return 0 ;;
+        3|4) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+local_systemd_enabled_state() {
+    local service="$1" value="" status=0
+    command -v systemctl >/dev/null 2>&1 || return 2
+    value="$(systemctl --user is-enabled "$service" 2>/dev/null)" || status=$?
+    case "$value" in
+        enabled|enabled-runtime|linked|linked-runtime|alias) return 0 ;;
+        disabled|masked|masked-runtime|not-found) return 1 ;;
+        *)
+            [ "$status" = "0" ] && return 0
+            return 2
+            ;;
+    esac
+}
+
+stop_and_verify_local_systemd_service() {
+    local service="$1" unit_path="$2"
+    local active_state=0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [ -e "$unit_path" ] || [ -L "$unit_path" ]; then
+            echo "${RED:-}Error: systemctl is unavailable; local daemon supervisor quiescence cannot be verified.${NORMAL:-}" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    active_state=0
+    local_systemd_active_state "$service" || active_state=$?
+    if [ "$active_state" = "1" ]; then
+        return 0
+    fi
+    if [ "$active_state" = "2" ]; then
+        echo "${RED:-}Error: could not inspect local systemd service $service.${NORMAL:-}" >&2
+        return 1
+    fi
+    if ! systemctl --user stop "$service" >/dev/null 2>&1; then
+        echo "${RED:-}Error: could not stop local systemd service $service.${NORMAL:-}" >&2
+        return 1
+    fi
+
+    active_state=0
+    local_systemd_active_state "$service" || active_state=$?
+    if [ "$active_state" != "1" ]; then
+        echo "${RED:-}Error: local systemd service $service remains active or unverifiable.${NORMAL:-}" >&2
+        return 1
+    fi
+}
+
+disable_and_verify_local_systemd_service() {
+    local service="$1" unit_path="$2"
+    local active_state=0 enabled_state=0
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [ -e "$unit_path" ] || [ -L "$unit_path" ]; then
+            echo "${RED:-}Error: systemctl is unavailable; local daemon supervisor disablement cannot be verified.${NORMAL:-}" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    active_state=0
+    local_systemd_active_state "$service" || active_state=$?
+    enabled_state=0
+    local_systemd_enabled_state "$service" || enabled_state=$?
+    if [ "$active_state" = "1" ] && [ "$enabled_state" = "1" ]; then
+        return 0
+    fi
+    if [ "$active_state" = "2" ] || [ "$enabled_state" = "2" ]; then
+        echo "${RED:-}Error: could not inspect local systemd service $service.${NORMAL:-}" >&2
+        return 1
+    fi
+    if ! systemctl --user disable --now "$service" >/dev/null 2>&1; then
+        echo "${RED:-}Error: could not disable and stop local systemd service $service.${NORMAL:-}" >&2
+        return 1
+    fi
+
+    active_state=0
+    local_systemd_active_state "$service" || active_state=$?
+    enabled_state=0
+    local_systemd_enabled_state "$service" || enabled_state=$?
+    if [ "$active_state" != "1" ] || [ "$enabled_state" != "1" ]; then
+        echo "${RED:-}Error: local systemd service $service remains active, enabled, or unverifiable.${NORMAL:-}" >&2
+        return 1
+    fi
+}
+
 local_signing_keychain() {
     if [ -n "${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-}" ]; then
         printf '%s' "$CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN"
@@ -526,10 +683,11 @@ remove_legacy_local_app_path() {
     fi
 }
 
-# Remove only the retired local-development bundle. When TCC cleanup is
-# requested, keep the bundle available and registered until every scoped reset
-# succeeds so a failed reset remains retryable.
-cleanup_legacy_local_app() {
+# Authenticate and detach the retired local-development identity before a
+# caller moves or removes it. Keeping this separate from deletion lets the
+# installer stage the old bundle in a rollback slot until the replacement is
+# fully committed.
+prepare_legacy_local_app_removal() {
     local app="$1"
     local reset_tcc="${2:-1}"
     local expected_bundle_id="com.trycua.driver.local"
@@ -582,6 +740,19 @@ cleanup_legacy_local_app() {
         echo "${RED:-}Error: could not unregister retired local app $app; the app was preserved.${NORMAL:-}" >&2
         return 1
     fi
+}
+
+# Remove only the retired local-development bundle. When TCC cleanup is
+# requested, keep the bundle available and registered until every scoped reset
+# succeeds so a failed reset remains retryable.
+cleanup_legacy_local_app() {
+    local app="$1"
+    local reset_tcc="${2:-1}"
+    local expected_bundle_id="com.trycua.driver.local"
+
+    [ "${OS:-}" = "Darwin" ] || return 0
+    prepare_legacy_local_app_removal "$app" "$reset_tcc" || return 1
+    [ -e "$app" ] || [ -L "$app" ] || return 0
 
     if ! remove_legacy_local_app_path "$app"; then
         echo "${RED:-}Error: could not remove retired local app $app.${NORMAL:-}" >&2

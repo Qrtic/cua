@@ -11,6 +11,8 @@ import pytest
 
 INSTALL_LOCAL = Path(__file__).resolve().parents[1] / "_install-local-rust.sh"
 LOCAL_SIGNING = INSTALL_LOCAL.with_name("_local-signing.sh")
+INSTALL_COMMON = INSTALL_LOCAL.with_name("_install-common.sh")
+RELEASE_INSTALL = INSTALL_LOCAL.with_name("_install-rust.sh")
 DISPATCHER = INSTALL_LOCAL.with_name("install-local.sh")
 WINDOWS_INSTALL_LOCAL = INSTALL_LOCAL.with_name("install-local.ps1")
 SKILL_PACK = INSTALL_LOCAL.parents[1] / "rust/Skills/cua-driver"
@@ -47,6 +49,13 @@ def _extract_local_signing_function(name: str) -> str:
 
 def _extract_local_install_function(name: str) -> str:
     source = INSTALL_LOCAL.read_text(encoding="utf-8")
+    match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n", source)
+    assert match, f"could not find shell function {name}"
+    return match.group(0)
+
+
+def _extract_install_common_function(name: str) -> str:
+    source = INSTALL_COMMON.read_text(encoding="utf-8")
     match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n", source)
     assert match, f"could not find shell function {name}"
     return match.group(0)
@@ -213,18 +222,234 @@ def test_macos_local_install_rolls_back_on_registration_or_tcc_failure() -> None
     swap = source.index('&& ! mv "$APP_DEST" "$APP_BACKUP"', history_guard)
     register = source.index('if ! register_local_app "$APP_DEST"', install)
     reset = source.index("reset_local_tcc_after_requirement_change", register)
+    legacy_prepare = source.index("prepare_legacy_local_app_removal", reset)
+    legacy_stage = source.index(
+        'mv "$LEGACY_LOCAL_APP" "$LEGACY_LOCAL_APP_BACKUP"', legacy_prepare
+    )
     commit = source.index("LOCAL_APP_INSTALL_COMMITTED=1", reset)
     delete_backup = source.index("remove_authenticated_local_app_backup", commit)
-    legacy_cleanup = source.index('cleanup_legacy_local_app "$LEGACY_LOCAL_APP" 1')
+    autostart = source.index('if [ "$INSTALL_AUTOSTART" = true ]', commit)
 
-    assert trap < staged_verify < daemon_stop < history_guard < swap < register < reset < commit
-    assert commit < delete_backup < legacy_cleanup
+    assert (
+        trap
+        < staged_verify
+        < daemon_stop
+        < history_guard
+        < swap
+        < register
+        < reset
+        < legacy_prepare
+        < legacy_stage
+        < commit
+        < delete_backup
+        < autostart
+    )
     assert "trap 'exit 130' INT" in source
     assert "trap 'exit 143' TERM" in source
     assert "restore_local_app_backup" in source
+    assert "rollback_legacy_local_app_on_exit" in source
     assert '&& ! mv "$APP_DEST" "$APP_BACKUP"' in source
     assert source.index("LOCAL_APP_SWAP_STARTED=1", history_guard) < swap
     assert 'LEGACY_LOCAL_APP_OWNED:-0' in source
+
+
+def test_local_launchagent_quiescence_boots_out_keepalive_or_fails_closed(
+    tmp_path: Path,
+) -> None:
+    functions = "\n".join(
+        _extract_local_signing_function(name)
+        for name in ("local_launchagent_state", "stop_and_verify_local_launchagent")
+    )
+    state = tmp_path / "loaded"
+    state.write_text("loaded\n", encoding="utf-8")
+    calls = tmp_path / "calls"
+    launchctl = tmp_path / "launchctl"
+    _write_executable(
+        launchctl,
+        'printf "%s\\n" "$*" >> "$TEST_CALLS"\n'
+        'case "$1" in\n'
+        '  print) test -e "$TEST_STATE" && exit 0 || exit 113 ;;\n'
+        '  unload) exit 70 ;;\n'
+        '  bootout) test "${TEST_BOOTOUT_FAIL:-0}" = 1 && exit 71; rm -f "$TEST_STATE" ;;\n'
+        'esac\n',
+    )
+    plist = tmp_path / "local.plist"
+    plist.write_text("fixture\n", encoding="utf-8")
+    command = f"""set -euo pipefail
+    {functions}
+    OS=Darwin
+    CUA_DRIVER_LAUNCHCTL='{launchctl}'
+    stop_and_verify_local_launchagent '{plist}' com.trycua.cua-driver-local
+    """
+    env = {
+        **os.environ,
+        "TEST_STATE": str(state),
+        "TEST_CALLS": str(calls),
+    }
+    result = subprocess.run(
+        ["/bin/bash", "-c", command], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert not state.exists()
+    assert "bootout gui/" in calls.read_text(encoding="utf-8")
+
+    state.write_text("loaded\n", encoding="utf-8")
+    failed = subprocess.run(
+        ["/bin/bash", "-c", command],
+        env={**env, "TEST_BOOTOUT_FAIL": "1"},
+        text=True,
+        capture_output=True,
+    )
+    assert failed.returncode != 0
+    assert state.exists()
+    assert "could not stop loaded local launchd job" in failed.stderr
+
+
+def test_local_systemd_quiescence_requires_stop_and_verified_inactive_state(
+    tmp_path: Path,
+) -> None:
+    functions = "\n".join(
+        _extract_local_signing_function(name)
+        for name in (
+            "local_systemd_active_state",
+            "stop_and_verify_local_systemd_service",
+        )
+    )
+    systemctl = tmp_path / "systemctl"
+    state = tmp_path / "state"
+    state.write_text("enabled\n", encoding="utf-8")
+    _write_executable(
+        systemctl,
+        'case "$*" in\n'
+        '  *"is-active --quiet"*) test "$(cat "$TEST_STATE")" = enabled && exit 0 || exit 3 ;;\n'
+        '  *" stop "*) test "${TEST_STOP_FAIL:-0}" = 1 && exit 70; printf "disabled\\n" > "$TEST_STATE" ;;\n'
+        'esac\n',
+    )
+    command = f"""set -euo pipefail
+    {functions}
+    stop_and_verify_local_systemd_service cua-driver-local.service '{tmp_path / "unit"}'
+    """
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:/usr/bin:/bin",
+        "TEST_STATE": str(state),
+    }
+    result = subprocess.run(
+        ["/bin/bash", "-c", command], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert state.read_text(encoding="utf-8").strip() == "disabled"
+
+    state.write_text("enabled\n", encoding="utf-8")
+    failed = subprocess.run(
+        ["/bin/bash", "-c", command],
+        env={**env, "TEST_STOP_FAIL": "1"},
+        text=True,
+        capture_output=True,
+    )
+    assert failed.returncode != 0
+    assert "could not stop" in failed.stderr
+
+
+def test_linux_local_installer_quiesces_before_replacing_runtime() -> None:
+    source = INSTALL_LOCAL.read_text(encoding="utf-8")
+    quiesce = source.index(
+        '&& ! stop_local_linux_daemons_before_runtime_change'
+    )
+    first_stage = source.index('stage_binary "$BUILT_BINARY"')
+    second_quiesce = source.index(
+        "stop_local_linux_daemons_before_runtime_change", first_stage
+    )
+    autostart = source.index('if [ "$INSTALL_AUTOSTART" = true ]', second_quiesce)
+
+    assert quiesce < first_stage < second_quiesce < autostart
+
+
+def test_release_linux_shutdown_covers_current_and_legacy_systemd_units() -> None:
+    source = INSTALL_COMMON.read_text(encoding="utf-8")
+    stop = _extract_install_common_function("stop_cua_driver_daemons")
+    release = RELEASE_INSTALL.read_text(encoding="utf-8")
+    linux_branch = release.index("# Linux: versioned-dirs + atomic `current` symlink swap.")
+    quiesce = release.index("if ! stop_cua_driver_daemons", linux_branch)
+    install_binary = release.index('install -m 0755 "$SRC"', quiesce)
+
+    assert "cua-driver.service" in stop
+    assert "cua-driver-rs.service" in stop
+    assert stop.count("stop_and_verify_cua_systemd_service") == 2
+    assert "|| true" not in "\n".join(
+        line for line in stop.splitlines() if "systemctl" in line
+    )
+    assert quiesce < install_binary
+
+
+def test_release_systemd_quiescence_fails_when_stop_fails(tmp_path: Path) -> None:
+    functions = "\n".join(
+        _extract_install_common_function(name)
+        for name in (
+            "cua_systemd_active_state",
+            "stop_and_verify_cua_systemd_service",
+        )
+    )
+    systemctl = tmp_path / "systemctl"
+    _write_executable(
+        systemctl,
+        'case "$*" in\n'
+        '  *"is-active --quiet"*) exit 0 ;;\n'
+        '  *" stop "*) exit 70 ;;\n'
+        'esac\n',
+    )
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {functions}
+            stop_and_verify_cua_systemd_service cua-driver.service '{tmp_path / "unit"}'
+            """,
+        ],
+        env={**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "could not stop" in result.stderr
+
+
+def test_interrupted_local_install_restores_staged_legacy_app(tmp_path: Path) -> None:
+    function = _extract_local_install_function("rollback_legacy_local_app_on_exit")
+    legacy = tmp_path / "CuaDriverLocal.app"
+    backup = tmp_path / "CuaDriverLocal.app.install-backup"
+    backup.mkdir()
+    registration = tmp_path / "registered"
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {function}
+            verify_local_app_identity() {{ return 0; }}
+            register_legacy_local_app() {{ printf registered > '{registration}'; }}
+            remove_authenticated_local_app_backup() {{ return 70; }}
+            LEGACY_LOCAL_APP_REMOVAL_STARTED=1
+            LOCAL_APP_INSTALL_COMMITTED=0
+            LEGACY_LOCAL_APP='{legacy}'
+            LEGACY_LOCAL_APP_BACKUP='{backup}'
+            rollback_legacy_local_app_on_exit
+            [[ -d "$LEGACY_LOCAL_APP" ]]
+            [[ ! -e "$LEGACY_LOCAL_APP_BACKUP" ]]
+            [[ "$LEGACY_LOCAL_APP_REMOVAL_STARTED" == 0 ]]
+            """,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert legacy.is_dir()
+    assert registration.read_text(encoding="utf-8") == "registered"
 
 
 @pytest.mark.parametrize(
@@ -360,7 +585,10 @@ chmod +x "$CARGO_TARGET_DIR/release/cua-cursor-theme"
 esac
 """,
     )
-    _write_executable(fake_bin / "systemctl", "exit 0")
+    _write_executable(
+        fake_bin / "systemctl",
+        'case "$*" in *"is-active --quiet"*) exit 4 ;; *"is-enabled"*) printf "not-found\\n"; exit 1 ;; *) exit 0 ;; esac\n',
+    )
     _write_executable(fake_bin / "pkill", "exit 0")
 
     user_home = tmp_path / "home"
@@ -439,7 +667,10 @@ chmod +x "$CARGO_TARGET_DIR/debug/cua-cursor-theme"
 esac
 """,
     )
-    _write_executable(fake_bin / "systemctl", "exit 0")
+    _write_executable(
+        fake_bin / "systemctl",
+        'case "$*" in *"is-active --quiet"*) exit 4 ;; *"is-enabled"*) printf "not-found\\n"; exit 1 ;; *) exit 0 ;; esac\n',
+    )
     _write_executable(fake_bin / "pkill", "exit 0")
 
     user_home = tmp_path / "home"

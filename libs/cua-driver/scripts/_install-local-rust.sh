@@ -40,6 +40,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Shared process, supervisor, and macOS signing helpers have no top-level side
+# effects. Load them before staging so Linux can prove the old supervised
+# daemon is quiescent before replacing its executable.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=_local-signing.sh
+. "$SCRIPT_DIR/_local-signing.sh"
 # Rust workspace root: scripts/ is the cross-cutting installer dir at
 # libs/cua-driver/scripts/; the Cargo workspace lives one level deeper
 # under libs/cua-driver/rust/.
@@ -243,6 +249,7 @@ case "$BIN_DIR" in
 esac
 RELEASES_DIR="$HOME_DIR/packages/releases"
 CURRENT_LINK="$HOME_DIR/packages/current"
+LOCAL_SYSTEMD_UNIT="$HOME/.config/systemd/user/cua-driver-local.service"
 
 VERSION_TAG="0.0.0-local-$BUILD_CONFIG"
 VERSIONED_DIR="$RELEASES_DIR/$VERSION_TAG-$TARGET_TRIPLE"
@@ -314,6 +321,37 @@ if [ ! -x "$BUILT_THEME_BINARY" ]; then
     exit 1
 fi
 echo ""
+
+stop_local_linux_daemons_before_runtime_change() {
+    local candidate resolved records="" status=0
+    local owned_paths=(
+        "$BIN_DIR/cua-driver-local"
+        "$CURRENT_LINK/cua-driver-local"
+    )
+    stop_and_verify_local_systemd_service \
+        "cua-driver-local.service" "$LOCAL_SYSTEMD_UNIT" || return 1
+    for candidate in "$HOME_DIR"/packages/releases/*/cua-driver-local; do
+        [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        owned_paths+=("$candidate")
+    done
+    for candidate in "${owned_paths[@]}"; do
+        resolved="$(realpath "$candidate" 2>/dev/null || true)"
+        [ -n "$resolved" ] && owned_paths+=("$resolved")
+    done
+    stop_verified_local_processes 0 "${owned_paths[@]}" || return 1
+    stop_and_verify_local_systemd_service \
+        "cua-driver-local.service" "$LOCAL_SYSTEMD_UNIT" || return 1
+    records="$(local_owned_process_records 0 "${owned_paths[@]}")" || status=$?
+    if [ "$status" != "0" ] || [ -n "$records" ]; then
+        echo "${RED:-}Error: local daemon respawned or could not be inspected after systemd shutdown.${NORMAL:-}" >&2
+        return 1
+    fi
+}
+
+if [ "$OS" = "Linux" ] \
+   && ! stop_local_linux_daemons_before_runtime_change; then
+    exit 1
+fi
 
 # --- Stage into versioned release dir + repoint `current` --------------
 
@@ -425,10 +463,8 @@ echo ""
 # --- macOS: stable local code-signing identity (so TCC grants survive rebuilds) ---
 #
 # Keep policy in a sourceable helper so strict/fallback behavior can be tested
-# without building or installing the app.
-# shellcheck source-path=SCRIPTDIR
-# shellcheck source=_local-signing.sh
-. "$SCRIPT_DIR/_local-signing.sh"
+# without building or installing the app. The helper is sourced above because
+# Linux shutdown must run before the versioned runtime is replaced.
 
 # --- macOS: wrap the binary in MuseCodeCuaDriverLocal.app for a stable TCC identity ---
 #
@@ -442,11 +478,15 @@ echo ""
 # the visible bin at the binary INSIDE the bundle. Linux/Windows have no
 # .app concept and keep the bare-binary symlink below.
 APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"
+LEGACY_LOCAL_APP="/Applications/CuaDriverLocal.app"
 LOCAL_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver-local/computer-history"
 LOCAL_APP_SWAP_STARTED=0
 LOCAL_APP_HAD_PREVIOUS=0
 LOCAL_APP_INSTALL_COMMITTED=0
 LOCAL_APP_BACKUP=""
+LEGACY_LOCAL_APP_OWNED=0
+LEGACY_LOCAL_APP_REMOVAL_STARTED=0
+LEGACY_LOCAL_APP_BACKUP=""
 
 rollback_local_app_on_exit() {
     [ "$LOCAL_APP_SWAP_STARTED" = "1" ] || return 0
@@ -472,10 +512,57 @@ rollback_local_app_on_exit() {
     fi
 }
 
+rollback_legacy_local_app_on_exit() {
+    [ "$LEGACY_LOCAL_APP_REMOVAL_STARTED" = "1" ] || return 0
+
+    if [ "$LOCAL_APP_INSTALL_COMMITTED" = "1" ]; then
+        if ! remove_authenticated_local_app_backup "$LEGACY_LOCAL_APP_BACKUP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: committed local install is usable, but its authenticated legacy-app backup could not be removed.${NORMAL:-}" >&2
+            return 1
+        fi
+        LEGACY_LOCAL_APP_REMOVAL_STARTED=0
+        return 0
+    fi
+
+    if [ -e "$LEGACY_LOCAL_APP_BACKUP" ] || [ -L "$LEGACY_LOCAL_APP_BACKUP" ]; then
+        if ! verify_local_app_identity "$LEGACY_LOCAL_APP_BACKUP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: refusing to restore unauthenticated legacy local-app backup at $LEGACY_LOCAL_APP_BACKUP.${NORMAL:-}" >&2
+            return 1
+        fi
+        if [ -e "$LEGACY_LOCAL_APP" ] || [ -L "$LEGACY_LOCAL_APP" ]; then
+            echo "${RED:-}Error: refusing to overwrite $LEGACY_LOCAL_APP while restoring its authenticated backup.${NORMAL:-}" >&2
+            return 1
+        fi
+        if ! mv "$LEGACY_LOCAL_APP_BACKUP" "$LEGACY_LOCAL_APP" \
+           || ! register_legacy_local_app "$LEGACY_LOCAL_APP"; then
+            echo "${RED:-}Error: could not restore and register legacy local app $LEGACY_LOCAL_APP.${NORMAL:-}" >&2
+            return 1
+        fi
+    elif [ -e "$LEGACY_LOCAL_APP" ] || [ -L "$LEGACY_LOCAL_APP" ]; then
+        # Preparation can fail after unregistering but before the atomic move.
+        if ! verify_local_app_identity "$LEGACY_LOCAL_APP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: refusing to re-register unauthenticated legacy local app $LEGACY_LOCAL_APP.${NORMAL:-}" >&2
+            return 1
+        fi
+        if ! register_legacy_local_app "$LEGACY_LOCAL_APP"; then
+            echo "${RED:-}Error: could not re-register preserved legacy local app $LEGACY_LOCAL_APP.${NORMAL:-}" >&2
+            return 1
+        fi
+    fi
+    LEGACY_LOCAL_APP_REMOVAL_STARTED=0
+    echo "${YELLOW:-}warning: restored the legacy local app after an interrupted installation.${NORMAL:-}" >&2
+}
+
 local_install_exit() {
     local status=$?
     trap - EXIT INT TERM
     if ! rollback_local_app_on_exit; then
+        status=1
+    fi
+    if ! rollback_legacy_local_app_on_exit; then
         status=1
     fi
     exit "$status"
@@ -495,8 +582,11 @@ stop_local_daemons_before_identity_check() {
         "$CURRENT_LINK/cua-driver-local"
         "$APP_DEST/Contents/MacOS/cua-driver-local"
     )
-    launchctl unload "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" \
-        >/dev/null 2>&1 || true
+    if ! stop_and_verify_local_launchagent \
+        "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" \
+        "com.trycua.cua-driver-local"; then
+        return 1
+    fi
     if [ "${LEGACY_LOCAL_APP_OWNED:-0}" = "1" ]; then
         owned_paths+=("$LEGACY_LOCAL_APP/Contents/MacOS/cua-driver-local")
     fi
@@ -543,8 +633,6 @@ if [ "$OS" = "Darwin" ]; then
             exit 1
         fi
     fi
-    LEGACY_LOCAL_APP="/Applications/CuaDriverLocal.app"
-    LEGACY_LOCAL_APP_OWNED=0
     if [ -e "$LEGACY_LOCAL_APP" ] || [ -L "$LEGACY_LOCAL_APP" ]; then
         if ! verify_local_app_identity "$LEGACY_LOCAL_APP" \
             "com.trycua.driver.local" "cua-driver-local"; then
@@ -595,21 +683,37 @@ if [ "$OS" = "Darwin" ]; then
     if ! stop_local_daemons_before_identity_check; then
         exit 1
     fi
-    for _history_check in 1 2; do
-        if [ "$REQUIREMENT_COMPATIBILITY" = "incompatible" ] \
-           && ! refuse_local_history_identity_transition \
-                "$LOCAL_HISTORY_ROOT" "$APP_DEST" \
-                "replace the current local signer identity"; then
-            exit 1
-        fi
-        if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ] \
-           && ! refuse_local_history_identity_transition \
-                "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
-                "remove the legacy local app identity"; then
-            exit 1
-        fi
-    done
-    unset _history_check
+    if [ "$REQUIREMENT_COMPATIBILITY" = "incompatible" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$APP_DEST" \
+            "replace the current local signer identity"; then
+        exit 1
+    fi
+    if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+            "remove the legacy local app identity"; then
+        exit 1
+    fi
+
+    # Re-check both the supervisor and exact process generations immediately
+    # before the first bundle move. A failed/unloaded KeepAlive job must not
+    # respawn into the gap between history preflight and signer replacement.
+    if ! stop_local_daemons_before_identity_check; then
+        exit 1
+    fi
+    if [ "$REQUIREMENT_COMPATIBILITY" = "incompatible" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$APP_DEST" \
+            "replace the current local signer identity"; then
+        exit 1
+    fi
+    if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ] \
+       && ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+            "remove the legacy local app identity"; then
+        exit 1
+    fi
 
     # Install to /Applications (user-writable for admins; no sudo — same as
     # install.sh). Keep the prior bundle available until the copy completes so
@@ -697,33 +801,19 @@ INSTALLED_BIN="$BIN_DIR/cua-driver-local"
 
 # --- Stop any pre-swap cua-driver daemons ------------------------------
 #
-# Mirror of install-local.ps1's daemon kill — the new binary is now
-# under packages/current/, but any LaunchAgent / systemd user unit /
-# manual `serve` shell is still running off the OLD binary. Stop them
-# so the next invocation picks up this build. Best-effort, never
-# fails the install. Survivors (rare on Unix — `pkill` reaches all
-# user-owned procs without elevation) get a yellow hint.
+# Re-check after publishing the new binary. The pre-stage Linux shutdown above
+# prevents replacement under an active Restart unit; this second pass catches
+# an independently started process before optional autostart is re-enabled.
 #
-# NOTE: do not use `pkill -x cua-driver-local`. `-x` compares against the
-# kernel's truncated process name — 15 chars on Linux (`comm`) — and
-# `cua-driver-local` is 16, so on Linux it silently matched nothing and
-# every pre-swap daemon survived the install. Match argv[0] instead, and
-# anchor it: an unanchored `-f` pattern also matches the launcher shells
-# whose script *text* contains the daemon path, killing the surrounding
-# session rather than the daemon.
 if [ "$OS" = "Darwin" ]; then
     if ! stop_local_daemons_before_identity_check; then
         exit 1
     fi
-elif [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl --user stop cua-driver-local.service >/dev/null 2>&1 || true
-    for _daemon_bin in "$INSTALLED_BIN" "$BIN_TARGET"; do
-        [ -n "$_daemon_bin" ] || continue
-        _daemon_pattern="$(escape_extended_regex "$_daemon_bin")"
-        pkill -f "^${_daemon_pattern}([[:space:]]|\$)" >/dev/null 2>&1 || true
-    done
+elif [ "$OS" = "Linux" ]; then
+    if ! stop_local_linux_daemons_before_runtime_change; then
+        exit 1
+    fi
 fi
-unset _daemon_bin _daemon_pattern
 
 # An incompatible signing transition leaves the old csreq attached to this
 # bundle's TCC rows. Once the new bundle is registered and old daemons are
@@ -732,12 +822,48 @@ if [ "$OS" = "Darwin" ]; then
     if ! reset_local_tcc_after_requirement_change "$INSTALLED_COMPATIBILITY"; then
         exit 1
     fi
+
+    # Retire the legacy identity transactionally before the replacement becomes
+    # committed or any KeepAlive job can launch it. The authenticated old app
+    # stays in a rollback slot until both identities have completed their TCC
+    # and LaunchServices transitions.
+    if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ]; then
+        if ! stop_local_daemons_before_identity_check; then
+            exit 1
+        fi
+        if ! refuse_local_history_identity_transition \
+            "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+            "remove the legacy local app identity"; then
+            exit 1
+        fi
+        LEGACY_LOCAL_APP_BACKUP="${LEGACY_LOCAL_APP}.install-backup.$$"
+        if [ -e "$LEGACY_LOCAL_APP_BACKUP" ] || [ -L "$LEGACY_LOCAL_APP_BACKUP" ]; then
+            echo "${RED}Error: refusing to overwrite legacy local-app backup path $LEGACY_LOCAL_APP_BACKUP.${NORMAL}" >&2
+            exit 1
+        fi
+        LEGACY_LOCAL_APP_REMOVAL_STARTED=1
+        if ! prepare_legacy_local_app_removal "$LEGACY_LOCAL_APP" 1; then
+            exit 1
+        fi
+        if ! mv "$LEGACY_LOCAL_APP" "$LEGACY_LOCAL_APP_BACKUP"; then
+            echo "${RED}Error: could not move the authenticated legacy local app into its rollback slot.${NORMAL}" >&2
+            exit 1
+        fi
+        echo "${YELLOW}staged retired local app $LEGACY_LOCAL_APP for removal${NORMAL}" >&2
+    fi
+
     LOCAL_APP_INSTALL_COMMITTED=1
     if ! remove_authenticated_local_app_backup "$APP_BACKUP" \
         "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
         exit 1
     fi
+    if [ "$LEGACY_LOCAL_APP_REMOVAL_STARTED" = "1" ] \
+       && ! remove_authenticated_local_app_backup "$LEGACY_LOCAL_APP_BACKUP" \
+            "com.trycua.driver.local" "cua-driver-local"; then
+        exit 1
+    fi
     LOCAL_APP_SWAP_STARTED=0
+    LEGACY_LOCAL_APP_REMOVAL_STARTED=0
 fi
 
 # Agent skill pack symlinks: NOT auto-created. Run
@@ -795,14 +921,6 @@ EOF
         echo "${GREEN}Enabled.${NORMAL} Manage with systemctl --user {start|stop|status} cua-driver-local."
     fi
     echo ""
-fi
-
-# The old local bundle has a different TCC identity and can otherwise remain as
-# a duplicate Accessibility entry. Remove it only after the replacement and
-# optional autostart setup completed, and only after exact identity validation
-# plus scoped TCC resets succeed.
-if [ "$OS" = "Darwin" ]; then
-    cleanup_legacy_local_app "$LEGACY_LOCAL_APP" 1
 fi
 
 # --- Done ---------------------------------------------------------------

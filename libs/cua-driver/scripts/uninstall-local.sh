@@ -44,6 +44,37 @@ SYSTEMD_UNIT="$HOME/.config/systemd/user/cua-driver-local.service"
 
 log() { printf '==> %s\n' "$*"; }
 
+remove_and_verify_local_systemd_service() {
+    local service="$1" unit_path="$2"
+    local active_state=0 enabled_state=0
+
+    disable_and_verify_local_systemd_service "$service" "$unit_path" || return 1
+    if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+        if ! rm -f -- "$unit_path"; then
+            echo "error: could not remove systemd user unit $unit_path; runtime was preserved" >&2
+            return 1
+        fi
+    fi
+    if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+        echo "error: systemd user unit $unit_path remains after removal; runtime was preserved" >&2
+        return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl --user daemon-reload >/dev/null 2>&1; then
+            echo "error: systemd user manager reload failed; runtime was preserved" >&2
+            return 1
+        fi
+        active_state=0
+        local_systemd_active_state "$service" || active_state=$?
+        enabled_state=0
+        local_systemd_enabled_state "$service" || enabled_state=$?
+        if [[ "$active_state" != "1" || "$enabled_state" != "1" ]]; then
+            echo "error: local systemd service $service reappeared or remains enabled after cleanup; runtime was preserved" >&2
+            return 1
+        fi
+    fi
+}
+
 CURRENT_LOCAL_BUNDLE_ID="com.meta.musecode.cua.driver.local"
 LEGACY_LOCAL_BUNDLE_ID="com.trycua.driver.local"
 LOCAL_EXECUTABLE="cua-driver-local"
@@ -420,17 +451,25 @@ if [[ "$OS" == "Darwin" && "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
     fi
 fi
 
-# Stop only local autostart/process identities.
-if [[ "$OS" == "Darwin" && -f "$LAUNCHAGENT" ]]; then
-    launchctl unload "$LAUNCHAGENT" 2>/dev/null || true
-    rm -f "$LAUNCHAGENT"
-    log "removed LaunchAgent $LAUNCHAGENT"
-elif [[ "$OS" == "Linux" && -f "$SYSTEMD_UNIT" ]]; then
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl --user disable --now cua-driver-local.service 2>/dev/null || true
+# Stop only local autostart/process identities. A failed unload/disable must not
+# be hidden: KeepAlive/Restart can otherwise repopulate the process set after a
+# successful snapshot scan and before history or app removal.
+if [[ "$OS" == "Darwin" ]]; then
+    if ! stop_and_verify_local_launchagent \
+        "$LAUNCHAGENT" "com.trycua.cua-driver-local"; then
+        exit 1
     fi
-    rm -f "$SYSTEMD_UNIT"
-    log "removed systemd user unit $SYSTEMD_UNIT"
+    if [[ -f "$LAUNCHAGENT" ]]; then
+        rm -f "$LAUNCHAGENT"
+        log "removed LaunchAgent $LAUNCHAGENT"
+    fi
+elif [[ "$OS" == "Linux" ]]; then
+    if ! remove_and_verify_local_systemd_service \
+        "cua-driver-local.service" "$SYSTEMD_UNIT"; then
+        exit 1
+    fi
+    [[ ! -e "$SYSTEMD_UNIT" ]] \
+        && log "stopped and removed systemd user unit $SYSTEMD_UNIT"
 fi
 # Enumerate candidates by name, authenticate each command path against the
 # verified local installation, capture process generation, and re-check before
@@ -438,6 +477,22 @@ fi
 # app deletion.
 if ! stop_verified_local_daemons; then
     exit 1
+fi
+# Verify the supervisor again after process termination, then perform one final
+# exact-generation scan. This makes a supervised respawn a hard failure before
+# the second history gate and all TCC/app mutations.
+if [[ "$OS" == "Darwin" ]]; then
+    if ! stop_and_verify_local_launchagent \
+        "$LAUNCHAGENT" "com.trycua.cua-driver-local" \
+       || ! verify_local_daemons_absent; then
+        exit 1
+    fi
+elif [[ "$OS" == "Linux" ]]; then
+    if ! stop_and_verify_local_systemd_service \
+        "cua-driver-local.service" "$SYSTEMD_UNIT" \
+       || ! verify_local_daemons_absent; then
+        exit 1
+    fi
 fi
 # Repeat the history gate only after every verified daemon has stopped. This
 # closes the race where a live writer creates a new chunk after the preflight

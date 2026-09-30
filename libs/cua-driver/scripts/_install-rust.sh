@@ -119,12 +119,15 @@ if [[ "$_cua_install_common_loaded" == "0" ]] && command -v curl >/dev/null 2>&1
     rm -f "$_cua_install_common_tmp" 2>/dev/null || true
 fi
 if [[ "$_cua_install_common_loaded" == "0" ]]; then
-    # Stubs so call sites stay unconditional. Print a one-line warning
-    # so a fetch failure shows up in the install log, but don't fail
-    # the install over it — the binary swap below is the load-bearing
-    # part, daemon cleanup is "nice to have".
-    printf 'warning: could not load _install-common.sh (on-disk + network); daemon kill skipped\n' >&2
-    stop_cua_driver_daemons() { :; }
+    # Linux cannot safely replace a supervised executable without these
+    # helpers: Restart can repopulate the process set after a name-based kill.
+    printf 'warning: could not load _install-common.sh (on-disk + network)\n' >&2
+    stop_cua_driver_daemons() {
+        if [[ "$(uname -s 2>/dev/null || echo unknown)" == "Linux" ]]; then
+            printf 'error: daemon supervisor quiescence helpers are unavailable; refusing the install\n' >&2
+            return 1
+        fi
+    }
     show_cua_driver_daemon_survivors() { :; }
 fi
 
@@ -178,6 +181,7 @@ MACOS_CODESIGN="/usr/bin/codesign"
 MACOS_SPCTL="/usr/sbin/spctl"
 MACOS_TCCUTIL="/usr/bin/tccutil"
 MACOS_LSOF="/usr/sbin/lsof"
+MACOS_LAUNCHCTL="/bin/launchctl"
 MACOS_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver/computer-history"
 
 while [[ $# -gt 0 ]]; do
@@ -431,6 +435,62 @@ macos_unregister_app() {
         && "$MACOS_LSREGISTER" -u "$app" >/dev/null 2>&1
 }
 
+macos_launchagent_state() {
+    local label="$1" uid status=0
+    [[ -x "$MACOS_LAUNCHCTL" ]] || return 2
+    uid="$(id -u 2>/dev/null || true)"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 2
+    "$MACOS_LAUNCHCTL" print "gui/$uid/$label" >/dev/null 2>&1 || status=$?
+    case "$status" in
+        0) return 0 ;;
+        113) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+macos_stop_and_verify_launchagent() {
+    local plist="$1" label="$2" uid state=0
+    [[ -x "$MACOS_LAUNCHCTL" ]] || {
+        err "launchctl is unavailable; daemon supervisor quiescence cannot be verified"
+        return 1
+    }
+    uid="$(id -u 2>/dev/null || true)"
+    [[ "$uid" =~ ^[0-9]+$ ]] || {
+        err "current user identity is unavailable; daemon supervisor quiescence cannot be verified"
+        return 1
+    }
+    if [[ -f "$plist" ]]; then
+        "$MACOS_LAUNCHCTL" unload "$plist" >/dev/null 2>&1 || true
+    fi
+    state=0
+    macos_launchagent_state "$label" || state=$?
+    if [[ "$state" == "0" ]]; then
+        if ! "$MACOS_LAUNCHCTL" bootout "gui/$uid/$label" >/dev/null 2>&1; then
+            err "could not stop loaded launchd job $label"
+            return 1
+        fi
+    elif [[ "$state" != "1" ]]; then
+        err "could not inspect launchd job $label"
+        return 1
+    fi
+    state=0
+    macos_launchagent_state "$label" || state=$?
+    if [[ "$state" != "1" ]]; then
+        err "launchd job $label remains active or unverifiable"
+        return 1
+    fi
+}
+
+macos_stop_and_verify_install_supervisors() {
+    macos_stop_and_verify_launchagent \
+        "$HOME/Library/LaunchAgents/com.trycua.cua-driver.plist" \
+        "com.trycua.cua-driver" \
+        || return 1
+    macos_stop_and_verify_launchagent \
+        "$HOME/Library/LaunchAgents/com.trycua.cua-driver-rs.plist" \
+        "com.trycua.cua-driver-rs"
+}
+
 # Return the source form of an app's designated code-signing requirement.
 macos_designated_requirement() {
     "$MACOS_CODESIGN" -d -r- "$1" 2>/dev/null \
@@ -628,13 +688,8 @@ macos_wait_for_owned_process_exit() {
 }
 
 stop_authenticated_macos_daemons() {
-    local plist records="" status=0 pid generation wait_status
-    for plist in \
-        "$HOME/Library/LaunchAgents/com.trycua.cua-driver.plist" \
-        "$HOME/Library/LaunchAgents/com.trycua.cua-driver-rs.plist"; do
-        [[ -f "$plist" ]] || continue
-        launchctl unload "$plist" >/dev/null 2>&1 || true
-    done
+    local records="" status=0 pid generation wait_status
+    macos_stop_and_verify_install_supervisors || return 1
     records="$(macos_install_owned_process_records "$@")" || status=$?
     [[ "$status" == "0" ]] || {
         err "could not inspect installed Cua Driver processes before replacement"
@@ -660,6 +715,10 @@ stop_authenticated_macos_daemons() {
             [[ "$wait_status" == "0" ]] || return 1
         fi
     done <<< "$records"
+    # Re-check launchd after signalling. A KeepAlive job that survived the
+    # first unload can otherwise respawn in the gap between the final PID scan
+    # and the signing/history identity swap.
+    macos_stop_and_verify_install_supervisors || return 1
     records=""
     status=0
     records="$(macos_install_owned_process_records "$@")" || status=$?
@@ -677,10 +736,7 @@ macos_stage_legacy_rs_removal() {
     fi
     MACOS_LEGACY_RS_REMOVAL_STARTED=1
     if ! mv "$LEGACY_RS_APP_DEST" "$MACOS_LEGACY_RS_BACKUP"; then
-        MACOS_LEGACY_RS_REMOVAL_STARTED=0
         err "could not stage authenticated legacy CuaDriverRs.app for removal"
-        macos_register_app "$LEGACY_RS_APP_DEST" \
-            || err "could not re-register legacy CuaDriverRs.app after failed removal staging"
         return 1
     fi
 }
@@ -747,9 +803,7 @@ restore_macos_app_backup_on_exit() {
     fi
 
     if [[ "$MACOS_APP_HAD_PREVIOUS" == "1" ]]; then
-        # If the backup does not exist, the atomic move never completed or an
-        # explicit rollback already restored it. Leave the live path alone.
-        if [[ -e "$MACOS_APP_BACKUP" ]]; then
+        if [[ -e "$MACOS_APP_BACKUP" || -L "$MACOS_APP_BACKUP" ]]; then
             if ! macos_verify_release_app "$MACOS_APP_BACKUP" \
                 "$MACOS_APP_BACKUP_BUNDLE_ID" "$BINARY_NAME" \
                 "$MACOS_APP_BACKUP_TEAM_ID" 0; then
@@ -807,6 +861,25 @@ restore_macos_app_backup_on_exit() {
                 return 1
             fi
             printf 'warning: interrupted macOS install restored the previous CuaDriver.app\n' >&2
+        elif [[ -e "$APP_DEST" || -L "$APP_DEST" ]]; then
+            # Legacy migration preparation unregisters the source before its
+            # atomic move. If preparation or the move is interrupted, verify
+            # the still-live source identity before restoring registration.
+            if ! macos_verify_release_app "$APP_DEST" \
+                "$MACOS_APP_BACKUP_BUNDLE_ID" "$BINARY_NAME" \
+                "$MACOS_APP_BACKUP_TEAM_ID" 0; then
+                printf 'warning: refusing to re-register unauthenticated previous CuaDriver.app at %s\n' \
+                    "$APP_DEST" >&2
+                return 1
+            fi
+            if ! macos_register_app "$APP_DEST"; then
+                printf 'warning: could not re-register preserved previous CuaDriver.app with LaunchServices\n' >&2
+                return 1
+            fi
+            printf 'warning: interrupted macOS install re-registered the preserved previous CuaDriver.app\n' >&2
+        else
+            printf 'warning: previous CuaDriver.app is missing from both its source and rollback paths\n' >&2
+            return 1
         fi
     else
         # A first install has no app to restore. Remove only an authenticated
@@ -839,36 +912,63 @@ restore_macos_app_backup_on_exit() {
 
 restore_macos_legacy_rs_backup_on_exit() {
     [[ "$MACOS_LEGACY_RS_REMOVAL_STARTED" == "1" ]] || return 0
-    [[ -e "$MACOS_LEGACY_RS_BACKUP" || -L "$MACOS_LEGACY_RS_BACKUP" ]] || return 0
-    if ! macos_verify_release_app "$MACOS_LEGACY_RS_BACKUP" \
-        "$LEGACY_RS_BUNDLE_ID" "$BINARY_NAME" "$LEGACY_PRODUCTION_TEAM_ID" 0; then
-        printf 'warning: preserving unauthenticated legacy CuaDriverRs backup at %s\n' \
-            "$MACOS_LEGACY_RS_BACKUP" >&2
-        return 1
-    fi
     if [[ "$MACOS_LEGACY_RS_REMOVAL_COMMITTED" == "1" ]]; then
-        if ! rm -rf "$MACOS_LEGACY_RS_BACKUP"; then
-            printf 'warning: could not remove committed legacy CuaDriverRs backup at %s\n' \
-                "$MACOS_LEGACY_RS_BACKUP" >&2
-            return 1
+        if [[ -e "$MACOS_LEGACY_RS_BACKUP" || -L "$MACOS_LEGACY_RS_BACKUP" ]]; then
+            if ! macos_verify_release_app "$MACOS_LEGACY_RS_BACKUP" \
+                "$LEGACY_RS_BUNDLE_ID" "$BINARY_NAME" \
+                "$LEGACY_PRODUCTION_TEAM_ID" 0; then
+                printf 'warning: preserving unauthenticated legacy CuaDriverRs backup at %s\n' \
+                    "$MACOS_LEGACY_RS_BACKUP" >&2
+                return 1
+            fi
+            if ! rm -rf "$MACOS_LEGACY_RS_BACKUP"; then
+                printf 'warning: could not remove committed legacy CuaDriverRs backup at %s\n' \
+                    "$MACOS_LEGACY_RS_BACKUP" >&2
+                return 1
+            fi
         fi
         return 0
     fi
-    if [[ -e "$LEGACY_RS_APP_DEST" || -L "$LEGACY_RS_APP_DEST" ]]; then
-        printf 'warning: refusing to overwrite path while restoring legacy CuaDriverRs.app: %s\n' \
-            "$LEGACY_RS_APP_DEST" >&2
+    if [[ -e "$MACOS_LEGACY_RS_BACKUP" || -L "$MACOS_LEGACY_RS_BACKUP" ]]; then
+        if ! macos_verify_release_app "$MACOS_LEGACY_RS_BACKUP" \
+            "$LEGACY_RS_BUNDLE_ID" "$BINARY_NAME" \
+            "$LEGACY_PRODUCTION_TEAM_ID" 0; then
+            printf 'warning: preserving unauthenticated legacy CuaDriverRs backup at %s\n' \
+                "$MACOS_LEGACY_RS_BACKUP" >&2
+            return 1
+        fi
+        if [[ -e "$LEGACY_RS_APP_DEST" || -L "$LEGACY_RS_APP_DEST" ]]; then
+            printf 'warning: refusing to overwrite path while restoring legacy CuaDriverRs.app: %s\n' \
+                "$LEGACY_RS_APP_DEST" >&2
+            return 1
+        fi
+        if ! mv "$MACOS_LEGACY_RS_BACKUP" "$LEGACY_RS_APP_DEST"; then
+            printf 'warning: could not restore legacy CuaDriverRs.app from %s\n' \
+                "$MACOS_LEGACY_RS_BACKUP" >&2
+            return 1
+        fi
+        if ! macos_register_app "$LEGACY_RS_APP_DEST"; then
+            printf 'warning: restored legacy CuaDriverRs.app but could not re-register it\n' >&2
+            return 1
+        fi
+        printf 'warning: interrupted install restored legacy CuaDriverRs.app\n' >&2
+    elif [[ -e "$LEGACY_RS_APP_DEST" || -L "$LEGACY_RS_APP_DEST" ]]; then
+        if ! macos_verify_release_app "$LEGACY_RS_APP_DEST" \
+            "$LEGACY_RS_BUNDLE_ID" "$BINARY_NAME" \
+            "$LEGACY_PRODUCTION_TEAM_ID" 0; then
+            printf 'warning: refusing to re-register unauthenticated legacy CuaDriverRs.app at %s\n' \
+                "$LEGACY_RS_APP_DEST" >&2
+            return 1
+        fi
+        if ! macos_register_app "$LEGACY_RS_APP_DEST"; then
+            printf 'warning: could not re-register preserved legacy CuaDriverRs.app\n' >&2
+            return 1
+        fi
+        printf 'warning: interrupted install re-registered preserved legacy CuaDriverRs.app\n' >&2
+    else
+        printf 'warning: legacy CuaDriverRs.app is missing from both its source and rollback paths\n' >&2
         return 1
     fi
-    if ! mv "$MACOS_LEGACY_RS_BACKUP" "$LEGACY_RS_APP_DEST"; then
-        printf 'warning: could not restore legacy CuaDriverRs.app from %s\n' \
-            "$MACOS_LEGACY_RS_BACKUP" >&2
-        return 1
-    fi
-    if ! macos_register_app "$LEGACY_RS_APP_DEST"; then
-        printf 'warning: restored legacy CuaDriverRs.app but could not re-register it\n' >&2
-        return 1
-    fi
-    printf 'warning: interrupted install restored legacy CuaDriverRs.app\n' >&2
 }
 
 release_install_lock() {
@@ -1097,7 +1197,7 @@ cleanup_prior_local_install() {
 
     # The Darwin caller already performed authenticated, generation-bound
     # shutdown before the app swap. Other platforms retain the shared helper.
-    if [[ "${OS:-}" != "Darwin" ]]; then
+    if [[ "${OS:-}" != "Darwin" && "${DAEMONS_STOPPED_BEFORE_SWAP:-0}" != "1" ]]; then
         stop_cua_driver_daemons
     fi
 
@@ -1895,6 +1995,10 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
             err "temporary legacy backup path already exists: $MACOS_LEGACY_RS_BACKUP"
             exit 1
         fi
+        # TCC cleanup unregisters the authenticated source. Start rollback
+        # coverage before that preparation so an interrupt can either
+        # re-register the unmoved source or restore the staged backup.
+        MACOS_LEGACY_RS_REMOVAL_STARTED=1
         if ! macos_reset_legacy_tcc_before_migration \
             "$LEGACY_RS_APP_DEST" "$LEGACY_RS_BUNDLE_ID"; then
             exit 1
@@ -1903,10 +2007,16 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
             exit 1
         fi
     fi
-    if [[ "$MIGRATED_LEGACY_ID" == "1" ]] \
-       && ! macos_reset_legacy_tcc_before_migration \
+    if [[ "$MIGRATED_LEGACY_ID" == "1" ]]; then
+        # Cover the unregistering preparation, not only the later bundle
+        # move. Before a backup exists, rollback authenticates and
+        # re-registers the preserved source app in place.
+        MACOS_APP_HAD_PREVIOUS=1
+        MACOS_APP_SWAP_STARTED=1
+        if ! macos_reset_legacy_tcc_before_migration \
             "$APP_DEST" "$LEGACY_PRODUCTION_BUNDLE_ID"; then
-        exit 1
+            exit 1
+        fi
     fi
     if [[ -e "$APP_DEST" ]]; then
         MACOS_APP_HAD_PREVIOUS=1
@@ -1915,8 +2025,6 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
     if [[ "$MACOS_APP_HAD_PREVIOUS" == "1" ]]; then
         if ! mv "$APP_DEST" "$MACOS_APP_BACKUP"; then
             err "could not move the authenticated previous app into its rollback slot"
-            macos_register_app "$APP_DEST" \
-                || err "could not re-register the previous app after failed rollback staging"
             exit 1
         fi
     fi
@@ -1999,6 +2107,11 @@ else
     # filesystem call. A daemon that already mmap'd the previous
     # `current/cua-driver` keeps using the open file handle — Unix
     # only invalidates path-based lookups, not held fds.
+    if ! stop_cua_driver_daemons; then
+        err "refusing to replace the Linux runtime while its supervisor or daemon remains active"
+        exit 1
+    fi
+    DAEMONS_STOPPED_BEFORE_SWAP=1
     cleanup_prior_local_install
     PACKAGES_DIR="$HOME_DIR/packages"
     RELEASES_DIR="$PACKAGES_DIR/releases"
