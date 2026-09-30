@@ -79,6 +79,7 @@ pub enum CommandLine {
     Run(Config),
     Help,
     Version,
+    BuildAttestation,
 }
 
 impl CommandLine {
@@ -120,6 +121,18 @@ impl CommandLine {
                         return Err("--version must be used alone".into());
                     }
                     return Ok(Self::Version);
+                }
+                Some("__build-attestation") => {
+                    if plugin_version.is_some()
+                        || setup_program.is_some()
+                        || backend_program.is_some()
+                        || !setup_args.is_empty()
+                        || !backend_args.is_empty()
+                        || args.next().is_some()
+                    {
+                        return Err("__build-attestation must be used alone".into());
+                    }
+                    return Ok(Self::BuildAttestation);
                 }
                 Some("--plugin-version") => {
                     let value = next_utf8(&mut args, "--plugin-version")?;
@@ -171,6 +184,18 @@ impl CommandLine {
             },
         }))
     }
+}
+
+/// Immutable build provenance consumed by the downstream signed-plugin
+/// assembler. A production artifact is rejected unless both stamped values
+/// match its reviewed dependency manifest exactly.
+pub fn build_attestation() -> Value {
+    json!({
+        "schema_version": 1,
+        "binary_version": option_env!("CUA_DRIVER_RELEASE_VERSION")
+            .unwrap_or(env!("CARGO_PKG_VERSION")),
+        "source_sha": option_env!("CUA_DRIVER_SOURCE_SHA"),
+    })
 }
 
 fn next_os<I>(args: &mut I, option: &str) -> Result<OsString, String>
@@ -2321,5 +2346,30 @@ while True:
         };
         assert_eq!(config.setup.args, [OsString::from("--first-use")]);
         assert_eq!(config.backend.args, [OsString::from("--driver")]);
+    }
+
+    #[test]
+    fn private_build_attestation_is_exact_and_cannot_be_combined() {
+        assert_eq!(
+            CommandLine::parse([OsString::from("__build-attestation")]).unwrap(),
+            CommandLine::BuildAttestation,
+        );
+        assert!(CommandLine::parse(
+            ["__build-attestation", "--version"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .is_err());
+
+        let attestation = build_attestation();
+        assert_eq!(attestation["schema_version"], 1);
+        assert_eq!(
+            attestation["binary_version"],
+            option_env!("CUA_DRIVER_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        );
+        assert_eq!(
+            attestation["source_sha"],
+            serde_json::json!(option_env!("CUA_DRIVER_SOURCE_SHA")),
+        );
     }
 }

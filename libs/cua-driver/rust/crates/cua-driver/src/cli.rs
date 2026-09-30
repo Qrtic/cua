@@ -36,6 +36,10 @@ pub enum Command {
         /// Forward the process-local experimental PiP request to a daemon
         /// launched by the MCP proxy.
         experimental_pip: bool,
+        /// Require the already-attested service PID selected by an embedding
+        /// host. The persistent control session then pins that daemon
+        /// generation for the lifetime of this proxy.
+        expected_pid: Option<u32>,
     },
     ListTools,
     Describe(String),
@@ -620,6 +624,7 @@ pub fn parse_command() -> Command {
             "  --host-bundle-id <id>   Advisory host bundle id label for check_permissions output."
         );
         println!("  --socket <path>         Select an explicit daemon socket/pipe endpoint.");
+        println!("  --expected-pid <pid>    Require an already-attested daemon PID (mcp/stop).");
         println!("  --claude-code-computer-use-compat");
         println!("                          Select the Claude Code computer-use compat surface.");
         println!(
@@ -742,7 +747,7 @@ pub fn parse_command() -> Command {
         }
     }
 
-    let expected_stop_pid = parse_expected_stop_pid(&args, positionals.first().copied());
+    let expected_daemon_pid = parse_expected_daemon_pid(&args, positionals.first().copied());
 
     if matches!(positionals.first().copied(), None | Some("mcp")) {
         if let Some(flag) = serve_only_authorization_flag(&args) {
@@ -788,6 +793,7 @@ pub fn parse_command() -> Command {
                 claude_code_compat,
                 grants: grants.clone(),
                 experimental_pip,
+                expected_pid: expected_daemon_pid,
             }
         }
         Some("mcp") => Command::Mcp {
@@ -796,13 +802,14 @@ pub fn parse_command() -> Command {
             claude_code_compat,
             grants: grants.clone(),
             experimental_pip,
+            expected_pid: expected_daemon_pid,
         },
         Some("list-tools") => Command::ListTools,
         Some("mcp-config") => Command::McpConfig { client: mcp_client },
         Some("serve") => parse_serve_command(&args, socket, claude_code_compat, grants),
         Some("stop") => Command::Stop {
             socket,
-            expected_pid: expected_stop_pid,
+            expected_pid: expected_daemon_pid,
         },
         Some("revoke") => {
             let all = args.iter().any(|a| a == "--all");
@@ -1049,10 +1056,10 @@ pub fn parse_command() -> Command {
     }
 }
 
-fn parse_expected_stop_pid(args: &[String], command: Option<&str>) -> Option<u32> {
+fn parse_expected_daemon_pid(args: &[String], command: Option<&str>) -> Option<u32> {
     let raw = flag_value(args, "--expected-pid")?;
-    if command != Some("stop") {
-        eprintln!("--expected-pid is valid only with `cua-driver stop`");
+    if !matches!(command, Some("stop") | Some("mcp")) {
+        eprintln!("--expected-pid is valid only with `cua-driver stop` or `cua-driver mcp`");
         process::exit(64);
     }
     match raw.parse::<u32>() {
@@ -1673,6 +1680,17 @@ pub enum McpDaemonStartup {
     UnsupportedRelaunch,
 }
 
+fn verify_expected_daemon_pid(actual_pid: u32, expected_pid: Option<u32>) -> Result<(), String> {
+    if let Some(expected_pid) = expected_pid {
+        if actual_pid != expected_pid {
+            return Err(format!(
+                "Cua Driver daemon pid mismatch (expected {expected_pid}, found {actual_pid})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl McpDaemonStartup {
     pub const fn telemetry_value(self) -> &'static str {
         match self {
@@ -1688,6 +1706,7 @@ impl McpDaemonStartup {
 
 pub fn run_mcp_via_daemon_proxy<F>(
     socket: Option<String>,
+    expected_pid: Option<u32>,
     claude_code_compat: bool,
     grants: &[String],
     experimental_pip: bool,
@@ -1833,6 +1852,11 @@ where
         }
     }
 
+    if let Some(expected_pid) = expected_pid {
+        let metadata = cua_driver_core::daemon::request_daemon_metadata(&socket_path)?;
+        verify_expected_daemon_pid(metadata.pid, Some(expected_pid)).map_err(anyhow::Error::msg)?;
+    }
+
     if let Some(on_startup) = on_startup.take() {
         on_startup(daemon, true);
     }
@@ -1923,6 +1947,7 @@ pub fn build_manifest() -> serde_json::Value {
               "description": "Run the MCP stdio server: direct runtime on Windows/Linux, app-daemon proxy on macOS, or explicit service with --socket.",
               "args": [
                   { "name": "--socket", "type": "string", "description": "Select an explicit daemon socket or named-pipe endpoint." },
+                  { "name": "--expected-pid", "type": "integer", "description": "Require the exact daemon PID previously attested by the embedding host." },
                   { "name": "--direct", "type": "flag", "description": "Own the runtime in the MCP process; on macOS this explicitly accepts host TCC attribution. Mutually exclusive with --socket." },
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
                   { "name": "--embedded", "type": "flag", "description": "Declare embedding-host mode. Without --direct, requires the host's private service through --socket instead of auto-launching the standalone app." },
@@ -7842,20 +7867,42 @@ mod tests {
     fn expected_pid_keeps_stop_as_the_subcommand() {
         let argv = args(&["--expected-pid", "42", "stop"]);
         assert_eq!(positional_args(&argv), vec!["stop"]);
-        assert_eq!(parse_expected_stop_pid(&argv, Some("stop")), Some(42));
+        assert_eq!(parse_expected_daemon_pid(&argv, Some("stop")), Some(42));
 
         let with_socket = args(&["--socket", "/tmp/cua.sock", "--expected-pid", "42", "stop"]);
         assert_eq!(positional_args(&with_socket), vec!["stop"]);
         assert_eq!(
-            parse_expected_stop_pid(&with_socket, Some("stop")),
+            parse_expected_daemon_pid(&with_socket, Some("stop")),
+            Some(42)
+        );
+
+        let embedded_mcp = args(&[
+            "--embedded",
+            "mcp",
+            "--socket",
+            "/tmp/cua.sock",
+            "--expected-pid",
+            "42",
+        ]);
+        assert_eq!(positional_args(&embedded_mcp), vec!["mcp"]);
+        assert_eq!(
+            parse_expected_daemon_pid(&embedded_mcp, Some("mcp")),
             Some(42)
         );
     }
 
     #[test]
+    fn expected_mcp_pid_rejects_a_rebound_daemon_generation() {
+        assert!(verify_expected_daemon_pid(42, Some(42)).is_ok());
+        let error = verify_expected_daemon_pid(43, Some(42)).unwrap_err();
+        assert!(error.contains("expected 42, found 43"));
+        assert!(verify_expected_daemon_pid(43, None).is_ok());
+    }
+
+    #[test]
     fn expected_pid_is_absent_for_an_ordinary_stop() {
         let argv = args(&["stop"]);
-        assert_eq!(parse_expected_stop_pid(&argv, Some("stop")), None);
+        assert_eq!(parse_expected_daemon_pid(&argv, Some("stop")), None);
     }
 
     #[test]

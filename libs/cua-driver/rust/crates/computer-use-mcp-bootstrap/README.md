@@ -89,3 +89,10 @@ separate plugin asset, stamps `CuaPluginManaged` into its managed Driver input,
 and verifies the onboarding contract, build attestation, and public tool
 catalog before assembling a plugin release. A Cua source merge alone is not a
 shippable plugin release.
+
+Production builders must set `CUA_DRIVER_RELEASE_VERSION` and
+`CUA_DRIVER_SOURCE_SHA`. The exact private invocation
+`computer-use-mcp-bootstrap __build-attestation` emits those compiled values as
+one canonical JSON line; it cannot be combined with runtime options. The plugin
+assembler requires the version and source SHA to match its reviewed dependency
+manifest before executing the bootstrap or blessing release bytes.

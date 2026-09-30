@@ -12,6 +12,10 @@ fn main() -> ExitCode {
             println!("computer-use-mcp-bootstrap {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Ok(CommandLine::BuildAttestation) => {
+            println!("{}", computer_use_mcp_bootstrap::build_attestation());
+            ExitCode::SUCCESS
+        }
         Ok(CommandLine::Run(config)) => match run(config) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
