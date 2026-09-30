@@ -32,6 +32,7 @@ on:
       - ".github/scripts/cua-driver-mcp-compat/**"
       - ".github/workflows/cd-py-cua-driver.yml"
       - ".github/workflows/ci-cua-driver-contract-clients.yml"
+      - ".github/workflows/verify-cua-driver-release-artifacts.yml"
   push:
     branches: [main]
     paths:
@@ -64,6 +65,7 @@ on:
       - ".github/scripts/cua-driver-mcp-compat/**"
       - ".github/workflows/cd-py-cua-driver.yml"
       - ".github/workflows/ci-cua-driver-contract-clients.yml"
+      - ".github/workflows/verify-cua-driver-release-artifacts.yml"
   workflow_dispatch:
 
 permissions:

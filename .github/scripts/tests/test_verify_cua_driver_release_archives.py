@@ -17,6 +17,7 @@ from verify_cua_driver_release_archives import (
 
 
 VERSION = "9.8.7"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _write_tar(path: Path, contract: ArchiveContract, overrides=None) -> None:
@@ -62,6 +63,20 @@ def test_complete_release_archive_set_passes(tmp_path: Path) -> None:
     verified = verify_release_archives(tmp_path, VERSION)
 
     assert len(verified) == len(contracts) == 12
+
+
+def test_reusable_release_job_verifies_the_downloaded_artifact_set() -> None:
+    workflow = (
+        REPO_ROOT / ".github/workflows/verify-cua-driver-release-artifacts.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "workflow_call:" in workflow
+    assert "actions/download-artifact@" in workflow
+    assert "name: ${{ inputs.artifact_name }}" in workflow
+    assert "verify_cua_driver_release_archives.py" in workflow
+    assert "--artifacts release-artifacts" in workflow
+    assert "CUA_RELEASE_VERSION: ${{ inputs.version }}" in workflow
+    assert '--version "$CUA_RELEASE_VERSION"' in workflow
 
 
 def test_missing_cursor_theme_fails_with_archive_and_member(
