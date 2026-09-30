@@ -7,6 +7,7 @@ from pathlib import Path
 
 DRIVER_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = DRIVER_ROOT / "rust/scripts/CuaDriverBundle"
+ENTITLEMENTS = DRIVER_ROOT / "rust/scripts/CuaDriver.entitlements"
 
 
 class BundlePresentationTest(unittest.TestCase):
@@ -54,6 +55,19 @@ class BundlePresentationTest(unittest.TestCase):
         }.items():
             self.assertIn(f'plutil -replace {key} -string "{value}"', source)
         self.assertIn('APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"', source)
+
+    def test_production_history_entitlements_match_muse_code_identity(self):
+        with ENTITLEMENTS.open("rb") as reader:
+            entitlements = plistlib.load(reader)
+        application_identifier = "4W5TH4RKQ2.com.meta.musecode.cua.driver"
+        self.assertEqual(
+            entitlements["com.apple.application-identifier"],
+            application_identifier,
+        )
+        self.assertEqual(
+            entitlements["keychain-access-groups"],
+            [application_identifier],
+        )
 
 
 if __name__ == "__main__":

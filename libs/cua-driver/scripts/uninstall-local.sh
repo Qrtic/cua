@@ -34,8 +34,10 @@ APP_BUNDLE="/Applications/MuseCodeCuaDriverLocal.app"
 LEGACY_APP_BUNDLE="/Applications/CuaDriverLocal.app"
 if [[ "$OS" == "Darwin" ]]; then
     CACHE_DIR="$HOME/Library/Caches/cua-driver-local"
+    LOCAL_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver-local/computer-history"
 else
     CACHE_DIR="$HOME/.cache/cua-driver-local"
+    LOCAL_HISTORY_ROOT=""
 fi
 LAUNCHAGENT="$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist"
 SYSTEMD_UNIT="$HOME/.config/systemd/user/cua-driver-local.service"
@@ -229,6 +231,195 @@ is_local_target() {
     esac
 }
 
+local_daemon_pid_alive() {
+    kill -0 "$1" 2>/dev/null
+}
+
+local_daemon_process_generation() {
+    local pid="$1" start=""
+    command -v ps >/dev/null 2>&1 || return 2
+    start="$(LC_ALL=C ps -ww -o lstart= -p "$pid" 2>/dev/null)" || return 2
+    start="${start#"${start%%[![:space:]]*}"}"
+    start="${start%"${start##*[![:space:]]}"}"
+    [[ -n "$start" ]] || return 2
+    printf '%s' "$start"
+}
+
+local_daemon_process_identity() {
+    local_owned_process_identity "$1"
+}
+
+local_daemon_identity_matches_install() {
+    local identity="$1"
+    if [[ "${CLI_LINK_OWNED:-0}" == "1" ]]; then
+        case "$identity" in
+            "$CLI_LINK"|"$CLI_LINK"[[:space:]]*) return 0 ;;
+        esac
+    fi
+    case "$identity" in
+        "$HOME_DIR"/packages/current/cua-driver-local|"$HOME_DIR"/packages/current/cua-driver-local[[:space:]]*|\
+        "$HOME_DIR"/packages/releases/*/cua-driver-local|"$HOME_DIR"/packages/releases/*/cua-driver-local[[:space:]]*) return 0 ;;
+    esac
+    if [[ "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
+        case "$identity" in
+            "$APP_BUNDLE"/Contents/MacOS/cua-driver-local|"$APP_BUNDLE"/Contents/MacOS/cua-driver-local[[:space:]]*) return 0 ;;
+        esac
+    fi
+    if [[ "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then
+        case "$identity" in
+            "$LEGACY_APP_BUNDLE"/Contents/MacOS/cua-driver-local|"$LEGACY_APP_BUNDLE"/Contents/MacOS/cua-driver-local[[:space:]]*) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
+local_daemon_pid_matches_generation() {
+    local pid="$1" expected_generation="$2" current_generation="" identity=""
+    local_daemon_pid_alive "$pid" || return 1
+    current_generation="$(local_daemon_process_generation "$pid")" || return 2
+    [[ "$current_generation" == "$expected_generation" ]] || return 1
+    identity="$(local_daemon_process_identity "$pid")" || return 2
+    local_daemon_identity_matches_install "$identity" || return 1
+}
+
+local_daemon_signal_if_current() {
+    local pid="$1" generation="$2" signal="$3" status=0
+    local_daemon_pid_matches_generation "$pid" "$generation" || status=$?
+    [[ "$status" != "2" ]] || return 2
+    [[ "$status" == "0" ]] || return 1
+    kill -"$signal" "$pid" 2>/dev/null || return 1
+}
+
+local_daemon_wait_for_generation_exit() {
+    local pid="$1" generation="$2" attempts=0 status=0
+    while :; do
+        status=0
+        local_daemon_pid_matches_generation "$pid" "$generation" || status=$?
+        case "$status" in
+            0) ;;
+            1) return 0 ;;
+            *) return 2 ;;
+        esac
+        [[ "$attempts" -lt 20 ]] || return 1
+        sleep 0.1 2>/dev/null || sleep 1 || true
+        attempts=$((attempts + 1))
+    done
+}
+
+local_daemon_candidate_pids() {
+    local uid="" candidates="" pgrep_status=0
+    command -v pgrep >/dev/null 2>&1 || return 2
+    uid="$(id -u 2>/dev/null || true)"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 2
+    candidates="$(pgrep -U "$uid" -f '(^|[[:space:]/])cua-driver-local([[:space:]]|$)' 2>/dev/null)" \
+        || pgrep_status=$?
+    case "$pgrep_status" in
+        0) printf '%s\n' "$candidates" ;;
+        1) return 0 ;;
+        *) return 2 ;;
+    esac
+}
+
+verified_local_daemon_records() {
+    local candidates="" candidate_status=0 pid identity="" generation=""
+    candidates="$(local_daemon_candidate_pids)" || candidate_status=$?
+    [[ "$candidate_status" == "0" ]] || return 2
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+        local_daemon_pid_alive "$pid" || continue
+        identity="$(local_daemon_process_identity "$pid")" || {
+            local_daemon_pid_alive "$pid" || continue
+            return 2
+        }
+        local_daemon_identity_matches_install "$identity" || continue
+        generation="$(local_daemon_process_generation "$pid")" || {
+            local_daemon_pid_alive "$pid" || continue
+            return 2
+        }
+        printf '%s\t%s\n' "$pid" "$generation"
+    done <<< "$candidates"
+}
+
+verify_local_daemons_absent() {
+    local records="" status=0
+    records="$(verified_local_daemon_records)" || status=$?
+    if [[ "$status" != "0" ]]; then
+        echo "error: process inspection failed while verifying local daemon shutdown; no permission or app cleanup was attempted" >&2
+        return 1
+    fi
+    if [[ -n "$records" ]]; then
+        echo "error: a verified local cua-driver process remains; no permission or app cleanup was attempted" >&2
+        return 1
+    fi
+}
+
+stop_verified_local_daemons() {
+    local records="" status=0 record pid generation wait_status
+    records="$(verified_local_daemon_records)" || status=$?
+    if [[ "$status" != "0" ]]; then
+        echo "error: process inspection failed before local daemon shutdown; no permission or app cleanup was attempted" >&2
+        return 1
+    fi
+
+    while IFS=$'\t' read -r pid generation; do
+        [[ -n "$pid" ]] || continue
+        status=0
+        local_daemon_signal_if_current "$pid" "$generation" TERM || status=$?
+        [[ "$status" != "2" ]] || {
+            echo "error: process inspection failed before signalling local daemon pid $pid" >&2
+            return 1
+        }
+        [[ "$status" == "0" ]] || continue
+        wait_status=0
+        local_daemon_wait_for_generation_exit "$pid" "$generation" || wait_status=$?
+        [[ "$wait_status" != "2" ]] || {
+            echo "error: process inspection failed while waiting for local daemon pid $pid" >&2
+            return 1
+        }
+        if [[ "$wait_status" == "1" ]]; then
+            status=0
+            local_daemon_signal_if_current "$pid" "$generation" KILL || status=$?
+            [[ "$status" != "2" ]] || {
+                echo "error: process inspection failed before killing local daemon pid $pid" >&2
+                return 1
+            }
+            if [[ "$status" == "0" ]]; then
+                wait_status=0
+                local_daemon_wait_for_generation_exit "$pid" "$generation" || wait_status=$?
+                [[ "$wait_status" == "0" ]] || {
+                    echo "error: verified local daemon pid $pid survived TERM and KILL" >&2
+                    return 1
+                }
+            fi
+        fi
+    done <<< "$records"
+
+    verify_local_daemons_absent
+}
+
+# Resolve ownership and guard encrypted history before changing supervisor,
+# permission, app, or runtime state.
+CLI_LINK_OWNED=0
+if [[ -L "$CLI_LINK" ]]; then
+    target="$(resolve_link "$CLI_LINK")"
+    if is_local_target "$target"; then
+        CLI_LINK_OWNED=1
+    fi
+fi
+if [[ "$OS" == "Darwin" && "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then
+    if ! refuse_local_history_identity_transition "$LOCAL_HISTORY_ROOT" \
+        "$LEGACY_APP_BUNDLE" "remove the legacy local app signer identity"; then
+        exit 1
+    fi
+fi
+if [[ "$OS" == "Darwin" && "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
+    if ! refuse_local_history_identity_transition "$LOCAL_HISTORY_ROOT" \
+        "$APP_BUNDLE" "remove the current local app signer identity"; then
+        exit 1
+    fi
+fi
+
 # Stop only local autostart/process identities.
 if [[ "$OS" == "Darwin" && -f "$LAUNCHAGENT" ]]; then
     launchctl unload "$LAUNCHAGENT" 2>/dev/null || true
@@ -241,28 +432,28 @@ elif [[ "$OS" == "Linux" && -f "$SYSTEMD_UNIT" ]]; then
     rm -f "$SYSTEMD_UNIT"
     log "removed systemd user unit $SYSTEMD_UNIT"
 fi
-# See the note in _install-local-rust.sh: `pkill -x cua-driver-local` never
-# matches on Linux, because `-x` compares against the 15-char truncated
-# `comm` and the name is 16. Match argv[0], anchored so the launcher shells
-# that merely mention the path in their script text are left alone. App paths
-# enter this list only after their bundle, executable, and signer were
-# validated above.
-LOCAL_DAEMON_BINS=(
-    "$CLI_LINK"
-    "$HOME_DIR/packages/current/cua-driver-local"
-)
-if [[ "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
-    LOCAL_DAEMON_BINS+=("$APP_BUNDLE/Contents/MacOS/cua-driver-local")
+# Enumerate candidates by name, authenticate each command path against the
+# verified local installation, capture process generation, and re-check before
+# every signal. Inspection failures or survivors stop uninstall before TCC or
+# app deletion.
+if ! stop_verified_local_daemons; then
+    exit 1
 fi
-if [[ "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then
-    LOCAL_DAEMON_BINS+=("$LEGACY_APP_BUNDLE/Contents/MacOS/cua-driver-local")
+# Repeat the history gate only after every verified daemon has stopped. This
+# closes the race where a live writer creates a new chunk after the preflight
+# check but before its signer identity is removed.
+if [[ "$OS" == "Darwin" && "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then
+    if ! refuse_local_history_identity_transition "$LOCAL_HISTORY_ROOT" \
+        "$LEGACY_APP_BUNDLE" "remove the legacy local app signer identity"; then
+        exit 1
+    fi
 fi
-for _daemon_bin in "${LOCAL_DAEMON_BINS[@]}"; do
-    [ -n "$_daemon_bin" ] || continue
-    _daemon_pattern="$(escape_extended_regex "$_daemon_bin")"
-    pkill -f "^${_daemon_pattern}([[:space:]]|\$)" >/dev/null 2>&1 || true
-done
-unset _daemon_bin _daemon_pattern LOCAL_DAEMON_BINS
+if [[ "$OS" == "Darwin" && "$CURRENT_LOCAL_APP_OWNED" == "1" ]]; then
+    if ! refuse_local_history_identity_transition "$LOCAL_HISTORY_ROOT" \
+        "$APP_BUNDLE" "remove the current local app signer identity"; then
+        exit 1
+    fi
+fi
 
 # Reset and unregister each verified identity while its app remains present.
 if [[ "$OS" == "Darwin" && "$LEGACY_LOCAL_APP_OWNED" == "1" ]]; then

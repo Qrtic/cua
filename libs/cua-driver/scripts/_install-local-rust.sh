@@ -17,6 +17,8 @@
 #                install the visible symlink to <path> instead of
 #                ~/.local/bin. Takes precedence over
 #                CUA_DRIVER_LOCAL_INSTALL_DIR; must be absolute.
+#   CUA_DRIVER_LOCAL_HOME must be an absolute, non-symlink directory below
+#   HOME and must not overlap the release-owned $HOME/.cua-driver directory.
 #
 # Not for end-users — scripts/install.sh fetches a built release from
 # GitHub. This script is for the developer loop (rapid edit/build/test
@@ -76,6 +78,69 @@ if [ "$(id -u)" -eq 0 ] || [ -n "${SUDO_USER:-}" ]; then
     echo "It prompts for sudo on the specific operations that need it."
     exit 1
 fi
+
+validate_local_install_home_dir() {
+    local home_dir="$1" user_home="${2%/}" resolved_home resolved_dir
+    local relative prefix component child old_ifs="$IFS"
+    local components=()
+
+    case "$user_home" in
+        /*) ;;
+        *) echo "error: HOME must be an absolute path" >&2; return 1 ;;
+    esac
+    [ -n "$user_home" ] && [ "$user_home" != "/" ] || {
+        echo "error: refusing unsafe HOME: ${user_home:-<empty>}" >&2
+        return 1
+    }
+    case "$home_dir" in
+        /*) ;;
+        *) echo "error: CUA_DRIVER_LOCAL_HOME must be an absolute path" >&2; return 1 ;;
+    esac
+    case "$home_dir" in
+        /|"$user_home"|"$user_home"/|"$user_home/.cua-driver"|"$user_home/.cua-driver"/|*//*|*/../*|*/..|*/./*|*/.)
+            echo "error: refusing unsafe or release-owned local home: $home_dir" >&2
+            return 1
+            ;;
+    esac
+    [[ "$home_dir" != *$'\n'* && "$home_dir" != *$'\r'* ]] || {
+        echo "error: refusing local home containing a line break" >&2
+        return 1
+    }
+    resolved_home="$(CDPATH= cd -- "$user_home" 2>/dev/null && pwd -P)" || {
+        echo "error: could not resolve HOME safely: $user_home" >&2
+        return 1
+    }
+    case "$home_dir" in
+        "$user_home"/*) ;;
+        *) echo "error: CUA_DRIVER_LOCAL_HOME must remain inside HOME ($resolved_home): $home_dir" >&2; return 1 ;;
+    esac
+
+    relative="${home_dir#"$user_home"/}"
+    prefix="$user_home"
+    IFS='/' read -r -a components <<< "$relative"
+    IFS="$old_ifs"
+    for component in "${components[@]}"; do
+        [ -n "$component" ] && [ "$component" != "." ] && [ "$component" != ".." ] || return 1
+        prefix="$prefix/$component"
+        if [ -L "$prefix" ] || { [ -e "$prefix" ] && [ ! -d "$prefix" ]; }; then
+            echo "error: refusing symlink or non-directory local home component: $prefix" >&2
+            return 1
+        fi
+    done
+    if [ -d "$home_dir" ]; then
+        resolved_dir="$(CDPATH= cd -- "$home_dir" 2>/dev/null && pwd -P)" || return 1
+        case "$resolved_dir" in
+            "$resolved_home"/*) ;;
+            *) echo "error: local home resolves outside HOME: $resolved_dir" >&2; return 1 ;;
+        esac
+    fi
+    for child in "$home_dir/packages" "$home_dir/packages/releases"; do
+        if [ -L "$child" ] || { [ -e "$child" ] && [ ! -d "$child" ]; }; then
+            echo "error: refusing unsafe managed local install directory: $child" >&2
+            return 1
+        fi
+    done
+}
 
 # --- Parse arguments ----------------------------------------------------
 
@@ -163,6 +228,7 @@ case "$OS" in
 esac
 
 HOME_DIR="${CUA_DRIVER_LOCAL_HOME:-$HOME/.cua-driver-local}"
+validate_local_install_home_dir "$HOME_DIR" "$HOME" || exit 2
 BIN_DIR="${BIN_DIR_OVERRIDE:-${CUA_DRIVER_LOCAL_INSTALL_DIR:-$HOME/.local/bin}}"
 # The symlink is created after this script cds into the Cargo workspace, so a
 # relative path would silently land inside rust/ — and uninstall-local.sh
@@ -376,6 +442,75 @@ echo ""
 # the visible bin at the binary INSIDE the bundle. Linux/Windows have no
 # .app concept and keep the bare-binary symlink below.
 APP_DEST="/Applications/MuseCodeCuaDriverLocal.app"
+LOCAL_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver-local/computer-history"
+LOCAL_APP_SWAP_STARTED=0
+LOCAL_APP_HAD_PREVIOUS=0
+LOCAL_APP_INSTALL_COMMITTED=0
+LOCAL_APP_BACKUP=""
+
+rollback_local_app_on_exit() {
+    [ "$LOCAL_APP_SWAP_STARTED" = "1" ] || return 0
+
+    if [ "$LOCAL_APP_INSTALL_COMMITTED" = "1" ]; then
+        if ! remove_authenticated_local_app_backup "$LOCAL_APP_BACKUP" \
+            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+            echo "${RED:-}Error: committed local app is usable, but its authenticated install backup could not be removed.${NORMAL:-}" >&2
+            return 1
+        fi
+        LOCAL_APP_SWAP_STARTED=0
+        return 0
+    fi
+
+    if ! restore_local_app_backup "$APP_DEST" "$LOCAL_APP_BACKUP" \
+        "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+        echo "${RED:-}Error: interrupted local app replacement could not be rolled back safely; inspect $LOCAL_APP_BACKUP before retrying.${NORMAL:-}" >&2
+        return 1
+    fi
+    LOCAL_APP_SWAP_STARTED=0
+    if [ "$LOCAL_APP_HAD_PREVIOUS" = "1" ]; then
+        echo "${YELLOW:-}warning: restored the previous MuseCodeCuaDriverLocal.app after an interrupted installation.${NORMAL:-}" >&2
+    fi
+}
+
+local_install_exit() {
+    local status=$?
+    trap - EXIT INT TERM
+    if ! rollback_local_app_on_exit; then
+        status=1
+    fi
+    exit "$status"
+}
+
+# The EXIT handler covers ordinary errors, including failures inside explicit
+# `if`/`||` checks. Signal handlers convert INT/TERM into conventional exit
+# statuses and let EXIT perform exactly one rollback.
+trap local_install_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+stop_local_daemons_before_identity_check() {
+    local candidate resolved
+    local owned_paths=(
+        "$BIN_DIR/cua-driver-local"
+        "$CURRENT_LINK/cua-driver-local"
+        "$APP_DEST/Contents/MacOS/cua-driver-local"
+    )
+    launchctl unload "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" \
+        >/dev/null 2>&1 || true
+    if [ "${LEGACY_LOCAL_APP_OWNED:-0}" = "1" ]; then
+        owned_paths+=("$LEGACY_LOCAL_APP/Contents/MacOS/cua-driver-local")
+    fi
+    for candidate in "$HOME_DIR"/packages/releases/*/cua-driver-local; do
+        [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        owned_paths+=("$candidate")
+    done
+    for candidate in "${owned_paths[@]}"; do
+        resolved="$(realpath "$candidate" 2>/dev/null || true)"
+        [ -n "$resolved" ] && owned_paths+=("$resolved")
+    done
+    stop_verified_local_processes 0 "${owned_paths[@]}"
+}
+
 if [ "$OS" = "Darwin" ]; then
     SKELETON="$REPO_ROOT/scripts/CuaDriverBundle"
     if [ ! -d "$SKELETON/Contents" ]; then
@@ -402,7 +537,11 @@ if [ "$OS" = "Darwin" ]; then
             echo "${RED}Error: refusing to replace unauthenticated shared app path $APP_DEST.${NORMAL}" >&2
             exit 1
         fi
-        PREVIOUS_REQUIREMENT="$(designated_requirement "$APP_DEST")"
+        if ! PREVIOUS_REQUIREMENT="$(designated_requirement "$APP_DEST")" \
+           || [ -z "$PREVIOUS_REQUIREMENT" ]; then
+            echo "${RED}Error: could not read the installed local app's designated requirement; refusing a TCC-unsafe replacement.${NORMAL}" >&2
+            exit 1
+        fi
     fi
     LEGACY_LOCAL_APP="/Applications/CuaDriverLocal.app"
     LEGACY_LOCAL_APP_OWNED=0
@@ -444,13 +583,33 @@ if [ "$OS" = "Darwin" ]; then
     fi
     STAGED_REQUIREMENT="$(designated_requirement "$APP_STAGE")"
     STAGED_SIGNING_CLASS="$(classify_designated_requirement "$STAGED_REQUIREMENT")"
-    if [ -n "$PREVIOUS_REQUIREMENT" ] \
-       && [ "$(classify_designated_requirement "$PREVIOUS_REQUIREMENT")" = "certificate-backed" ] \
-       && ! codesign --verify --deep --strict -R "=$PREVIOUS_REQUIREMENT" \
-            "$APP_STAGE" >/dev/null 2>&1; then
-        echo "${RED}Error: refusing to replace a certificate-signed local app with a different signer.${NORMAL}" >&2
+    REQUIREMENT_COMPATIBILITY="first-install"
+    if [ -n "$PREVIOUS_REQUIREMENT" ]; then
+        REQUIREMENT_COMPATIBILITY="$(local_requirement_compatibility \
+            "$PREVIOUS_REQUIREMENT" "$APP_STAGE")"
+        if [ "$REQUIREMENT_COMPATIBILITY" = "unknown" ]; then
+            echo "${RED}Error: could not evaluate the existing local app's signing requirement; refusing a TCC-unsafe replacement.${NORMAL}" >&2
+            exit 1
+        fi
+    fi
+    if ! stop_local_daemons_before_identity_check; then
         exit 1
     fi
+    for _history_check in 1 2; do
+        if [ "$REQUIREMENT_COMPATIBILITY" = "incompatible" ] \
+           && ! refuse_local_history_identity_transition \
+                "$LOCAL_HISTORY_ROOT" "$APP_DEST" \
+                "replace the current local signer identity"; then
+            exit 1
+        fi
+        if [ "$LEGACY_LOCAL_APP_OWNED" = "1" ] \
+           && ! refuse_local_history_identity_transition \
+                "$LOCAL_HISTORY_ROOT" "$LEGACY_LOCAL_APP" \
+                "remove the legacy local app identity"; then
+            exit 1
+        fi
+    done
+    unset _history_check
 
     # Install to /Applications (user-writable for admins; no sudo — same as
     # install.sh). Keep the prior bundle available until the copy completes so
@@ -461,7 +620,15 @@ if [ "$OS" = "Darwin" ]; then
         exit 1
     fi
     if [ -d "$APP_DEST" ]; then
-        mv "$APP_DEST" "$APP_BACKUP"
+        LOCAL_APP_HAD_PREVIOUS=1
+    fi
+    LOCAL_APP_BACKUP="$APP_BACKUP"
+    LOCAL_APP_SWAP_STARTED=1
+    if [ "$LOCAL_APP_HAD_PREVIOUS" = "1" ] \
+       && ! mv "$APP_DEST" "$APP_BACKUP"; then
+        LOCAL_APP_SWAP_STARTED=0
+        echo "${RED}Error: could not move the authenticated local app into its rollback slot.${NORMAL}" >&2
+        exit 1
     fi
     install_valid=false
     if ditto "$APP_STAGE" "$APP_DEST" \
@@ -476,12 +643,7 @@ if [ "$OS" = "Darwin" ]; then
         fi
     fi
     if [ "$install_valid" != true ]; then
-        if restore_local_app_backup "$APP_DEST" "$APP_BACKUP" \
-            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
-            echo "${RED}Error: installed MuseCodeCuaDriverLocal.app did not preserve its verified signing identity; restored the previous installation state.${NORMAL}" >&2
-        else
-            echo "${RED}Error: installed app identity verification and safe rollback both failed; preserved $APP_BACKUP for manual recovery.${NORMAL}" >&2
-        fi
+        echo "${RED}Error: installed MuseCodeCuaDriverLocal.app did not preserve its verified signing identity; rolling back.${NORMAL}" >&2
         exit 1
     fi
     echo "${GREEN}installed $APP_DEST${NORMAL}"
@@ -499,13 +661,19 @@ if [ "$OS" = "Darwin" ]; then
     # launch the daemon) fails with -1728. A synchronous `lsregister -f` closes
     # that race so both the reset and the first launch resolve the bundle id.
     if ! register_local_app "$APP_DEST"; then
-        if restore_local_app_backup "$APP_DEST" "$APP_BACKUP" \
-            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
-            echo "${RED}Error: could not register MuseCodeCuaDriverLocal.app with LaunchServices; restored the previous installation state.${NORMAL}" >&2
-        else
-            echo "${RED}Error: LaunchServices registration and safe rollback both failed; preserved $APP_BACKUP for manual recovery.${NORMAL}" >&2
-        fi
+        echo "${RED}Error: could not register MuseCodeCuaDriverLocal.app with LaunchServices; rolling back.${NORMAL}" >&2
         exit 1
+    fi
+
+    if [ -n "$PREVIOUS_REQUIREMENT" ]; then
+        INSTALLED_COMPATIBILITY="$(local_requirement_compatibility \
+            "$PREVIOUS_REQUIREMENT" "$APP_DEST")"
+        if [ "$INSTALLED_COMPATIBILITY" != "$REQUIREMENT_COMPATIBILITY" ]; then
+            echo "${RED}Error: installed local app's signing compatibility changed during copy; rolling back.${NORMAL}" >&2
+            exit 1
+        fi
+    else
+        INSTALLED_COMPATIBILITY="first-install"
     fi
 
 fi
@@ -544,44 +712,32 @@ INSTALLED_BIN="$BIN_DIR/cua-driver-local"
 # whose script *text* contains the daemon path, killing the surrounding
 # session rather than the daemon.
 if [ "$OS" = "Darwin" ]; then
-    launchctl unload "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" 2>/dev/null || true
-elif [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl --user stop cua-driver-local.service >/dev/null 2>&1 || true
-fi
-for _daemon_bin in \
-    "$INSTALLED_BIN" \
-    "$BIN_TARGET"; do
-    [ -n "$_daemon_bin" ] || continue
-    _daemon_pattern="$(escape_extended_regex "$_daemon_bin")"
-    pkill -f "^${_daemon_pattern}([[:space:]]|\$)" >/dev/null 2>&1 || true
-done
-if [ "${LEGACY_LOCAL_APP_OWNED:-0}" = "1" ]; then
-    if ! verify_local_app_identity "$LEGACY_LOCAL_APP" \
-        "com.trycua.driver.local" "cua-driver-local"; then
-        echo "${RED}Error: legacy local app ownership changed during installation; refusing process cleanup.${NORMAL}" >&2
+    if ! stop_local_daemons_before_identity_check; then
         exit 1
     fi
-    _daemon_bin="$LEGACY_LOCAL_APP/Contents/MacOS/cua-driver-local"
-    _daemon_pattern="$(escape_extended_regex "$_daemon_bin")"
-    pkill -f "^${_daemon_pattern}([[:space:]]|\$)" >/dev/null 2>&1 || true
+elif [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop cua-driver-local.service >/dev/null 2>&1 || true
+    for _daemon_bin in "$INSTALLED_BIN" "$BIN_TARGET"; do
+        [ -n "$_daemon_bin" ] || continue
+        _daemon_pattern="$(escape_extended_regex "$_daemon_bin")"
+        pkill -f "^${_daemon_pattern}([[:space:]]|\$)" >/dev/null 2>&1 || true
+    done
 fi
 unset _daemon_bin _daemon_pattern
 
-# A changed ad-hoc cdhash leaves the old csreq attached to this bundle's TCC
-# rows. Once the new bundle is registered and old daemons are stopped, reset
-# only its Accessibility and ScreenCapture rows so `permissions grant` can
-# create entries for the new identity.
+# An incompatible signing transition leaves the old csreq attached to this
+# bundle's TCC rows. Once the new bundle is registered and old daemons are
+# stopped, reset all services used by the local driver.
 if [ "$OS" = "Darwin" ]; then
-    if ! reset_local_tcc_after_ad_hoc_change \
-        "$PREVIOUS_REQUIREMENT" "$INSTALLED_REQUIREMENT"; then
-        if ! restore_local_app_backup "$APP_DEST" "$APP_BACKUP" \
-            "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
-            echo "${RED}Error: TCC reset and safe rollback both failed; preserved $APP_BACKUP for manual recovery.${NORMAL}" >&2
-        fi
+    if ! reset_local_tcc_after_requirement_change "$INSTALLED_COMPATIBILITY"; then
         exit 1
     fi
-    remove_authenticated_local_app_backup "$APP_BACKUP" \
-        "com.meta.musecode.cua.driver.local" "cua-driver-local" || true
+    LOCAL_APP_INSTALL_COMMITTED=1
+    if ! remove_authenticated_local_app_backup "$APP_BACKUP" \
+        "com.meta.musecode.cua.driver.local" "cua-driver-local"; then
+        exit 1
+    fi
+    LOCAL_APP_SWAP_STARTED=0
 fi
 
 # Agent skill pack symlinks: NOT auto-created. Run

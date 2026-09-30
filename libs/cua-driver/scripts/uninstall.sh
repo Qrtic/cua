@@ -114,7 +114,8 @@ RELEASE_BUNDLE_ID="com.meta.musecode.cua.driver"
 LEGACY_RELEASE_BUNDLE_ID="com.trycua.driver"
 LEGACY_RS_BUNDLE_ID="com.trycua.cuadriverrs"
 RELEASE_EXECUTABLE="cua-driver"
-PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-}"
+PINNED_PRODUCTION_TEAM_ID="4W5TH4RKQ2"
+PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-$PINNED_PRODUCTION_TEAM_ID}"
 LEGACY_PRODUCTION_TEAM_ID="${CUA_DRIVER_LEGACY_TEAM_ID:-YCK386LBJ7}"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
 CODESIGN="/usr/bin/codesign"
@@ -170,6 +171,32 @@ validate_release_home_dir() {
                 ;;
         esac
     fi
+}
+
+directory_has_entries() {
+    local directory="$1" entry
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Return 0 only for a nonempty, ordinary history directory. Absence and an
+# empty directory return 1 so a later --purge can finish after the runtime was
+# already removed. Unsafe path types fail closed with status 2.
+history_state_present() {
+    local history_root="$1"
+    if [[ ! -e "$history_root" && ! -L "$history_root" ]]; then
+        return 1
+    fi
+    if [[ -L "$history_root" || ! -d "$history_root" ]]; then
+        printf 'history_purge_incomplete: refusing unsafe Computer History path %s\n' \
+            "$history_root" >&2
+        return 2
+    fi
+    directory_has_entries "$history_root"
 }
 
 macos_plist_value() {
@@ -250,6 +277,35 @@ purge_linux_history() {
     fi
 }
 
+purge_release_history_if_present() {
+    local history_root="$1" state_status=0 helper
+    history_state_present "$history_root" || state_status=$?
+    case "$state_status" in
+        0) ;;
+        1)
+            log "no encrypted release Computer History state to purge"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+
+    case "$OS" in
+        Darwin)
+            helper="$APP_BUNDLE/Contents/MacOS/cua-driver"
+            purge_macos_history \
+                "$APP_BUNDLE" "$helper" "$RUST_INSTALL_PRESENT" \
+                "$CODESIGN" "$PLISTBUDDY" "$APP_BUNDLE_ID" \
+                "$APP_BUNDLE_TEAM_ID" "$SPCTL" || return 1
+            log "cryptographically purged release Computer History key and local history state"
+            ;;
+        Linux)
+            helper="$PACKAGES_DIR/current/cua-driver"
+            purge_linux_history "$helper" "$RUST_INSTALL_PRESENT" || return 1
+            log "cryptographically purged release Computer History Secret Service key and local history state"
+            ;;
+    esac
+}
+
 daemon_pid_file_path() {
     case "$OS" in
         Darwin) printf '%s/Library/Caches/cua-driver/cua-driver.pid' "$HOME" ;;
@@ -307,14 +363,24 @@ daemon_wait_for_exit() {
 }
 
 daemon_process_identity() {
-    local pid="$1" identity=""
+    local pid="$1" identity="" lsof_tool="${CUA_DRIVER_LSOF:-/usr/sbin/lsof}"
     if [[ -L "/proc/$pid/exe" ]]; then
         identity="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
         identity="${identity% (deleted)}"
     fi
+    if [[ -z "$identity" && "$OS" == "Darwin" ]]; then
+        [[ -x "$lsof_tool" ]] || return 2
+        identity="$("$lsof_tool" -a -p "$pid" -d txt -Fn 2>/dev/null \
+            | sed -n 's/^n//p' | sed -n '1p')" || return 2
+        [[ -n "$identity" ]] || return 2
+    fi
     if [[ -z "$identity" ]]; then
         command -v ps >/dev/null 2>&1 || return 2
-        identity="$(ps -ww -o command= -p "$pid" 2>/dev/null)" || return 2
+        # `command=` starts with argv[0], which may be only `cua-driver` for a
+        # PATH launch and therefore loses the installed path. `comm=` is the
+        # kernel executable identity on macOS; /proc remains authoritative on
+        # Linux when available.
+        identity="$(ps -ww -o comm= -p "$pid" 2>/dev/null)" || return 2
     fi
     identity="${identity#"${identity%%[![:space:]]*}"}"
     identity="${identity%"${identity##*[![:space:]]}"}"
@@ -665,6 +731,10 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     APP_BUNDLE_ID=""
     APP_BUNDLE_TEAM_ID=""
     LEGACY_APP_BUNDLE_OWNED=0
+    if [[ "$OS" == "Darwin" && "$PRODUCTION_TEAM_ID" != "$PINNED_PRODUCTION_TEAM_ID" ]]; then
+        printf 'error: CUA_DRIVER_PRODUCTION_TEAM_ID does not match the pinned Muse Code production Team ID\n' >&2
+        exit 1
+    fi
     if [[ "$OS" == "Darwin" && ( -e "$APP_BUNDLE" || -L "$APP_BUNDLE" ) ]]; then
         APP_BUNDLE_ID="$(macos_plist_value "$PLISTBUDDY" "$APP_BUNDLE" CFBundleIdentifier || true)"
         case "$APP_BUNDLE_ID" in
@@ -731,6 +801,33 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
         log "no Rust install marker; leaving any running cua-driver process untouched"
     fi
 
+    MACOS_HISTORY_ROOT="$HOME/Library/Application Support/cua-driver/computer-history"
+    case "$OS" in
+        Darwin) HISTORY_ROOT="$MACOS_HISTORY_ROOT" ;;
+        Linux) HISTORY_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/cua-driver/computer-history" ;;
+        *) HISTORY_ROOT="" ;;
+    esac
+    HISTORY_STATE_PRESENT=0
+    if [[ -n "$HISTORY_ROOT" ]]; then
+        _history_state_status=0
+        history_state_present "$HISTORY_ROOT" || _history_state_status=$?
+        case "$_history_state_status" in
+            0) HISTORY_STATE_PRESENT=1 ;;
+            1) ;;
+            *) exit 1 ;;
+        esac
+        unset _history_state_status
+    fi
+    if [[ "$OS" == "Darwin" && "$PURGE_DATA" == "0" \
+       && -d "$MACOS_HISTORY_ROOT" ]] \
+       && directory_has_entries "$MACOS_HISTORY_ROOT" \
+       && [[ "$APP_BUNDLE_ID" == "$LEGACY_RELEASE_BUNDLE_ID" \
+          || "$LEGACY_APP_BUNDLE_OWNED" == "1" ]]; then
+        printf 'error: refusing to remove the legacy Cua Driver identity while encrypted Computer History remains\n' >&2
+        printf 'to preserve it, keep the authenticated legacy app; to destroy it safely, rerun with --purge\n' >&2
+        exit 1
+    fi
+
     # --- CLI symlink ---
     # Only remove ~/.local/bin/cua-driver when it resolves into a
     # cua-driver-rs install. Pre-rename installs at
@@ -771,24 +868,14 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     # executable still exists. The helper uses the production KeyProvider and
     # its own bundle-derived namespace, then takes the exclusive writer lease;
     # failure leaves the runtime and all retryable history state in place.
-    if [[ "$OS" == "Darwin" && "$PURGE_DATA" == "1" ]]; then
-        HISTORY_PURGE_HELPER="$APP_BUNDLE/Contents/MacOS/cua-driver"
-        if ! purge_macos_history \
-            "$APP_BUNDLE" "$HISTORY_PURGE_HELPER" "$RUST_INSTALL_PRESENT" \
-            "$CODESIGN" "$PLISTBUDDY" "$APP_BUNDLE_ID" "$APP_BUNDLE_TEAM_ID" "$SPCTL"; then
+    if [[ "$PURGE_DATA" == "1" && ( "$OS" == "Darwin" || "$OS" == "Linux" ) ]]; then
+        if ! purge_release_history_if_present "$HISTORY_ROOT"; then
             exit 1
         fi
-        log "cryptographically purged release Computer History key and local history state"
     elif [[ "$OS" == "Darwin" ]]; then
-        log "preserved encrypted Computer History if present; reinstall to reopen it or run uninstall.sh --purge to destroy it"
-    elif [[ "$OS" == "Linux" && "$PURGE_DATA" == "1" ]]; then
-        HISTORY_PURGE_HELPER="$PACKAGES_DIR/current/cua-driver"
-        if ! purge_linux_history "$HISTORY_PURGE_HELPER" "$RUST_INSTALL_PRESENT"; then
-            exit 1
-        fi
-        log "cryptographically purged release Computer History Secret Service key and local history state"
+        log "preserved encrypted Computer History if present; reinstall the same signed identity to reopen it or restore its purge helper"
     elif [[ "$OS" == "Linux" ]]; then
-        log "preserved encrypted Computer History if present; reinstall to reopen it or run uninstall.sh --purge to destroy it"
+        log "preserved encrypted Computer History if present; reinstall the same release to reopen it or restore its purge helper"
     fi
 
     # --- Revoke TCC grants and unregister BEFORE removing each app ---
@@ -1137,10 +1224,18 @@ PY
         echo ""
         echo "cua-driver uninstalled."
         if [[ "$PURGE_DATA" == "0" ]]; then
+            if [[ "$HISTORY_STATE_PRESENT" == "1" ]]; then
+                cat << 'HISTORYUNMSG'
+
+Encrypted Computer History was preserved. To destroy it later, first reinstall
+the same signed Cua Driver identity, then run uninstall.sh --purge while that
+verified helper is still installed.
+HISTORYUNMSG
+            fi
             cat << 'TELEMETRYUNMSG'
 
 Telemetry identity and preference were preserved for a future reinstall.
-To delete them too, re-run with --purge:
+If no encrypted Computer History remains, delete telemetry later with:
 
   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)" -- --purge
 TELEMETRYUNMSG

@@ -80,13 +80,12 @@ bundle's TCC permissions.
 
 ## Production macOS signing identity
 
-Production artifact builders must set `CUA_DRIVER_PRODUCTION_TEAM_ID` to the
-approved 10-character Apple Team ID while compiling the Driver and while
-running the release installer or uninstaller. There is deliberately no source
-default. The value is embedded into Computer History admission policy, and the
-install scripts use the same value to require an Apple-anchored, notarized app
-with the exact `com.meta.musecode.cua.driver` identity. Release wrappers must
-provide this value without asking end users to discover it.
+Production uses the Muse Code Apple Team ID `4W5TH4RKQ2`. The value is embedded
+into Computer History admission policy, and the install scripts require an
+Apple-anchored, notarized app with that team and the exact
+`com.meta.musecode.cua.driver` identity. `CUA_DRIVER_PRODUCTION_TEAM_ID` is an
+optional release/test assertion and is rejected if it differs from the pinned
+value; end users do not need to configure it.
 
 The one-time migration from `com.trycua.driver` defaults its old signer to
 `YCK386LBJ7`; a different reviewed legacy signer may be supplied through

@@ -127,7 +127,8 @@ def test_release_app_requires_exact_bundle_executable_and_apple_team(tmp_path: P
         assert result.returncode != 0
 
     source = UNINSTALL.read_text(encoding="utf-8")
-    assert 'PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-}"' in source
+    assert 'PINNED_PRODUCTION_TEAM_ID="4W5TH4RKQ2"' in source
+    assert 'PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-$PINNED_PRODUCTION_TEAM_ID}"' in source
     assert 'LEGACY_PRODUCTION_TEAM_ID="${CUA_DRIVER_LEGACY_TEAM_ID:-YCK386LBJ7}"' in source
 
 
@@ -169,6 +170,47 @@ purge_macos_history '{app}' '{helper}' 1 '{codesign}' '{plistbuddy}' \
     assert result.returncode != 0
     assert not marker.exists()
     assert "history_purge_incomplete" in result.stderr
+
+
+def test_followup_purge_needs_no_helper_when_history_is_absent_or_empty(
+    tmp_path: Path,
+) -> None:
+    functions = _extract(
+        UNINSTALL,
+        "directory_has_entries",
+        "history_state_present",
+        "purge_release_history_if_present",
+    )
+    empty = tmp_path / "empty-history"
+    empty.mkdir()
+    missing = tmp_path / "missing-history"
+    nonempty = tmp_path / "nonempty-history"
+    nonempty.mkdir()
+    (nonempty / "chunk.cborseq").write_text("encrypted", encoding="utf-8")
+    invoked = tmp_path / "purge-invoked"
+    body = f"""
+log() {{ :; }}
+purge_macos_history() {{ : > '{invoked}'; return 91; }}
+purge_linux_history() {{ : > '{invoked}'; return 92; }}
+PACKAGES_DIR=/missing-packages
+RUST_INSTALL_PRESENT=0
+OS=Darwin
+purge_release_history_if_present '{missing}'
+purge_release_history_if_present '{empty}'
+OS=Linux
+purge_release_history_if_present '{missing}'
+purge_release_history_if_present '{empty}'
+[[ ! -e '{invoked}' ]]
+! purge_release_history_if_present '{nonempty}'
+[[ -e '{invoked}' ]]
+"""
+
+    result = _run_shell(functions, body, {})
+    assert result.returncode == 0, result.stderr
+
+    source = UNINSTALL.read_text(encoding="utf-8")
+    assert "first reinstall" in source
+    assert "while that\nverified helper is still installed" in source
 
 
 def test_release_tcc_failure_does_not_unregister_app(tmp_path: Path) -> None:

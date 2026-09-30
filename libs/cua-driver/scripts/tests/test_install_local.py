@@ -45,6 +45,13 @@ def _extract_local_signing_function(name: str) -> str:
     return match.group(0)
 
 
+def _extract_local_install_function(name: str) -> str:
+    source = INSTALL_LOCAL.read_text(encoding="utf-8")
+    match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}\n", source)
+    assert match, f"could not find shell function {name}"
+    return match.group(0)
+
+
 def _run_local_signing_policy(body: str) -> subprocess.CompletedProcess[str]:
     functions = "\n".join(
         _extract_local_signing_function(name)
@@ -195,14 +202,114 @@ def test_local_app_ownership_rejects_signature_failure(tmp_path: Path) -> None:
 def test_macos_local_install_rolls_back_on_registration_or_tcc_failure() -> None:
     source = INSTALL_LOCAL.read_text(encoding="utf-8")
     install = source.index('if [ "$OS" = "Darwin" ]; then')
+    trap = source.index("trap local_install_exit EXIT")
+    staged_verify = source.index(
+        'if ! verify_local_app_identity "$APP_STAGE"', install
+    )
+    daemon_stop = source.index("stop_local_daemons_before_identity_check", staged_verify)
+    history_guard = source.index(
+        "refuse_local_history_identity_transition", daemon_stop
+    )
+    swap = source.index('&& ! mv "$APP_DEST" "$APP_BACKUP"', history_guard)
     register = source.index('if ! register_local_app "$APP_DEST"', install)
-    register_rollback = source.index("restore_local_app_backup", register)
-    reset = source.index("reset_local_tcc_after_ad_hoc_change", register_rollback)
-    reset_rollback = source.index("restore_local_app_backup", reset)
-    delete_backup = source.index("remove_authenticated_local_app_backup", reset_rollback)
+    reset = source.index("reset_local_tcc_after_requirement_change", register)
+    commit = source.index("LOCAL_APP_INSTALL_COMMITTED=1", reset)
+    delete_backup = source.index("remove_authenticated_local_app_backup", commit)
+    legacy_cleanup = source.index('cleanup_legacy_local_app "$LEGACY_LOCAL_APP" 1')
 
-    assert register < register_rollback < reset < reset_rollback < delete_backup
+    assert trap < staged_verify < daemon_stop < history_guard < swap < register < reset < commit
+    assert commit < delete_backup < legacy_cleanup
+    assert "trap 'exit 130' INT" in source
+    assert "trap 'exit 143' TERM" in source
+    assert "restore_local_app_backup" in source
+    assert '&& ! mv "$APP_DEST" "$APP_BACKUP"' in source
+    assert source.index("LOCAL_APP_SWAP_STARTED=1", history_guard) < swap
     assert 'LEGACY_LOCAL_APP_OWNED:-0' in source
+
+
+@pytest.mark.parametrize(
+    ("effective_uid", "sudo_user"),
+    [("0", ""), ("501", "developer")],
+    ids=["root", "sudo"],
+)
+def test_local_installer_rejects_root_or_sudo_before_build(
+    tmp_path: Path, effective_uid: str, sudo_user: str
+) -> None:
+    fixture_root = tmp_path / "cua-driver"
+    scripts_dir = fixture_root / "scripts"
+    rust_dir = fixture_root / "rust"
+    scripts_dir.mkdir(parents=True)
+    rust_dir.mkdir()
+    shutil.copy2(INSTALL_LOCAL, scripts_dir / INSTALL_LOCAL.name)
+    shutil.copy2(LOCAL_SIGNING, scripts_dir / LOCAL_SIGNING.name)
+    fake_bin = tmp_path / "fake-bin"
+    _write_executable(fake_bin / "id", f"printf '%s\\n' {effective_uid}\n")
+    cargo_called = tmp_path / "cargo-called"
+    _write_executable(fake_bin / "cargo", f"touch '{cargo_called}'\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "CUA_DRIVER_SOURCE_SHA": "a" * 40,
+        }
+    )
+    if sudo_user:
+        env["SUDO_USER"] = sudo_user
+    else:
+        env.pop("SUDO_USER", None)
+
+    result = subprocess.run(
+        ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name)],
+        cwd=fixture_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "do not run this script with sudo or as root" in result.stdout
+    assert not cargo_called.exists()
+
+
+def test_local_install_home_must_be_private_and_not_release_owned(
+    tmp_path: Path,
+) -> None:
+    function = _extract_local_install_function("validate_local_install_home_dir")
+    home = tmp_path / "home"
+    home.mkdir()
+    valid = home / ".cua-driver-local"
+    valid.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = home / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    packages_escape = home / "packages-escape"
+    packages_escape.mkdir()
+    (packages_escape / "packages").symlink_to(outside, target_is_directory=True)
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {function}
+            validate_local_install_home_dir '{valid}' '{home}'
+            ! validate_local_install_home_dir / '{home}'
+            ! validate_local_install_home_dir '{home}' '{home}'
+            ! validate_local_install_home_dir relative '{home}'
+            ! validate_local_install_home_dir '{outside}' '{home}'
+            ! validate_local_install_home_dir '{home}/.cua-driver' '{home}'
+            ! validate_local_install_home_dir '{escape}/nested' '{home}'
+            ! validate_local_install_home_dir '{packages_escape}' '{home}'
+            """,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("relative_target", [False, True], ids=["absolute", "relative"])
@@ -256,8 +363,8 @@ esac
     _write_executable(fake_bin / "systemctl", "exit 0")
     _write_executable(fake_bin / "pkill", "exit 0")
 
-    local_home = tmp_path / "local-home"
     user_home = tmp_path / "home"
+    local_home = user_home / ".cua-driver-local"
     installed_helper = user_home / ".local/share/gnome-shell/extensions/winrects@cua"
     installed_helper.mkdir(parents=True)
     (installed_helper / "metadata.json").write_text('{"version":4}\n', encoding="utf-8")
@@ -335,16 +442,18 @@ esac
     _write_executable(fake_bin / "systemctl", "exit 0")
     _write_executable(fake_bin / "pkill", "exit 0")
 
+    user_home = tmp_path / "home"
+    user_home.mkdir()
     env = os.environ.copy()
     env.pop("SUDO_USER", None)
     env.pop("CARGO_TARGET_DIR", None)
     env.pop("CUA_DRIVER_LOCAL_INSTALL_DIR", None)
     env.update(
         {
-            "HOME": str(tmp_path / "home"),
+            "HOME": str(user_home),
             "PATH": f"{fake_bin}:/usr/bin:/bin",
             "CUA_DRIVER_SOURCE_SHA": "a" * 40,
-            "CUA_DRIVER_LOCAL_HOME": str(tmp_path / "local-home"),
+            "CUA_DRIVER_LOCAL_HOME": str(user_home / ".cua-driver-local"),
         }
     )
     return scripts_dir, fake_bin, env
@@ -408,7 +517,8 @@ def test_reinstall_over_a_running_driver(tmp_path: Path) -> None:
     """
     scripts_dir, _, env = _linux_fixture(tmp_path)
     versioned = (
-        tmp_path / "local-home/packages/releases/0.0.0-local-debug-x86_64-unknown-linux-gnu"
+        Path(env["CUA_DRIVER_LOCAL_HOME"])
+        / "packages/releases/0.0.0-local-debug-x86_64-unknown-linux-gnu"
     )
     versioned.mkdir(parents=True)
     busy = versioned / "cua-driver-local"

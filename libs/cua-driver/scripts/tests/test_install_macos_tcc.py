@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from io import BytesIO
 import os
 import re
 import subprocess
+import tarfile
 from pathlib import Path
 
 
@@ -28,7 +30,11 @@ def run_policy(body: str) -> subprocess.CompletedProcess[str]:
         )
     )
     return subprocess.run(
-        ["/bin/bash", "-c", f"set -euo pipefail\n{functions}\n{body}"],
+        [
+            "/bin/bash",
+            "-c",
+            f"set -euo pipefail\nMACOS_CODESIGN=codesign\nMACOS_TCCUTIL=tccutil\n{functions}\n{body}",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -50,7 +56,11 @@ def run_release_identity_policy(
         )
     )
     return subprocess.run(
-        ["/bin/bash", "-c", f"set -euo pipefail\n{functions}\n{body}"],
+        [
+            "/bin/bash",
+            "-c",
+            f"set -euo pipefail\nMACOS_CODESIGN=codesign\nMACOS_SPCTL=spctl\n{functions}\n{body}",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -68,12 +78,41 @@ def run_rollback_policy(body: str, env: dict[str, str]) -> subprocess.CompletedP
         if [[ -n "${REGISTER_LOG:-}" ]]; then
             printf '%s\n' "$1" >> "$REGISTER_LOG"
         fi
+        [[ "${REGISTER_FAIL:-0}" != "1" ]]
+    }
+    macos_unregister_app() {
+        if [[ -n "${UNREGISTER_LOG:-}" ]]; then
+            printf '%s\n' "$1" >> "$UNREGISTER_LOG"
+        fi
+        [[ "${UNREGISTER_FAIL:-0}" != "1" ]]
     }
     PRODUCTION_BUNDLE_ID="${PRODUCTION_BUNDLE_ID:-com.meta.musecode.cua.driver}"
     PRODUCTION_TEAM_ID="${PRODUCTION_TEAM_ID:-A1B2C3D4E5}"
     MACOS_APP_BACKUP_BUNDLE_ID="${MACOS_APP_BACKUP_BUNDLE_ID:-com.meta.musecode.cua.driver}"
     MACOS_APP_BACKUP_TEAM_ID="${MACOS_APP_BACKUP_TEAM_ID:-A1B2C3D4E5}"
     BINARY_NAME="${BINARY_NAME:-cua-driver}"
+    '''
+    return subprocess.run(
+        ["/bin/bash", "-c", f"set -euo pipefail\n{function}\n{stubs}\n{body}"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **env},
+    )
+
+
+def run_legacy_rs_rollback_policy(
+    body: str, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    function = extract_shell_function("restore_macos_legacy_rs_backup_on_exit")
+    stubs = r'''
+    macos_verify_release_app() { return 0; }
+    macos_register_app() {
+        [[ "${REGISTER_FAIL:-0}" != "1" ]]
+    }
+    LEGACY_RS_BUNDLE_ID=com.trycua.cuadriverrs
+    LEGACY_PRODUCTION_TEAM_ID=YCK386LBJ7
+    BINARY_NAME=cua-driver
     '''
     return subprocess.run(
         ["/bin/bash", "-c", f"set -euo pipefail\n{function}\n{stubs}\n{body}"],
@@ -125,10 +164,11 @@ def test_incompatible_requirement_resets_only_driver_permissions() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == (
-        "log: the app signing requirement changed; cleared stale Accessibility and Screen Recording rows\n"
+        "log: the app signing requirement changed; cleared stale Accessibility, Screen Recording, and Automation rows\n"
         "log: macOS authorization is required again: cua-driver permissions grant\n"
         "reset:Accessibility:com.meta.musecode.cua.driver\n"
         "reset:ScreenCapture:com.meta.musecode.cua.driver\n"
+        "reset:AppleEvents:com.meta.musecode.cua.driver\n"
     )
 
 
@@ -183,6 +223,7 @@ def test_reset_failure_is_actionable_and_returns_failure() -> None:
     assert "could not reset these TCC services" in result.stderr
     assert "tccutil reset Accessibility com.meta.musecode.cua.driver" in result.stderr
     assert "tccutil reset ScreenCapture com.meta.musecode.cua.driver" in result.stderr
+    assert "tccutil reset AppleEvents com.meta.musecode.cua.driver" in result.stderr
 
 
 def test_installer_verifies_then_registers_before_any_tcc_reset() -> None:
@@ -192,7 +233,7 @@ def test_installer_verifies_then_registers_before_any_tcc_reset() -> None:
     build_attestation = source.index(
         'macos_verify_build_attestation "$SRC_APP"', staged_verify
     )
-    stop_daemon = source.index("stop_cua_driver_daemons", build_attestation)
+    stop_daemon = source.index("stop_authenticated_macos_daemons", build_attestation)
     backup = source.index('mv "$APP_DEST" "$MACOS_APP_BACKUP"', staged_verify)
     copy = source.index('ditto "$SRC_APP" "$APP_DEST"', backup)
     installed_verify = source.index('macos_verify_release_app "$APP_DEST"', copy)
@@ -240,7 +281,7 @@ def test_legacy_release_identity_is_an_explicit_fresh_permission_migration() -> 
     assert migration < history_guard < tcc_reset
 
 
-def test_release_team_id_is_required_and_strictly_validated() -> None:
+def test_release_team_id_is_pinned_and_strictly_validated() -> None:
     result = run_release_identity_policy(
         """
         ! validate_apple_team_id ''
@@ -252,8 +293,180 @@ def test_release_team_id_is_required_and_strictly_validated() -> None:
 
     assert result.returncode == 0, result.stderr
     source = INSTALLER.read_text()
-    assert 'PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-}"' in source
+    assert 'PINNED_PRODUCTION_TEAM_ID="4W5TH4RKQ2"' in source
+    assert 'PRODUCTION_TEAM_ID="${CUA_DRIVER_PRODUCTION_TEAM_ID:-$PINNED_PRODUCTION_TEAM_ID}"' in source
     assert 'validate_apple_team_id "$PRODUCTION_TEAM_ID"' in source
+
+
+def test_release_install_rejects_root_and_sudo() -> None:
+    function = extract_shell_function("reject_root_install_invocation")
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {function}
+            ! reject_root_install_invocation 0 '' ''
+            ! reject_root_install_invocation 501 0 root
+            ! reject_root_install_invocation 501 '' root
+            reject_root_install_invocation 501 '' ''
+            """,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_release_install_home_must_be_private_to_home_and_symlink_free(
+    tmp_path: Path,
+) -> None:
+    function = extract_shell_function("validate_release_install_home_dir")
+    home = tmp_path / "home"
+    home.mkdir()
+    valid = home / ".cua-driver"
+    valid.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = home / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    packages_escape = home / "packages-escape"
+    packages_escape.mkdir()
+    (packages_escape / "packages").symlink_to(outside, target_is_directory=True)
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {function}
+            validate_release_install_home_dir '{valid}' '{home}' CUA_DRIVER_RS_HOME
+            ! validate_release_install_home_dir / '{home}' CUA_DRIVER_RS_HOME
+            ! validate_release_install_home_dir '{home}' '{home}' CUA_DRIVER_RS_HOME
+            ! validate_release_install_home_dir relative '{home}' CUA_DRIVER_RS_HOME
+            ! validate_release_install_home_dir '{outside}' '{home}' CUA_DRIVER_RS_HOME
+            ! validate_release_install_home_dir '{escape}/nested' '{home}' CUA_DRIVER_RS_HOME
+            ! validate_release_install_home_dir '{packages_escape}' '{home}' CUA_DRIVER_RS_HOME
+            """,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_release_archive_extraction_rejects_traversal_links_and_duplicates(
+    tmp_path: Path,
+) -> None:
+    function = extract_shell_function("extract_release_tarball_safely")
+
+    def write_archive(path: Path, entries: list[tuple[str, bytes, bytes | None]]) -> None:
+        with tarfile.open(path, "w:gz") as archive:
+            for name, payload, link_target in entries:
+                info = tarfile.TarInfo(name)
+                if link_target is not None:
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = link_target.decode()
+                    archive.addfile(info)
+                else:
+                    info.size = len(payload)
+                    info.mode = 0o755
+                    archive.addfile(info, BytesIO(payload))
+
+    safe = tmp_path / "safe.tar.gz"
+    traversal = tmp_path / "traversal.tar.gz"
+    symlink = tmp_path / "symlink.tar.gz"
+    duplicate = tmp_path / "duplicate.tar.gz"
+    oversized = tmp_path / "oversized.tar.gz"
+    write_archive(safe, [("payload/cua-driver", b"driver", None)])
+    write_archive(traversal, [("../escaped", b"escape", None)])
+    write_archive(symlink, [("payload/link", b"", b"../../outside")])
+    write_archive(
+        duplicate,
+        [("payload/cua-driver", b"one", None), ("payload/cua-driver", b"two", None)],
+    )
+    write_archive(oversized, [("payload/oversized", b"x" * 17, None)])
+    destination = tmp_path / "extract"
+    destination.mkdir()
+    escaped = tmp_path / "escaped"
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {function}
+            TMP_DIR='{destination}'
+            err() {{ printf 'error: %s\n' "$*" >&2; }}
+            extract_release_tarball_safely '{safe}' '{destination}'
+            [[ "$(cat '{destination}/payload/cua-driver')" == driver ]]
+            ! extract_release_tarball_safely '{traversal}' '{destination}'
+            ! extract_release_tarball_safely '{symlink}' '{destination}'
+            ! extract_release_tarball_safely '{duplicate}' '{destination}'
+            ! extract_release_tarball_safely '{oversized}' '{destination}' 16 32
+            [[ ! -e '{escaped}' ]]
+            """,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "oversized member" in result.stderr
+
+
+def test_install_daemon_stop_is_path_authenticated_and_fail_closed(tmp_path: Path) -> None:
+    functions = "\n".join(
+        extract_shell_function(name)
+        for name in (
+            "macos_install_process_identity",
+            "macos_install_process_generation",
+            "macos_install_process_identity_is_owned",
+            "macos_install_owned_process_records",
+        )
+    )
+    lsof = tmp_path / "lsof"
+    args = tmp_path / "lsof-args"
+    lsof.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' \"$*\" > '{args}'\n"
+        "printf 'n/Applications/CuaDriver.app/Contents/MacOS/cua-driver\\n'\n"
+    )
+    lsof.chmod(0o755)
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {functions}
+            MACOS_LSOF='{lsof}'
+            identity="$(macos_install_process_identity 4242)"
+            [[ "$identity" == /Applications/CuaDriver.app/Contents/MacOS/cua-driver ]]
+            macos_install_process_identity_is_owned "$identity" \
+                /Applications/CuaDriver.app/Contents/MacOS/cua-driver
+            id() {{ printf '501\\n'; }}
+            pgrep() {{ return 2; }}
+            ! macos_install_owned_process_records \
+                /Applications/CuaDriver.app/Contents/MacOS/cua-driver
+            """,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert args.read_text() == "-a -p 4242 -d txt -Fn"
+    source = INSTALLER.read_text()
+    stop = extract_shell_function("stop_authenticated_macos_daemons")
+    assert "com.trycua.cua-driver.plist" in stop
+    assert "com.trycua.cua-driver-rs.plist" in stop
+    assert "kill -TERM" in stop and "kill -KILL" in stop
+    darwin_cleanup = extract_shell_function("cleanup_prior_local_install")
+    assert '[[ "${OS:-}" != "Darwin" ]]' in darwin_cleanup
 
 
 def test_release_app_requires_exact_team_apple_anchor_and_notarization(
@@ -365,6 +578,9 @@ def test_staged_binary_attestation_matches_bundle_and_team_pins(tmp_path: Path) 
         "      schema_version) printf '%s' \"${TEST_ATTESTATION_SCHEMA:-1}\" ;;\n"
         "      bundle_id) printf '%s' \"${TEST_ATTESTATION_BUNDLE:-com.meta.musecode.cua.driver}\" ;;\n"
         "      production_team_id) printf '%s' \"${TEST_ATTESTATION_TEAM:-A1B2C3D4E5}\" ;;\n"
+        "      binary_version) printf '%s' \"${TEST_ATTESTATION_VERSION:-0.23.2}\" ;;\n"
+        "      source_sha) printf '%s' \"${TEST_ATTESTATION_SOURCE_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\" ;;\n"
+        "      plugin_managed) printf '%s' \"${TEST_ATTESTATION_PLUGIN_MANAGED:-false}\" ;;\n"
         "      *) exit 2 ;;\n"
         "    esac ;;\n"
         "  *) exit 2 ;;\n"
@@ -378,7 +594,8 @@ def test_staged_binary_attestation_matches_bundle_and_team_pins(tmp_path: Path) 
         TMP_DIR='{temp}'
         MACOS_PLUTIL='{fake_plutil}'
         macos_verify_build_attestation '{app}' \
-            com.meta.musecode.cua.driver A1B2C3D4E5
+            com.meta.musecode.cua.driver A1B2C3D4E5 0.23.2 \
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     """
     result = run_release_identity_policy(body)
 
@@ -402,6 +619,9 @@ def test_staged_binary_attestation_rejects_mismatched_embedded_pins(
         "  -extract:schema_version) printf 1 ;;\n"
         "  -extract:bundle_id) printf '%s' \"$TEST_ATTESTATION_BUNDLE\" ;;\n"
         "  -extract:production_team_id) printf '%s' \"$TEST_ATTESTATION_TEAM\" ;;\n"
+        "  -extract:binary_version) printf '%s' \"$TEST_ATTESTATION_VERSION\" ;;\n"
+        "  -extract:source_sha) printf '%s' \"$TEST_ATTESTATION_SOURCE_SHA\" ;;\n"
+        "  -extract:plugin_managed) printf '%s' \"$TEST_ATTESTATION_PLUGIN_MANAGED\" ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n"
     )
@@ -413,13 +633,17 @@ def test_staged_binary_attestation_rejects_mismatched_embedded_pins(
         TMP_DIR='{temp}'
         MACOS_PLUTIL='{fake_plutil}'
         ! macos_verify_build_attestation '{app}' \
-            com.meta.musecode.cua.driver A1B2C3D4E5
+            com.meta.musecode.cua.driver A1B2C3D4E5 0.23.2 \
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     """
     wrong_team = run_release_identity_policy(
         body,
         {
             "TEST_ATTESTATION_BUNDLE": "com.meta.musecode.cua.driver",
             "TEST_ATTESTATION_TEAM": "OTHERTEAM1",
+            "TEST_ATTESTATION_VERSION": "0.23.2",
+            "TEST_ATTESTATION_SOURCE_SHA": "a" * 40,
+            "TEST_ATTESTATION_PLUGIN_MANAGED": "false",
         },
     )
     wrong_bundle = run_release_identity_policy(
@@ -427,11 +651,47 @@ def test_staged_binary_attestation_rejects_mismatched_embedded_pins(
         {
             "TEST_ATTESTATION_BUNDLE": "com.example.lookalike",
             "TEST_ATTESTATION_TEAM": "A1B2C3D4E5",
+            "TEST_ATTESTATION_VERSION": "0.23.2",
+            "TEST_ATTESTATION_SOURCE_SHA": "a" * 40,
+            "TEST_ATTESTATION_PLUGIN_MANAGED": "false",
+        },
+    )
+    wrong_version = run_release_identity_policy(
+        body,
+        {
+            "TEST_ATTESTATION_BUNDLE": "com.meta.musecode.cua.driver",
+            "TEST_ATTESTATION_TEAM": "A1B2C3D4E5",
+            "TEST_ATTESTATION_VERSION": "0.23.1",
+            "TEST_ATTESTATION_SOURCE_SHA": "a" * 40,
+            "TEST_ATTESTATION_PLUGIN_MANAGED": "false",
+        },
+    )
+    wrong_source = run_release_identity_policy(
+        body,
+        {
+            "TEST_ATTESTATION_BUNDLE": "com.meta.musecode.cua.driver",
+            "TEST_ATTESTATION_TEAM": "A1B2C3D4E5",
+            "TEST_ATTESTATION_VERSION": "0.23.2",
+            "TEST_ATTESTATION_SOURCE_SHA": "b" * 40,
+            "TEST_ATTESTATION_PLUGIN_MANAGED": "false",
+        },
+    )
+    plugin_managed = run_release_identity_policy(
+        body,
+        {
+            "TEST_ATTESTATION_BUNDLE": "com.meta.musecode.cua.driver",
+            "TEST_ATTESTATION_TEAM": "A1B2C3D4E5",
+            "TEST_ATTESTATION_VERSION": "0.23.2",
+            "TEST_ATTESTATION_SOURCE_SHA": "a" * 40,
+            "TEST_ATTESTATION_PLUGIN_MANAGED": "true",
         },
     )
 
     assert wrong_team.returncode == 0, wrong_team.stderr
     assert wrong_bundle.returncode == 0, wrong_bundle.stderr
+    assert wrong_version.returncode == 0, wrong_version.stderr
+    assert wrong_source.returncode == 0, wrong_source.stderr
+    assert plugin_managed.returncode == 0, plugin_managed.stderr
 
 
 def test_legacy_history_blocks_identity_migration_without_deleting_state(
@@ -466,6 +726,7 @@ def test_legacy_tcc_cleanup_is_scoped_and_fails_closed() -> None:
             "-c",
             f"""set -euo pipefail
             {function}
+            MACOS_TCCUTIL=tccutil
             err() {{ printf 'error: %s\\n' "$*" >&2; }}
             log() {{ printf 'log: %s\\n' "$*"; }}
             macos_register_app() {{ return 0; }}
@@ -496,10 +757,85 @@ def test_legacy_tcc_cleanup_is_scoped_and_fails_closed() -> None:
     assert "legacy app was preserved" in result.stderr
 
 
+def test_legacy_rs_cleanup_resets_unregisters_and_stages_rollback() -> None:
+    reset = extract_shell_function("macos_reset_legacy_tcc_before_migration")
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            f"""set -euo pipefail
+            {reset}
+            MACOS_TCCUTIL=tccutil
+            err() {{ printf 'error: %s\\n' "$*" >&2; }}
+            log() {{ :; }}
+            calls=''
+            macos_register_app() {{ calls="${{calls}}register:$1"$'\\n'; }}
+            macos_unregister_app() {{ calls="${{calls}}unregister:$1"$'\\n'; }}
+            tccutil() {{ calls="${{calls}}${{1}}:${{2}}:${{3}}"$'\\n'; }}
+            LEGACY_PRODUCTION_BUNDLE_ID=com.trycua.driver
+            APP_DEST=/Applications/CuaDriver.app
+            macos_reset_legacy_tcc_before_migration \
+                /Applications/CuaDriverRs.app com.trycua.cuadriverrs
+            printf '%s' "$calls"
+            """,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "register:/Applications/CuaDriverRs.app",
+        "reset:Accessibility:com.trycua.cuadriverrs",
+        "reset:ScreenCapture:com.trycua.cuadriverrs",
+        "reset:AppleEvents:com.trycua.cuadriverrs",
+        "unregister:/Applications/CuaDriverRs.app",
+    ]
+
+
+def test_legacy_rs_migration_and_history_checks_precede_bundle_moves() -> None:
+    source = INSTALLER.read_text()
+    install = source.index('if [[ "$OS" == "Darwin" && -n "$SRC_APP"')
+    attestation = source.index('macos_verify_build_attestation "$SRC_APP"', install)
+    legacy_verify = source.index(
+        'macos_verify_release_app "$LEGACY_RS_APP_DEST" "$LEGACY_RS_BUNDLE_ID"',
+        attestation,
+    )
+    stop = source.index("stop_authenticated_macos_daemons", legacy_verify)
+    first_history = source.index(
+        "macos_refuse_legacy_history_identity_transition", stop
+    )
+    second_history = source.index(
+        "macos_refuse_legacy_history_identity_transition", first_history + 1
+    )
+    legacy_reset = source.index("macos_reset_legacy_tcc_before_migration", second_history)
+    assert "$LEGACY_RS_APP_DEST" in source[legacy_reset : legacy_reset + 180]
+    assert "$LEGACY_RS_BUNDLE_ID" in source[legacy_reset : legacy_reset + 180]
+    legacy_move = source.index("macos_stage_legacy_rs_removal", legacy_reset)
+    canonical_move = source.index('mv "$APP_DEST" "$MACOS_APP_BACKUP"', legacy_move)
+    commit = source.index("MACOS_APP_INSTALL_COMMITTED=1", canonical_move)
+    local_cleanup = source.index("cleanup_prior_local_install", commit)
+
+    assert (
+        attestation
+        < legacy_verify
+        < stop
+        < first_history
+        < second_history
+        < legacy_reset
+        < legacy_move
+        < canonical_move
+        < commit
+        < local_cleanup
+    )
+
+
 def test_exit_cleanup_restores_the_previous_app(tmp_path: Path) -> None:
     app = tmp_path / "CuaDriver.app"
     backup = tmp_path / "CuaDriver.app.install-backup"
     register_log = tmp_path / "register.log"
+    unregister_log = tmp_path / "unregister.log"
     app.mkdir()
     (app / "candidate").write_text("partial")
     backup.mkdir()
@@ -514,6 +850,7 @@ def test_exit_cleanup_restores_the_previous_app(tmp_path: Path) -> None:
             "MACOS_APP_HAD_PREVIOUS": "1",
             "MACOS_APP_INSTALL_COMMITTED": "0",
             "REGISTER_LOG": str(register_log),
+            "UNREGISTER_LOG": str(unregister_log),
         },
     )
 
@@ -521,6 +858,7 @@ def test_exit_cleanup_restores_the_previous_app(tmp_path: Path) -> None:
     assert (app / "previous").read_text() == "valid"
     assert not backup.exists()
     assert register_log.read_text().strip() == str(app)
+    assert unregister_log.read_text().strip() == str(app)
 
 
 def test_exit_cleanup_removes_a_partial_first_install(tmp_path: Path) -> None:
@@ -592,3 +930,75 @@ def test_rollback_preserves_an_unauthenticated_failed_candidate(tmp_path: Path) 
     preserved = list(tmp_path.glob("CuaDriver.app.failed-install.*"))
     assert len(preserved) == 1
     assert (preserved[0] / "untrusted").read_text() == "preserve"
+
+
+def test_rollback_reports_launchservices_reregistration_failure(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriver.app"
+    backup = tmp_path / "CuaDriver.app.install-backup"
+    app.mkdir()
+    backup.mkdir()
+    (backup / "previous").write_text("valid")
+
+    result = run_rollback_policy(
+        "status=0; restore_macos_app_backup_on_exit || status=$?; exit \"$status\"",
+        {
+            "APP_DEST": str(app),
+            "MACOS_APP_BACKUP": str(backup),
+            "MACOS_APP_SWAP_STARTED": "1",
+            "MACOS_APP_HAD_PREVIOUS": "1",
+            "MACOS_APP_INSTALL_COMMITTED": "0",
+            "REGISTER_FAIL": "1",
+        },
+    )
+
+    assert result.returncode != 0
+    assert (app / "previous").read_text() == "valid"
+    assert "could not re-register" in result.stderr
+
+
+def test_rollback_preserves_failed_candidate_when_unregister_fails(
+    tmp_path: Path,
+) -> None:
+    app = tmp_path / "CuaDriver.app"
+    backup = tmp_path / "CuaDriver.app.install-backup"
+    app.mkdir()
+    (app / "candidate").write_text("new")
+    backup.mkdir()
+    (backup / "previous").write_text("old")
+    result = run_rollback_policy(
+        "restore_macos_app_backup_on_exit",
+        {
+            "APP_DEST": str(app),
+            "MACOS_APP_BACKUP": str(backup),
+            "MACOS_APP_SWAP_STARTED": "1",
+            "MACOS_APP_HAD_PREVIOUS": "1",
+            "MACOS_APP_INSTALL_COMMITTED": "0",
+            "UNREGISTER_FAIL": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (app / "previous").read_text() == "old"
+    preserved = list(tmp_path.glob("CuaDriver.app.failed-install.*"))
+    assert len(preserved) == 1
+    assert (preserved[0] / "candidate").read_text() == "new"
+
+
+def test_legacy_rs_backup_is_restored_and_reregistered(tmp_path: Path) -> None:
+    app = tmp_path / "CuaDriverRs.app"
+    backup = tmp_path / "CuaDriverRs.app.install-backup"
+    backup.mkdir()
+    (backup / "previous").write_text("valid")
+    result = run_legacy_rs_rollback_policy(
+        "restore_macos_legacy_rs_backup_on_exit",
+        {
+            "LEGACY_RS_APP_DEST": str(app),
+            "MACOS_LEGACY_RS_BACKUP": str(backup),
+            "MACOS_LEGACY_RS_REMOVAL_STARTED": "1",
+            "MACOS_LEGACY_RS_REMOVAL_COMMITTED": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (app / "previous").read_text() == "valid"
+    assert not backup.exists()
