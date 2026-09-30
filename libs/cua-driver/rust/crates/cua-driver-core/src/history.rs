@@ -786,16 +786,18 @@ impl HistoryManager {
             )
         } else {
             let lease = WriterLease::acquire(&self.config.root)?;
+            let events = HistoryStore::read_all(
+                &self.config.root,
+                &self.config.namespace,
+                self.key_provider.as_ref(),
+                self.config.quota_bytes,
+            )?;
+            // A disabled/read-only query must authenticate every existing
+            // chunk before retention deletes any of them. Otherwise a signer
+            // or Keychain access-group migration could silently erase the
+            // only evidence that its former key is inaccessible.
             prune_expired_chunks(&self.config.root, self.config.retention_days)?;
-            (
-                HistoryStore::read_all(
-                    &self.config.root,
-                    &self.config.namespace,
-                    self.key_provider.as_ref(),
-                    self.config.quota_bytes,
-                )?,
-                Some(lease),
-            )
+            (events, Some(lease))
         };
         drop(writer_guard);
         let next_sequence = events
@@ -1020,7 +1022,6 @@ impl HistoryManager {
             return Ok(());
         }
         let writer_lease = WriterLease::acquire(&self.config.root)?;
-        prune_expired_chunks(&self.config.root, self.config.retention_days)?;
         // Read every existing chunk before creating or caching a namespace key.
         // A signing-identity or Keychain access-group migration can make an
         // existing key temporarily unavailable. Creating a replacement key in
@@ -1033,6 +1034,12 @@ impl HistoryManager {
             self.config.quota_bytes,
         )?;
         self.ensure_session_id_key()?;
+        // Pruning is destructive. Perform it only after every existing chunk
+        // has been authenticated with the currently accessible namespace key.
+        // In particular, a signing/access-group migration must not erase old
+        // ciphertext and then create a replacement key merely because the
+        // unreadable chunks happened to be expired.
+        prune_expired_chunks(&self.config.root, self.config.retention_days)?;
         let max_sequence = existing
             .iter()
             .map(|event| event.data.sequence)
@@ -3326,12 +3333,41 @@ mod tests {
         first.disable().unwrap();
         drop(first);
 
+        let chunks_before = history_chunk_paths(temp.path()).unwrap();
+        assert!(!chunks_before.is_empty());
         keys.keys.lock().unwrap().clear();
-        let second = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        let mut migrated = config(temp.path());
+        migrated.retention_days = 0;
+        let second = HistoryManager::new(migrated, keys.clone(), None);
         let error = second.enable().unwrap_err();
 
         assert_eq!(error.category, HistoryHealthCategory::KeyUnavailable);
         assert!(keys.keys.lock().unwrap().is_empty());
+        assert_eq!(history_chunk_paths(temp.path()).unwrap(), chunks_before);
+    }
+
+    #[test]
+    fn inaccessible_existing_history_query_never_prunes_ciphertext() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeyProvider::default());
+        let first = HistoryManager::new(config(temp.path()), keys.clone(), None);
+        first.enable().unwrap();
+        first.disable().unwrap();
+        drop(first);
+
+        let chunks_before = history_chunk_paths(temp.path()).unwrap();
+        assert!(!chunks_before.is_empty());
+        keys.keys.lock().unwrap().clear();
+        let mut migrated = config(temp.path());
+        migrated.retention_days = 0;
+        let second = HistoryManager::new(migrated, keys.clone(), None);
+        let error = second
+            .query(HistoryQuery::default(), HistoryAccessOperation::LocalCli)
+            .unwrap_err();
+
+        assert_eq!(error.category, HistoryHealthCategory::KeyUnavailable);
+        assert!(keys.keys.lock().unwrap().is_empty());
+        assert_eq!(history_chunk_paths(temp.path()).unwrap(), chunks_before);
     }
 
     #[test]

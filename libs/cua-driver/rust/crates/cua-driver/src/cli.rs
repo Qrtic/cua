@@ -3508,7 +3508,7 @@ fn build_attestation() -> serde_json::Value {
         "binary_version": option_env!("CUA_DRIVER_RELEASE_VERSION")
             .unwrap_or(env!("CARGO_PKG_VERSION")),
         "source_sha": option_env!("CUA_DRIVER_SOURCE_SHA"),
-        "production_team_id": option_env!("CUA_DRIVER_PRODUCTION_TEAM_ID"),
+        "production_team_id": crate::bundle::PRODUCTION_TEAM_ID,
         "bundle_id": crate::bundle::bundle_id(),
         "plugin_managed": crate::bundle::is_plugin_managed_app(),
     })
@@ -6709,9 +6709,11 @@ fn diagnose_tcc_db_section() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let db = format!("{home}/Library/Application Support/com.apple.TCC/TCC.db");
     let sql = "SELECT service, client, client_type, auth_value, auth_reason, \
-               hex(csreq) AS csreq_hex FROM access WHERE client='com.meta.musecode.cua.driver';";
+               hex(csreq) AS csreq_hex FROM access WHERE client IN (\
+               'com.meta.musecode.cua.driver', 'com.meta.musecode.cua.driver.local', \
+               'com.trycua.driver', 'com.trycua.driver.local', 'com.trycua.cuadriverrs');";
 
-    let mut lines = vec!["## tcc database rows for com.meta.musecode.cua.driver".to_owned()];
+    let mut lines = vec!["## current and legacy Cua Driver TCC database rows".to_owned()];
     lines.push(format!(
         "(reading {db} — best-effort; system TCC DB requires FDA)"
     ));
@@ -7107,7 +7109,7 @@ mod tests {
         );
         assert_eq!(
             attestation["production_team_id"],
-            serde_json::json!(option_env!("CUA_DRIVER_PRODUCTION_TEAM_ID"))
+            crate::bundle::PRODUCTION_TEAM_ID
         );
         assert!(attestation["bundle_id"].is_string());
         assert!(attestation["plugin_managed"].is_boolean());

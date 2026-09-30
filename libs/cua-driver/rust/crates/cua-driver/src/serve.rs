@@ -802,28 +802,32 @@ fn pid_file_identity(pid_file_path: &str) -> anyhow::Result<PidFileIdentity> {
 #[derive(Debug)]
 struct PidFileLease {
     lock_file: std::fs::File,
-    parent: std::path::PathBuf,
-    path: String,
+    pid_parent: Option<std::path::PathBuf>,
+    pid_path: Option<String>,
     identity: Option<PidFileIdentity>,
 }
 
 #[cfg(unix)]
 impl PidFileLease {
-    fn acquire(pid_file_path: &str) -> anyhow::Result<Self> {
+    fn acquire(socket_path: &str, pid_file_path: Option<&str>) -> anyhow::Result<Self> {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
-        let destination = std::path::Path::new(pid_file_path);
-        let parent = destination
+        let socket = std::path::Path::new(socket_path);
+        let lock_parent = socket
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent)
-            .map_err(|error| anyhow::anyhow!("create daemon PID directory {parent:?}: {error}"))?;
-        let file_name = destination
+        std::fs::create_dir_all(lock_parent).map_err(|error| {
+            anyhow::anyhow!("create daemon socket directory {lock_parent:?}: {error}")
+        })?;
+        let socket_name = socket
             .file_name()
-            .ok_or_else(|| anyhow::anyhow!("daemon PID path has no file name: {pid_file_path}"))?;
-        let lock_path = parent.join(format!(".{}.lock", file_name.to_string_lossy()));
+            .ok_or_else(|| anyhow::anyhow!("daemon socket path has no file name: {socket_path}"))?;
+        let lock_path = lock_parent.join(format!(
+            ".{}.generation.lock",
+            socket_name.to_string_lossy()
+        ));
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -848,29 +852,47 @@ impl PidFileLease {
         if result != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                anyhow::bail!("another daemon generation owns the PID-file lock");
+                anyhow::bail!("another daemon generation owns the socket lock");
             }
             return Err(anyhow::anyhow!(
-                "lock daemon PID file {lock_path:?}: {error}"
+                "lock daemon socket generation {lock_path:?}: {error}"
             ));
         }
+        let (pid_parent, pid_path) = if let Some(pid_file_path) = pid_file_path {
+            let destination = std::path::Path::new(pid_file_path);
+            let parent = destination
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(parent).map_err(|error| {
+                anyhow::anyhow!("create daemon PID directory {parent:?}: {error}")
+            })?;
+            (Some(parent.to_path_buf()), Some(pid_file_path.to_owned()))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             lock_file,
-            parent: parent.to_path_buf(),
-            path: pid_file_path.to_owned(),
+            pid_parent,
+            pid_path,
             identity: None,
         })
     }
 
     fn publish(&mut self, pid: u32) -> anyhow::Result<()> {
-        let identity = write_private_pid_file(&self.path, pid, &self.parent)?;
+        let (Some(pid_path), Some(pid_parent)) = (&self.pid_path, &self.pid_parent) else {
+            return Ok(());
+        };
+        let identity = write_private_pid_file(pid_path, pid, pid_parent)?;
         self.identity = Some(identity);
         Ok(())
     }
 
     fn cleanup(&mut self) {
         if let Some(identity) = self.identity.take() {
-            remove_owned_pid_file(&self.path, identity);
+            if let Some(pid_path) = self.pid_path.as_deref() {
+                remove_owned_pid_file(pid_path, identity);
+            }
         }
     }
 }
@@ -1304,11 +1326,10 @@ pub async fn run_serve(
         std::fs::create_dir_all(dir)?;
     }
 
-    // Serialize daemon generations through a private PID-file lock before
-    // touching the shared socket. This prevents a concurrent replacement from
-    // publishing a new PID file while the prior daemon still owns cleanup
-    // authority.
-    let mut pid_file_lease = pid_file_path.map(PidFileLease::acquire).transpose()?;
+    // Serialize daemon generations by socket identity before touching the
+    // shared endpoint. PID paths are independent caller inputs and therefore
+    // cannot be the exclusivity key.
+    let mut pid_file_lease = PidFileLease::acquire(socket_path, pid_file_path)?;
 
     let embedded = cua_driver_core::embedded_mode();
     // Embedded endpoints are host-owned. The daemon must never unlink an
@@ -1329,9 +1350,7 @@ pub async fn run_serve(
     // Publish the PID only after the socket is bound. A managed caller uses
     // this file as lifecycle authority, so creation must fail closed rather
     // than leave a readable, partial, or stale PID behind.
-    if let Some(lease) = pid_file_lease.as_mut() {
-        lease.publish(std::process::id())?;
-    }
+    pid_file_lease.publish(std::process::id())?;
 
     // Shutdown channel.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2824,12 +2843,15 @@ mod socket_tests {
     #[test]
     fn pid_file_is_atomically_replaced_and_forced_private() {
         let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("driver.sock");
         let pid_file = directory.path().join("driver.pid");
         std::fs::write(&pid_file, "stale-partial-value").unwrap();
         std::fs::set_permissions(&pid_file, std::fs::Permissions::from_mode(0o666)).unwrap();
         let stale_inode = std::fs::metadata(&pid_file).unwrap().ino();
 
-        let mut lease = PidFileLease::acquire(pid_file.to_str().unwrap()).unwrap();
+        let mut lease =
+            PidFileLease::acquire(socket.to_str().unwrap(), Some(pid_file.to_str().unwrap()))
+                .unwrap();
         lease.publish(4242).unwrap();
         let identity = lease.identity.unwrap();
 
@@ -2850,12 +2872,15 @@ mod socket_tests {
     #[test]
     fn pid_file_publish_replaces_a_symlink_without_following_it() {
         let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("driver.sock");
         let victim = directory.path().join("victim");
         let pid_file = directory.path().join("driver.pid");
         std::fs::write(&victim, "do-not-change").unwrap();
         std::os::unix::fs::symlink(&victim, &pid_file).unwrap();
 
-        let mut lease = PidFileLease::acquire(pid_file.to_str().unwrap()).unwrap();
+        let mut lease =
+            PidFileLease::acquire(socket.to_str().unwrap(), Some(pid_file.to_str().unwrap()))
+                .unwrap();
         lease.publish(4242).unwrap();
 
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do-not-change");
@@ -2869,9 +2894,12 @@ mod socket_tests {
     #[test]
     fn pid_cleanup_preserves_a_replacement_file() {
         let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("driver.sock");
         let pid_file = directory.path().join("driver.pid");
         let original = directory.path().join("original.pid");
-        let mut lease = PidFileLease::acquire(pid_file.to_str().unwrap()).unwrap();
+        let mut lease =
+            PidFileLease::acquire(socket.to_str().unwrap(), Some(pid_file.to_str().unwrap()))
+                .unwrap();
         lease.publish(4242).unwrap();
         std::fs::rename(&pid_file, &original).unwrap();
         std::fs::write(&pid_file, "4343").unwrap();
@@ -2882,12 +2910,17 @@ mod socket_tests {
     }
 
     #[test]
-    fn pid_directory_lease_serializes_daemon_generations() {
+    fn socket_lease_serializes_generations_with_different_pid_paths() {
         let directory = tempfile::tempdir().unwrap();
-        let pid_file = directory.path().join("driver.pid");
-        let _first = PidFileLease::acquire(pid_file.to_str().unwrap()).unwrap();
+        let socket = directory.path().join("driver.sock");
+        let first_pid = directory.path().join("first.pid");
+        let second_pid = directory.path().join("second.pid");
+        let _first =
+            PidFileLease::acquire(socket.to_str().unwrap(), Some(first_pid.to_str().unwrap()))
+                .unwrap();
 
-        let second = PidFileLease::acquire(pid_file.to_str().unwrap());
+        let second =
+            PidFileLease::acquire(socket.to_str().unwrap(), Some(second_pid.to_str().unwrap()));
 
         assert!(second
             .unwrap_err()

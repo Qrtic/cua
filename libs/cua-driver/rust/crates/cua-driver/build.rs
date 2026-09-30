@@ -17,7 +17,6 @@ fn main() {
     // value while reusing the same target directory (for example POC A/B).
     println!("cargo:rerun-if-env-changed=CUA_DRIVER_RELEASE_VERSION");
     println!("cargo:rerun-if-env-changed=CUA_DRIVER_SOURCE_SHA");
-    println!("cargo:rerun-if-env-changed=CUA_DRIVER_PRODUCTION_TEAM_ID");
 
     #[cfg(target_os = "windows")]
     {

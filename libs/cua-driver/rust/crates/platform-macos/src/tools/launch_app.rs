@@ -460,6 +460,7 @@ fn is_cua_driver_bundle_id(bundle_id: &str) -> bool {
             | "com.meta.musecode.cua.driver.local"
             | "com.trycua.driver"
             | "com.trycua.driver.local"
+            | "com.trycua.cuadriverrs"
     )
 }
 
@@ -844,6 +845,7 @@ mod tests {
         ));
         assert!(is_cua_driver_bundle_id("com.trycua.driver"));
         assert!(is_cua_driver_bundle_id("com.trycua.driver.local"));
+        assert!(is_cua_driver_bundle_id("com.trycua.cuadriverrs"));
         assert!(!is_cua_driver_bundle_id("com.trycua.harness.tauri"));
     }
 

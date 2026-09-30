@@ -19,6 +19,7 @@ pub const RELEASE_APP_NAME: &str = "CuaDriver";
 pub const LOCAL_APP_NAME: &str = "MuseCodeCuaDriverLocal";
 pub const RELEASE_BUNDLE_ID: &str = "com.meta.musecode.cua.driver";
 pub const LOCAL_BUNDLE_ID: &str = "com.meta.musecode.cua.driver.local";
+pub const PRODUCTION_TEAM_ID: &str = "4W5TH4RKQ2";
 
 pub(crate) fn path_is_local(path: &Path) -> bool {
     #[cfg(target_os = "macos")]

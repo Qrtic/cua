@@ -29,15 +29,9 @@ fn valid_production_team_identifier(value: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn production_team_identifier() -> anyhow::Result<&'static str> {
-    let value = option_env!("CUA_DRIVER_PRODUCTION_TEAM_ID").ok_or_else(|| {
-        anyhow::anyhow!(
-            "production Computer History requires CUA_DRIVER_PRODUCTION_TEAM_ID at build time"
-        )
-    })?;
+    let value = crate::bundle::PRODUCTION_TEAM_ID;
     if !valid_production_team_identifier(value) {
-        anyhow::bail!(
-            "CUA_DRIVER_PRODUCTION_TEAM_ID must be a 10-character uppercase Apple Team ID"
-        );
+        anyhow::bail!("the pinned production Apple Team ID is invalid");
     }
     Ok(value)
 }
@@ -696,6 +690,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn production_team_identifier_format_is_strict() {
         assert!(valid_production_team_identifier(TEST_TEAM_IDENTIFIER));
+        assert_eq!(production_team_identifier().unwrap(), "4W5TH4RKQ2");
         assert!(!valid_production_team_identifier("YCK386LBJ7-extra"));
         assert!(!valid_production_team_identifier("team123456"));
         assert!(!valid_production_team_identifier("SHORT"));
