@@ -29,6 +29,7 @@ const SETUP_FAILED_CODE: &str = "computer_use_setup_failed";
 const INTERNAL_INITIALIZE_ID: &str = "computer-use-bootstrap/internal/initialize";
 const INTERNAL_TOOLS_LIST_ID: &str = "computer-use-bootstrap/internal/tools-list";
 const BACKEND_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(45);
+const BACKEND_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const AUTONOMOUS_CALL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 // The marketplace setup relay reserves up to 20 seconds to stop an exact
@@ -487,6 +488,14 @@ struct BackendProcess {
     exit_status: Option<ExitStatus>,
     pending_request_ids: Vec<Value>,
     cancelled_request_ids: Vec<Value>,
+    restart_on_retirement: bool,
+    drain: Option<BackendDrain>,
+}
+
+struct BackendDrain {
+    detail: String,
+    retryable: bool,
+    expired: bool,
 }
 
 struct Failure {
@@ -516,6 +525,7 @@ enum Event {
     SetupOutputClosed { generation: u64 },
     BackendLine { generation: u64, line: String },
     BackendOutputClosed { generation: u64 },
+    BackendDrainExpired { generation: u64 },
 }
 
 struct Server {
@@ -582,9 +592,9 @@ impl Server {
                         .and_then(Value::as_object)
                         .and_then(|params| params.get("requestId"))
                         .cloned();
-                    self.handle_cancellation(raw, request_id, output)?;
+                    self.handle_cancellation(raw, request_id, events)?;
                 }
-                _ if self.backend_ready() => self.forward_to_backend(raw, None, output)?,
+                _ if self.backend_ready() => self.forward_to_backend(raw, None, events)?,
                 _ => {}
             }
             return Ok(());
@@ -673,11 +683,13 @@ impl Server {
                     RuntimeState::Setup(setup) => {
                         write_json(output, &rpc_result(id, setup_pending_result(setup.stage)))
                     }
-                    RuntimeState::Backend(backend) if backend.phase != BackendPhase::Ready => {
+                    RuntimeState::Backend(backend)
+                        if backend.phase != BackendPhase::Ready || backend.drain.is_some() =>
+                    {
                         self.defer_tool_call(raw, id);
                         Ok(())
                     }
-                    RuntimeState::Backend(_) => self.forward_to_backend(raw, Some(id), output),
+                    RuntimeState::Backend(_) => self.forward_to_backend(raw, Some(id), events),
                     RuntimeState::Failed(failure) => {
                         let retryable = failure.retryable;
                         let report_on_next_call = failure.report_on_next_call;
@@ -741,6 +753,7 @@ impl Server {
             &self.runtime,
             RuntimeState::Backend(BackendProcess {
                 phase: BackendPhase::Ready,
+                drain: None,
                 ..
             })
         )
@@ -757,25 +770,39 @@ impl Server {
     fn current_pending_stage(&self) -> Option<SetupStage> {
         match &self.runtime {
             RuntimeState::Setup(setup) => Some(setup.stage),
-            RuntimeState::Backend(backend) if backend.phase != BackendPhase::Ready => {
+            RuntimeState::Backend(backend)
+                if backend.phase != BackendPhase::Ready || backend.drain.is_some() =>
+            {
                 Some(SetupStage::ServiceStarting)
             }
             _ => None,
         }
     }
 
-    fn progress_deferred_tool_calls(&mut self, output: &mut dyn Write) -> io::Result<()> {
+    fn progress_deferred_tool_calls(
+        &mut self,
+        events: &Sender<Event>,
+        output: &mut dyn Write,
+    ) -> io::Result<()> {
         if self.deferred_tool_calls.is_empty() {
+            return Ok(());
+        }
+        if matches!(
+            &self.runtime,
+            RuntimeState::Backend(BackendProcess { drain: Some(_), .. })
+        ) {
+            // Drain completion decides whether these never-written calls fail
+            // with the retired transport or continue on its replacement.
             return Ok(());
         }
         if self.backend_ready() {
             let mut calls = VecDeque::from(std::mem::take(&mut self.deferred_tool_calls));
             while let Some(call) = calls.pop_front() {
-                // Keep every not-yet-attempted call visible to fail_backend.
-                // If this write observes a closed backend pipe, fail_backend
-                // settles both already-forwarded IDs and the untouched tail.
+                // Keep every not-yet-attempted call visible to terminal drain
+                // handling. A closed backend pipe settles already-forwarded
+                // IDs and either fails or replays only the untouched tail.
                 self.deferred_tool_calls = calls.into();
-                self.forward_to_backend(call.raw, Some(call.id), output)?;
+                self.forward_to_backend(call.raw, Some(call.id), events)?;
                 if !self.backend_ready() {
                     return Ok(());
                 }
@@ -807,7 +834,7 @@ impl Server {
         &mut self,
         raw: String,
         request_id: Option<Value>,
-        output: &mut dyn Write,
+        events: &Sender<Event>,
     ) -> io::Result<()> {
         let cancelled_deferred = request_id.as_ref().is_some_and(|request_id| {
             let before = self.deferred_tool_calls.len();
@@ -824,6 +851,7 @@ impl Server {
         match &mut self.runtime {
             RuntimeState::Setup(_) => Ok(()),
             RuntimeState::Backend(backend) if backend.phase == BackendPhase::Ready => {
+                let can_forward = backend.drain.is_none();
                 let cancelled_request = request_id.as_ref().and_then(|request_id| {
                     backend
                         .pending_request_ids
@@ -841,7 +869,12 @@ impl Server {
                 // this cancellation. Retain the ID until that response arrives
                 // so it can be discarded without poisoning the session.
                 backend.cancelled_request_ids.push(cancelled_request);
-                self.forward_to_backend(raw, None, output)
+                backend.restart_on_retirement = true;
+                if can_forward {
+                    self.forward_to_backend(raw, None, events)
+                } else {
+                    Ok(())
+                }
             }
             RuntimeState::Backend(_) => Ok(()),
             RuntimeState::Dormant | RuntimeState::Failed(_) => Ok(()),
@@ -930,6 +963,8 @@ impl Server {
             exit_status: None,
             pending_request_ids: Vec::new(),
             cancelled_request_ids: Vec::new(),
+            restart_on_retirement: false,
+            drain: None,
         });
         Ok(())
     }
@@ -1010,6 +1045,16 @@ impl Server {
                 if let RuntimeState::Backend(backend) = &mut self.runtime {
                     if backend.generation == generation {
                         backend.stdout_closed = true;
+                    }
+                }
+                Ok(())
+            }
+            Event::BackendDrainExpired { generation } => {
+                if let RuntimeState::Backend(backend) = &mut self.runtime {
+                    if backend.generation == generation {
+                        if let Some(drain) = backend.drain.as_mut() {
+                            drain.expired = true;
+                        }
                     }
                 }
                 Ok(())
@@ -1172,10 +1217,18 @@ impl Server {
         &mut self,
         raw: String,
         request_id: Option<Value>,
-        output: &mut dyn Write,
+        events: &Sender<Event>,
     ) -> io::Result<()> {
         let write_result = match &mut self.runtime {
-            RuntimeState::Backend(backend) if backend.phase == BackendPhase::Ready => {
+            RuntimeState::Backend(backend)
+                if backend.phase == BackendPhase::Ready && backend.drain.is_none() =>
+            {
+                if let Some(id) = request_id.as_ref() {
+                    // A flush can report EPIPE after the backend consumed the
+                    // complete line and queued a response. Track the ID before
+                    // writing so a response received during drain can win.
+                    backend.pending_request_ids.push(id.clone());
+                }
                 let result = backend
                     .stdin
                     .write_all(raw.trim().as_bytes())
@@ -1183,34 +1236,51 @@ impl Server {
                         backend.stdin.write_all(b"\n")?;
                         backend.stdin.flush()
                     });
-                if result.is_ok() {
-                    if let Some(id) = request_id.as_ref() {
-                        backend.pending_request_ids.push(id.clone());
-                    }
-                }
                 result
             }
             _ => return Ok(()),
         };
         if let Err(error) = write_result {
-            self.fail_backend(
+            self.begin_backend_drain(
                 format!("Computer Use backend input closed: {error}"),
                 true,
-                output,
-            )?;
-            if let Some(id) = request_id {
-                write_json(output, &rpc_result(id, backend_failed_result(true)))?;
-            }
+                events,
+            );
         }
         Ok(())
+    }
+
+    fn begin_backend_drain(&mut self, detail: String, retryable: bool, events: &Sender<Event>) {
+        if let RuntimeState::Backend(backend) = &mut self.runtime {
+            if backend.drain.is_none() {
+                let generation = backend.generation;
+                backend.drain = Some(BackendDrain {
+                    detail,
+                    retryable,
+                    expired: false,
+                });
+                let events = events.clone();
+                thread::spawn(move || {
+                    thread::sleep(BACKEND_DRAIN_TIMEOUT);
+                    let _ = events.send(Event::BackendDrainExpired { generation });
+                });
+            }
+        }
     }
 
     fn poll_processes(&mut self, events: &Sender<Event>, output: &mut dyn Write) -> io::Result<()> {
         let mut setup_finished = None;
         let mut backend_failure = None;
+        let mut restart_retired_backend = false;
         match &mut self.runtime {
             RuntimeState::Setup(setup) => {
-                if setup.exit_status.is_none() {
+                if setup.reported_failure.is_some() && setup.exit_status.is_none() {
+                    terminate_child(&mut setup.child, None);
+                    setup.exit_status = setup.child.try_wait().ok().flatten();
+                } else if setup.stdout_closed && setup.exit_status.is_none() {
+                    // Keep an exited group leader unreaped while descendants
+                    // still hold stdout. Its PID pins the PGID so later host
+                    // shutdown can terminate that exact process group safely.
                     match setup.child.try_wait() {
                         Ok(status) => setup.exit_status = status,
                         Err(error) => {
@@ -1218,10 +1288,6 @@ impl Server {
                                 Some((format!("setup wait failed: {error}"), false))
                         }
                     }
-                }
-                if setup.reported_failure.is_some() && setup.exit_status.is_none() {
-                    terminate_child(&mut setup.child, None);
-                    setup.exit_status = setup.child.try_wait().ok().flatten();
                 }
                 if setup.stdout_closed {
                     if let Some(status) = setup.exit_status {
@@ -1243,23 +1309,38 @@ impl Server {
                 }
             }
             RuntimeState::Backend(backend) => {
-                if backend.exit_status.is_none() {
+                if backend.stdout_closed && backend.exit_status.is_none() {
+                    // As with setup, do not reap a group leader while a
+                    // descendant still owns the inherited output pipe.
                     match backend.child.try_wait() {
                         Ok(status) => backend.exit_status = status,
                         Err(error) => {
-                            backend_failure = Some(format!("backend wait failed: {error}"))
+                            backend_failure = Some((format!("backend wait failed: {error}"), true))
                         }
                     }
                 }
                 // The stdout reader queues every complete response before its
                 // closed event. Wait for that event so a final valid response
                 // is retired before unresolved IDs are failed.
-                if backend.stdout_closed {
-                    backend_failure = Some("Computer Use backend stopped".into());
+                if let Some(drain) = backend.drain.as_ref() {
+                    if backend.stdout_closed || drain.expired {
+                        if backend.restart_on_retirement {
+                            restart_retired_backend = true;
+                        } else {
+                            backend_failure = Some((drain.detail.clone(), drain.retryable));
+                        }
+                    }
+                } else if backend.stdout_closed {
+                    if backend.restart_on_retirement {
+                        restart_retired_backend = true;
+                    } else {
+                        backend_failure = Some(("Computer Use backend stopped".into(), true));
+                    }
                 } else if backend.phase != BackendPhase::Ready
                     && backend.started_at.elapsed() > BACKEND_INITIALIZATION_TIMEOUT
                 {
-                    backend_failure = Some("Computer Use backend initialization timed out".into());
+                    backend_failure =
+                        Some(("Computer Use backend initialization timed out".into(), true));
                 }
             }
             RuntimeState::Dormant | RuntimeState::Failed(_) => {}
@@ -1276,8 +1357,39 @@ impl Server {
                 Err((error, retryable)) => self.fail_setup(error, retryable, output)?,
             }
         }
-        if let Some(error) = backend_failure {
-            self.fail_backend(error, true, output)?;
+        if let Some((error, retryable)) = backend_failure {
+            self.fail_backend(error, retryable, output)?;
+        }
+        if restart_retired_backend {
+            self.restart_retired_backend(events, output)?;
+        }
+        Ok(())
+    }
+
+    fn restart_retired_backend(
+        &mut self,
+        events: &Sender<Event>,
+        output: &mut dyn Write,
+    ) -> io::Result<()> {
+        let pending_request_ids = match &mut self.runtime {
+            RuntimeState::Backend(backend) => std::mem::take(&mut backend.pending_request_ids),
+            _ => return Ok(()),
+        };
+        let mut retired = std::mem::replace(&mut self.runtime, RuntimeState::Dormant);
+        let mut response_result = Ok(());
+        for id in pending_request_ids {
+            if response_result.is_ok() {
+                response_result = write_json(output, &rpc_result(id, backend_failed_result(true)));
+            }
+        }
+        retired.terminate_with_signal(None);
+        response_result?;
+        if let Err(error) = self.start_backend(events) {
+            self.fail_backend(
+                format!("could not restart retired Computer Use backend: {error}"),
+                true,
+                output,
+            )?;
         }
         Ok(())
     }
@@ -1290,14 +1402,18 @@ impl Server {
     ) -> io::Result<()> {
         let deferred = std::mem::take(&mut self.deferred_tool_calls);
         let reason = public_failure_reason(&detail);
-        self.fail(detail, retryable, deferred.is_empty());
+        let mut previous = self.enter_failure(detail, retryable, deferred.is_empty());
+        let mut response_result = Ok(());
         for call in deferred {
-            write_json(
-                output,
-                &rpc_result(call.id, setup_failed_result(retryable, &reason)),
-            )?;
+            if response_result.is_ok() {
+                response_result = write_json(
+                    output,
+                    &rpc_result(call.id, setup_failed_result(retryable, &reason)),
+                );
+            }
         }
-        Ok(())
+        previous.terminate();
+        response_result
     }
 
     fn fail_backend(
@@ -1316,11 +1432,16 @@ impl Server {
                 .map(|call| call.id),
         );
         let report_on_next_call = pending_request_ids.is_empty();
-        self.fail(detail, retryable, report_on_next_call);
+        let mut previous = self.enter_failure(detail, retryable, report_on_next_call);
+        let mut response_result = Ok(());
         for id in pending_request_ids {
-            write_json(output, &rpc_result(id, backend_failed_result(retryable)))?;
+            if response_result.is_ok() {
+                response_result =
+                    write_json(output, &rpc_result(id, backend_failed_result(retryable)));
+            }
         }
-        Ok(())
+        previous.terminate();
+        response_result
     }
 
     fn fail(&mut self, detail: String, retryable: bool, report_on_next_call: bool) {
@@ -1334,20 +1455,46 @@ impl Server {
         report_on_next_call: bool,
         signal: Option<i32>,
     ) {
+        self.fail_with_signal_and_grace(
+            detail,
+            retryable,
+            report_on_next_call,
+            signal,
+            CHILD_TERMINATION_GRACE,
+        );
+    }
+
+    fn enter_failure(
+        &mut self,
+        detail: String,
+        retryable: bool,
+        report_on_next_call: bool,
+    ) -> RuntimeState {
         let reason = public_failure_reason(&detail);
         eprintln!(
             "computer-use-mcp-bootstrap: {}",
             bounded_diagnostic(&detail)
         );
-        let mut previous = std::mem::replace(
+        std::mem::replace(
             &mut self.runtime,
             RuntimeState::Failed(Failure {
                 reason,
                 retryable,
                 report_on_next_call,
             }),
-        );
-        previous.terminate_with_signal(signal);
+        )
+    }
+
+    fn fail_with_signal_and_grace(
+        &mut self,
+        detail: String,
+        retryable: bool,
+        report_on_next_call: bool,
+        signal: Option<i32>,
+        grace: Duration,
+    ) {
+        let mut previous = self.enter_failure(detail, retryable, report_on_next_call);
+        previous.terminate_with_signal_and_grace(signal, grace);
     }
 
     fn shutdown_with_signal(&mut self, signal: i32) {
@@ -1359,15 +1506,18 @@ impl Server {
 
 impl RuntimeState {
     fn terminate(&mut self) {
-        self.terminate_with_signal(None);
+        self.terminate_with_signal_and_grace(None, CHILD_TERMINATION_GRACE);
     }
 
     fn terminate_with_signal(&mut self, signal: Option<i32>) {
-        let grace = if signal.is_some() {
-            CHILD_TERMINATION_GRACE
-        } else {
-            Duration::ZERO
-        };
+        // Every owned-child retirement path gets the same bounded cleanup
+        // window. Cancellation transport replacement and protocol failures
+        // can otherwise SIGKILL the Driver before it removes its managed
+        // daemon/socket generation.
+        self.terminate_with_signal_and_grace(signal, CHILD_TERMINATION_GRACE);
+    }
+
+    fn terminate_with_signal_and_grace(&mut self, signal: Option<i32>, grace: Duration) {
         match self {
             Self::Setup(setup) => {
                 terminate_child_impl(&mut setup.child, signal, setup.exit_status.is_some(), grace)
@@ -1413,7 +1563,7 @@ fn serve<W: Write>(
             Err(RecvTimeoutError::Disconnected) => break,
         }
         server.poll_processes(&events_tx, &mut output)?;
-        server.progress_deferred_tool_calls(&mut output)?;
+        server.progress_deferred_tool_calls(&events_tx, &mut output)?;
         if let Some(signal) = take_received_signal() {
             server.shutdown_with_signal(signal);
         }
@@ -1529,12 +1679,7 @@ fn signal_process_group(process_group: i32, signal: i32) {
 }
 
 fn terminate_child(child: &mut Child, initial_signal: Option<i32>) {
-    let grace = if initial_signal.is_some() {
-        CHILD_TERMINATION_GRACE
-    } else {
-        Duration::ZERO
-    };
-    terminate_child_impl(child, initial_signal, false, grace);
+    terminate_child_impl(child, initial_signal, false, CHILD_TERMINATION_GRACE);
 }
 
 fn terminate_child_impl(

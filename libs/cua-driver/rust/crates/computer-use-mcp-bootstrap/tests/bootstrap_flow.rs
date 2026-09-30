@@ -13,15 +13,20 @@ use tempfile::TempDir;
 
 struct Host {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     lines: Receiver<String>,
 }
 
 impl Host {
     fn send(&mut self, value: Value) {
-        serde_json::to_writer(&mut self.stdin, &value).unwrap();
-        self.stdin.write_all(b"\n").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("host input is open");
+        serde_json::to_writer(&mut *stdin, &value).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn close_input(&mut self) {
+        self.stdin.take();
     }
 
     fn receive(&self) -> Value {
@@ -91,7 +96,7 @@ fn spawn_host_with_scripts(temp: &TempDir, setup_contents: &str, backend_content
     });
     Host {
         child,
-        stdin,
+        stdin: Some(stdin),
         lines,
     }
 }
@@ -657,6 +662,60 @@ printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","resu
 }
 
 #[test]
+fn backend_write_failure_drains_valid_responses_before_failing_unresolved_ids() {
+    let temp = TempDir::new().unwrap();
+    let gate = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+printf 'start\n' >> "$1"
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"ready","retryable":false,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
+"#;
+    let backend = r#"#!/bin/sh
+set -eu
+catalog=$1
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
+IFS= read -r initialized
+IFS= read -r tools_list
+tools=$(/usr/bin/tr -d '\n' < "$catalog")
+printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","result":{"tools":%s}}\n' "$tools"
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"ready"}}'
+IFS= read -r first_call
+exec 0<&-
+: > "$2.stdin-closed"
+/bin/sleep 0.05
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"completed before close"}],"structuredContent":{"proxied":true}}}'
+/bin/sleep 30
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, backend);
+    host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    host.receive();
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.receive();
+    assert_eq!(host.receive()["method"], "notifications/message");
+
+    host.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    let marker = gate.with_extension("stdin-closed");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "backend stdin remained open");
+        thread::sleep(Duration::from_millis(10));
+    }
+    host.send(json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+
+    let completed = host.receive();
+    assert_eq!(completed["id"], 7);
+    assert_eq!(completed["result"]["structuredContent"]["proxied"], true);
+    let unresolved = host.receive();
+    assert_eq!(unresolved["id"], 8);
+    assert_eq!(
+        unresolved["result"]["structuredContent"]["code"],
+        "computer_use_backend_unavailable"
+    );
+}
+
+#[test]
 fn invalid_ready_backend_responses_fail_before_retiring_the_request() {
     let cases = [
         r#"{"id":7,"result":{"unexpected":true}}"#,
@@ -743,10 +802,10 @@ exit 0
         fs::read_to_string(cancellation_marker).unwrap(),
         "cancelled\n"
     );
-    assert!(
-        host.lines.recv_timeout(Duration::from_millis(250)).is_err(),
-        "cancelled request ID must not be failed after backend exit"
-    );
+    let restarted = host.receive();
+    assert_eq!(restarted["method"], "notifications/message");
+    assert_eq!(restarted["params"]["data"], "ready");
+    assert_ne!(restarted["id"], 7);
 }
 
 #[test]
@@ -761,6 +820,9 @@ printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"re
     let backend = r#"#!/bin/sh
 set -eu
 catalog=$1
+starts=$2.cancel-starts
+printf 'start\n' >> "$starts"
+count=$(/usr/bin/wc -l < "$starts" | /usr/bin/tr -d ' ')
 IFS= read -r initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
 IFS= read -r initialized
@@ -769,6 +831,10 @@ tools=$(/usr/bin/tr -d '\n' < "$catalog")
 printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","result":{"tools":%s}}\n' "$tools"
 printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"ready"}}'
 IFS= read -r call
+if [ "$count" != 1 ]; then
+  printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"restarted"}],"structuredContent":{"proxied":true}}}'
+  exit 0
+fi
 exec 0<&-
 : > "$2.stdin-closed"
 /bin/sleep 30
@@ -794,11 +860,77 @@ exec 0<&-
         "cancelled request must not receive a response when cancellation forwarding fails"
     );
     host.send(json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
-    let failure = host.receive();
-    assert_eq!(failure["id"], 8);
+    let recovered = loop {
+        let response = host.receive();
+        assert_ne!(response["id"], 7, "cancelled request received a response");
+        if response["id"] == 8 {
+            break response;
+        }
+        assert_eq!(response["method"], "notifications/message");
+    };
+    assert_eq!(recovered["id"], 8);
+    assert_eq!(recovered["result"]["structuredContent"]["proxied"], true);
+}
+
+#[test]
+fn cancellation_retirement_restarts_backend_without_rerunning_setup() {
+    let temp = TempDir::new().unwrap();
+    let starts = temp.path().join("setup-starts");
+    let gate = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+printf 'start\n' >> "$1"
+printf '%s\n' '{"schema_version":1,"code":"computer_use_setup_ready","stage":"ready","retryable":false,"requires_user_action":false,"accessibility":true,"screen_recording":true,"screen_recording_capturable":true}'
+"#;
+    let backend = r#"#!/bin/sh
+set -eu
+catalog=$1
+starts=$2.backend-starts
+printf 'start\n' >> "$starts"
+count=$(/usr/bin/wc -l < "$starts" | /usr/bin/tr -d ' ')
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}'
+IFS= read -r initialized
+IFS= read -r tools_list
+tools=$(/usr/bin/tr -d '\n' < "$catalog")
+printf '{"jsonrpc":"2.0","id":"computer-use-bootstrap/internal/tools-list","result":{"tools":%s}}\n' "$tools"
+printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"ready-%s"}}\n' "$count"
+if [ "$count" = 1 ]; then
+  IFS= read -r cancelled_call
+  IFS= read -r unrelated_call
+  IFS= read -r cancellation
+  exit 0
+fi
+IFS= read -r next_call
+printf '%s\n' '{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"restarted"}],"structuredContent":{"proxied":true}}}'
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, backend);
+    host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    host.receive();
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.receive();
+    assert_eq!(host.receive()["params"]["data"], "ready-1");
+
+    host.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.send(json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"test"}}));
+
+    let unresolved = host.receive();
+    assert_eq!(unresolved["id"], 8);
     assert_eq!(
-        failure["result"]["structuredContent"]["code"],
-        "computer_use_setup_failed"
+        unresolved["result"]["structuredContent"]["code"],
+        "computer_use_backend_unavailable"
+    );
+    assert_eq!(host.receive()["params"]["data"], "ready-2");
+    host.send(json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    let restarted = host.receive();
+    assert_eq!(restarted["id"], 9);
+    assert_eq!(restarted["result"]["structuredContent"]["proxied"], true);
+    assert_eq!(fs::read_to_string(starts).unwrap(), "start\n");
+    assert_eq!(
+        fs::read_to_string(gate.with_extension("backend-starts")).unwrap(),
+        "start\nstart\n"
     );
 }
 
@@ -855,6 +987,78 @@ printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text
     let response = host.receive();
     assert_eq!(response["id"], 8);
     assert_eq!(response["result"]["structuredContent"]["proxied"], true);
+}
+
+#[test]
+fn client_eof_preserves_cleanup_grace_after_setup_leader_exits() {
+    let temp = TempDir::new().unwrap();
+    let gate = temp.path().join("permission-gate");
+    let setup = r#"#!/bin/sh
+set -eu
+printf 'start\n' >> "$1"
+exec /usr/bin/python3 -c '
+import os, pathlib, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+print("{\"schema_version\":1,\"code\":\"computer_use_setup_pending\",\"stage\":\"service_starting\",\"retryable\":true,\"requires_user_action\":false,\"accessibility\":true,\"screen_recording\":true,\"screen_recording_capturable\":true}", flush=True)
+pid = os.fork()
+if pid == 0:
+    def stop(_signal, _frame):
+        root.with_suffix(".term").write_text("term\n")
+        time.sleep(0.25)
+        root.with_suffix(".cleaned").write_text("cleaned\n")
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    root.with_suffix(".child-pid").write_text(str(os.getpid()))
+    root.with_suffix(".ready").write_text("ready\n")
+    while True:
+        signal.pause()
+while not root.with_suffix(".ready").exists():
+    time.sleep(0.01)
+root.with_suffix(".leader-exited").write_text("exited\n")
+os._exit(0)
+' "$2"
+"#;
+    let mut host = spawn_host_with_scripts(&temp, setup, NORMAL_BACKEND);
+    host.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    host.receive();
+    host.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    host.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_apps","arguments":{}}}));
+    host.receive();
+
+    let leader_exited = gate.with_extension("leader-exited");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !leader_exited.exists() {
+        assert!(Instant::now() < deadline, "setup leader did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(200));
+    host.close_input();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let exited = loop {
+        if host.child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let saw_term = gate.with_extension("term").exists();
+    let cleaned = gate.with_extension("cleaned").exists();
+    if let Ok(pid) = fs::read_to_string(gate.with_extension("child-pid")) {
+        if let Ok(pid) = pid.parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    assert!(exited, "bootstrap did not finish after client EOF");
+    assert!(
+        saw_term,
+        "setup descendant did not receive graceful shutdown"
+    );
+    assert!(cleaned, "client EOF skipped the setup cleanup grace");
 }
 
 #[test]

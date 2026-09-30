@@ -57,8 +57,9 @@ and requires its complete tool catalog to equal the embedded public catalog
 before forwarding. It tracks every deferred and forwarded request ID and
 resolves all outstanding calls with a structured failure if setup or the
 backend exits. On Unix, child commands run in private process groups so host
-termination can reach ordinary descendants. The bootstrap allows the group up
-to 25 seconds to exit cleanly before escalating to `SIGKILL`. The original
+termination can reach ordinary descendants. The bootstrap settles and flushes
+any affected client request IDs, then allows the group up to 25 seconds to exit
+cleanly before escalating to `SIGKILL`. The original
 group leader remains unreaped through that sequence, pinning the PGID while
 descendants finish or are stopped. This contains the plugin relay's bounded
 20-second exact-daemon cleanup window without risking a signal to a recycled
@@ -70,6 +71,13 @@ the version selected by the bootstrap before the backend is started. Cancelling
 one deferred call withdraws only that request; shared setup and backend
 initialization continue. Once a request has reached the backend, its cancelled
 ID remains tracked until any racing response arrives and is discarded.
+If backend input closes, the bootstrap drains stdout for one bounded second so
+responses already committed by the backend win over synthetic transport
+failures; only IDs still unresolved at close or timeout fail. A backend that
+retires its transport after an acknowledged cancellation is reinitialized
+directly from the verified runtime without rerunning setup. Unrelated requests
+already written to that retired transport fail explicitly, while calls held
+before forwarding continue on the replacement backend.
 
 `src/tool_catalog.json` and `src/initialize_instructions.txt` are generated
 from the marketplace Python wrapper's public definitions and must be refreshed
